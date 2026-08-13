@@ -16,7 +16,7 @@
 #       因此 --workdir 相对路径基于【用户启动目录】解析
 #     - codes 包导入由 main.py 基于 __file__ 注入 sys.path 完成（不依赖 PYTHONPATH）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-set -e
+# set -e
 # export DEEPSEEK_API_KEY="your-api-key"
 # 
 # # ── API key 检查 ──
@@ -31,10 +31,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── Install dependencies if missing（核心依赖 requests，不再需要 litellm） ──
-if [ ! -d "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/requests" ] 2>/dev/null; then
-    echo "Installing dependencies..."
-    pip install -r "$SCRIPT_DIR/requirements.txt" -q
-fi
+# if [ ! -d "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/requests" ] 2>/dev/null; then
+#     echo "Installing dependencies..."
+#     pip install -r "$SCRIPT_DIR/requirements.txt" -q
+# fi
 
 # ── 启动：以绝对路径执行 main.py（不再依赖 -m 与 cwd），参数全部透传 ──
 which python3

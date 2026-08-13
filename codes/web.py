@@ -5031,6 +5031,14 @@ def close_web_server():
             logger.info("Web server shutdown requested")
         except Exception as e:
             logger.warning(f"close_web_server 异常: {e}")
+    # 2026-08-13: /exit 退出 Web 时兜底清理本进程持有的 mkdir 锁
+    try:
+        from codes.lock import cleanup_all as _cleanup_all
+        _n = _cleanup_all()
+        if _n:
+            logger.info(f"close_web_server: 兜底清理 {_n} 个残留锁")
+    except Exception:
+        pass
 
 
 def run_web(args):

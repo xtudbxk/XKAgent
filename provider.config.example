@@ -49,11 +49,10 @@ models.flash: claude-haiku-4
 models.pro: claude-sonnet-4
 
 # ── 自定义 provider 示例（必须显式配置对应节）──
-# [myapi3]
-# type: openai
-# base_url: https://api3.xhub.chat/v1
-# default_model: gpt-5.4
-# [deepv4]
+# [deepseek]
+# api_key: sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 # type: openai
 # base_url: https://api.deepseek.com/v1
 # default_model: deepseek-v4-flash
+# models.flash: deepseek-v4-flash:max
+# models.pro: deepseek-v4-pro:max

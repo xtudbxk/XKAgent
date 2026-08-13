@@ -11,17 +11,17 @@
   <rect width="1200" height="675" rx="28" fill="url(#bg)"/>
   <g opacity=".22" stroke="#94cbd3"><path d="M0 100h1200M0 200h1200M0 300h1200M0 400h1200M0 500h1200M0 600h1200"/><path d="M100 0v675M200 0v675M300 0v675M400 0v675M500 0v675M600 0v675M700 0v675M800 0v675M900 0v675M1000 0v675M1100 0v675"/></g>
   <g fill="none" stroke-width="3">
-    <path d="M600 145v35" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
+    <path d="M600 135v45" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
     <path d="M592 300v35" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
     <path d="M608 335v-35" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
-    <path d="M310 250h145" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
-    <path d="M745 232h145" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
-    <path d="M890 248H745" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
-    <path d="M730 95h115" stroke="#16b3a3" stroke-dasharray="10 10" marker-end="url(#arrow-cyan)"/>
+    <path d="M285 250h170" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
+    <path d="M745 238h170" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
+    <path d="M915 262H745" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
+    <path d="M710 95h135" stroke="#16b3a3" stroke-dasharray="10 10" marker-end="url(#arrow-cyan)"/>
   </g>
   <g font-family="Segoe UI,Arial,sans-serif" text-anchor="middle">
-    <rect x="455" y="45" width="290" height="100" rx="22" fill="#ffffff" stroke="#16b3a3" stroke-width="3"/>
-    <text x="600" y="88" fill="#087f78" font-size="29" font-weight="800">STATUS</text>
+    <rect x="490" y="55" width="220" height="80" rx="20" fill="#ffffff" stroke="#16b3a3" stroke-width="3"/>
+    <text x="600" y="95" fill="#087f78" font-size="27" font-weight="800" dominant-baseline="middle">STATUS</text>
 
     <rect x="845" y="45" width="300" height="100" rx="22" fill="#f7fffc" stroke="#16b3a3" stroke-width="3" stroke-dasharray="8 7"/>
     <text x="995" y="84" fill="#087f78" font-size="22" font-weight="800">LONG-TERM</text>
@@ -31,10 +31,10 @@
     <rect x="455" y="180" width="290" height="120" rx="24" fill="#f3f7ff" stroke="#4f8ff7" stroke-width="4"/>
     <text x="600" y="250" fill="#17324d" font-size="48" font-weight="800">LLM</text>
 
-    <rect x="70" y="180" width="240" height="140" rx="24" fill="#ffffff" stroke="#4f8ff7" stroke-width="3"/>
+    <rect x="95" y="200" width="190" height="100" rx="22" fill="#ffffff" stroke="#4f8ff7" stroke-width="3"/>
     <text x="190" y="250" fill="#315b9d" font-size="30" font-weight="800" dominant-baseline="middle">SKILLS</text>
 
-    <rect x="890" y="180" width="240" height="140" rx="24" fill="#ffffff" stroke="#4f8ff7" stroke-width="3"/>
+    <rect x="915" y="200" width="190" height="100" rx="22" fill="#ffffff" stroke="#4f8ff7" stroke-width="3"/>
     <text x="1010" y="250" fill="#315b9d" font-size="28" font-weight="800" dominant-baseline="middle">REPL &amp; WEB</text>
 
     <rect x="380" y="335" width="440" height="205" rx="34" fill="#f7fffc" stroke="#16b3a3" stroke-width="3" stroke-dasharray="10 8"/>
@@ -46,6 +46,6 @@
       <text x="600" y="461" fill="#315b9d" font-size="16" font-weight="700">agent() -&gt; sub-agent</text>
     </g>
 
-    <text x="600" y="602" fill="#17324d" font-size="68" font-weight="800">XKAgent</text>
+    <text x="600" y="610" fill="#17324d" font-size="68" font-weight="800" dominant-baseline="middle">XKAgent</text>
   </g>
 </svg>

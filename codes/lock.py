@@ -364,3 +364,60 @@ def acquire_or_recover(session: str, holder_pid: int, holder_name: str,
     _stop_heartbeat(session)
     _rmtree(_lockdir(session))
     return acquire(session, holder_pid, holder_name, thread_id)
+
+
+# ── 退出清理（/exit、/session stop 兜底）────────────────────────────
+
+def cleanup(session: str) -> tuple:
+    """退出时清理 session 的 mkdir 锁（幂等，按 session 名，无需 lock_ctx）。
+
+    与 release() 的区别：release 需要 acquire 返回的 lock_ctx（调用方持有）；
+    本函数供 /exit、/session stop、stop_agent join 超时等退出路径兜底调用，
+    此时可能拿不到 lock_ctx（如线程未退出、进程即将结束）。
+
+    安全性：仅删除 owner.instance_id == _INSTANCE_ID（本进程）的锁；
+    他人持有（含跨容器）或 lockdir 不存在 → 不删除，返回 (False, 原因)。
+    """
+    _stop_heartbeat(session)
+    lockdir = _lockdir(session)
+    if not os.path.isdir(lockdir):
+        return False, "Not locked"
+    meta = _read_owner(lockdir)
+    if meta is None:
+        # 2026-08-13 多进程安全修复: owner.json 缺失/损坏时保守跳过。
+        # 场景: 他人进程 acquire 初始化窗口（mkdir 成功、owner.json 未写）
+        # 或元数据异常 → 此时删除会误伤他人锁。宁可残留也不误删
+        # （残留由 STALE_TIMEOUT 接管机制兜底，与 is_locked 保守语义一致）。
+        return False, "No owner metadata (skip)"
+    if meta.get("instance_id") != _INSTANCE_ID:
+        return False, "Not owner (other process)"
+    # 二次校验: 读→删 之间他人可能重建（TOCTOU），删除前再确认仍是本进程
+    meta2 = _read_owner(lockdir)
+    if meta2 is None or meta2.get("instance_id") != _INSTANCE_ID:
+        return False, "Owner changed (skip)"
+    _rmtree(lockdir)
+    return True, "Cleaned"
+
+
+def cleanup_all() -> int:
+    """清理当前进程持有的所有 session lockdir（进程退出兜底）。
+
+    Returns
+    -------
+    int
+        实际清理的 lockdir 数量（幂等：不存在的自动跳过）。
+    """
+    hist_dir = _config.get_historys_dir()
+    if not os.path.isdir(hist_dir):
+        return 0
+    n = 0
+    for name in sorted(os.listdir(hist_dir)):
+        if name.endswith(".db.lockdir"):
+            session = name[: -len(".db.lockdir")]
+            try:
+                ok, _ = cleanup(session)
+                if ok:
+                    n += 1
+            except Exception:
+                pass
+    return n

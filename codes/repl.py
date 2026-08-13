@@ -1100,6 +1100,15 @@ def run_repl(args):
 
     finally:
         reader.save_history()
+        # 2026-08-13: /exit 退出 REPL 时兜底清理本进程持有的 mkdir 锁，
+        # 避免 daemon agent 线程随进程退出导致 lockdir 残留。
+        try:
+            from codes.lock import cleanup_all as _cleanup_all
+            _n = _cleanup_all()
+            if _n:
+                logger.info(f"REPL 退出: 兜底清理 {_n} 个残留锁")
+        except Exception:
+            pass
 
 
 

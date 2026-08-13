@@ -208,6 +208,13 @@ class AgentManager:
                 logger.warning(
                     f"stop_agent: 线程未在 {join_timeout}s 内退出 session={session}，锁可能残留"
                 )
+                # 2026-08-13: /session stop 退出时兜底清理 mkdir 锁（线程未退出也清）
+                try:
+                    from codes.lock import cleanup as _cleanup_lock
+                    _ok_c, _msg_c = _cleanup_lock(session)
+                    logger.info(f"stop_agent: 兜底清理锁 session={session} ok={_ok_c} ({_msg_c})")
+                except Exception as _e:
+                    logger.warning(f"stop_agent: 清理锁失败 session={session}: {_e}")
         return True
 
     def switch_focus(self, session: str) -> bool:
