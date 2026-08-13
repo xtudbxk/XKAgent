@@ -1,0 +1,146 @@
+{
+  "query": "python",
+  "timestamp": "2026-08-07 02:06:51",
+  "total": 17,
+  "ok": 11,
+  "warn": 6,
+  "fail": 0,
+  "sources": [
+    {
+      "source": "baidu",
+      "status": "WARN",
+      "reason": "反爬/JS渲染",
+      "count": 0,
+      "elapsed": 0.16,
+      "sample": ""
+    },
+    {
+      "source": "google",
+      "status": "OK",
+      "reason": "正常",
+      "count": 3,
+      "elapsed": 8.47,
+      "sample": "python.orghttps://www.python.org"
+    },
+    {
+      "source": "bing",
+      "status": "OK",
+      "reason": "正常",
+      "count": 3,
+      "elapsed": 0.58,
+      "sample": "python.orghttps://www.python.org"
+    },
+    {
+      "source": "duckduckgo",
+      "status": "OK",
+      "reason": "正常",
+      "count": 3,
+      "elapsed": 8.55,
+      "sample": "python.orghttps://www.python.org"
+    },
+    {
+      "source": "github",
+      "status": "OK",
+      "reason": "正常",
+      "count": 3,
+      "elapsed": 0.94,
+      "sample": "donnemartin/system-design-primer"
+    },
+    {
+      "source": "arxiv",
+      "status": "OK",
+      "reason": "正常",
+      "count": 3,
+      "elapsed": 1.29,
+      "sample": "ePytho : A  impleme tatio  of Pytho  for the ma y-core Epiph"
+    },
+    {
+      "source": "semantic_scholar",
+      "status": "WARN",
+      "reason": "需代理",
+      "count": 0,
+      "elapsed": 0.65,
+      "sample": ""
+    },
+    {
+      "source": "wikipedia",
+      "status": "WARN",
+      "reason": "需代理",
+      "count": 0,
+      "elapsed": 8.02,
+      "sample": ""
+    },
+    {
+      "source": "weixin_sogou",
+      "status": "WARN",
+      "reason": "反爬/JS渲染",
+      "count": 0,
+      "elapsed": 0.62,
+      "sample": ""
+    },
+    {
+      "source": "openalex",
+      "status": "OK",
+      "reason": "正常",
+      "count": 3,
+      "elapsed": 1.37,
+      "sample": "Scikit-learn: Machine Learning in Python"
+    },
+    {
+      "source": "crossref",
+      "status": "OK",
+      "reason": "正常",
+      "count": 3,
+      "elapsed": 0.89,
+      "sample": "Embedded Python"
+    },
+    {
+      "source": "dblp",
+      "status": "OK",
+      "reason": "正常",
+      "count": 3,
+      "elapsed": 0.51,
+      "sample": "Pythonic vs Refactorable Pythonic: On the relationship betwe"
+    },
+    {
+      "source": "sogou",
+      "status": "WARN",
+      "reason": "反爬/JS渲染",
+      "count": 0,
+      "elapsed": 0.24,
+      "sample": ""
+    },
+    {
+      "source": "so360",
+      "status": "OK",
+      "reason": "正常",
+      "count": 2,
+      "elapsed": 1.56,
+      "sample": "Python 简介| 菜鸟教程"
+    },
+    {
+      "source": "bilibili",
+      "status": "WARN",
+      "reason": "反爬/JS渲染",
+      "count": 0,
+      "elapsed": 0.75,
+      "sample": ""
+    },
+    {
+      "source": "csdn",
+      "status": "OK",
+      "reason": "正常",
+      "count": 3,
+      "elapsed": 0.37,
+      "sample": "python从入门到精通——完整教程【转载】"
+    },
+    {
+      "source": "sourcegraph",
+      "status": "OK",
+      "reason": "正常",
+      "count": 2,
+      "elapsed": 2.67,
+      "sample": "github.com/lnxg33k/webhandler:modules/backdoor.py"
+    }
+  ]
+}

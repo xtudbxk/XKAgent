@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+  <title id="title">XKAgent - Code over Tools</title>
+  <desc id="desc">Status-aware context feeds the LLM and pythonrt code kernel. Skills extend capability, the LLM responds through REPL or Web, agent is callable inside the code kernel, and a path sandbox wraps execution. Long-term tasks and memory are on the roadmap.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f8fcff"/><stop offset="1" stop-color="#ebfaf4"/></linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#16b3a3"/><stop offset="1" stop-color="#4f8ff7"/></linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <marker id="arrow-cyan" markerWidth="6" markerHeight="6" refX="5.5" refY="3" orient="auto"><path d="M0 0L6 3L0 6Z" fill="#16b3a3"/></marker>
+    <marker id="arrow-blue" markerWidth="6" markerHeight="6" refX="5.5" refY="3" orient="auto"><path d="M0 0L6 3L0 6Z" fill="#4f8ff7"/></marker>
+  </defs>
+  <rect width="1200" height="675" rx="28" fill="url(#bg)"/>
+  <g opacity=".22" stroke="#94cbd3"><path d="M0 100h1200M0 200h1200M0 300h1200M0 400h1200M0 500h1200M0 600h1200"/><path d="M100 0v675M200 0v675M300 0v675M400 0v675M500 0v675M600 0v675M700 0v675M800 0v675M900 0v675M1000 0v675M1100 0v675"/></g>
+  <g fill="none" stroke-width="3">
+    <path d="M600 145v35" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
+    <path d="M592 300v35" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
+    <path d="M608 335v-35" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
+    <path d="M310 250h145" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
+    <path d="M745 232h145" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
+    <path d="M890 248H745" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
+    <path d="M730 95h115" stroke="#16b3a3" stroke-dasharray="10 10" marker-end="url(#arrow-cyan)"/>
+  </g>
+  <g font-family="Segoe UI,Arial,sans-serif" text-anchor="middle">
+    <rect x="455" y="45" width="290" height="100" rx="22" fill="#ffffff" stroke="#16b3a3" stroke-width="3"/>
+    <text x="600" y="88" fill="#087f78" font-size="29" font-weight="800">STATUS</text>
+
+    <rect x="845" y="45" width="300" height="100" rx="22" fill="#f7fffc" stroke="#16b3a3" stroke-width="3" stroke-dasharray="8 7"/>
+    <text x="995" y="84" fill="#087f78" font-size="22" font-weight="800">LONG-TERM</text>
+    <text x="995" y="115" fill="#457578" font-size="19" font-weight="700">TASKS + MEMORY</text>
+    <text x="790" y="82" fill="#087f78" font-size="14" font-weight="700">ROADMAP</text>
+
+    <rect x="455" y="180" width="290" height="120" rx="24" fill="#f3f7ff" stroke="#4f8ff7" stroke-width="4"/>
+    <text x="600" y="250" fill="#17324d" font-size="48" font-weight="800">LLM</text>
+
+    <rect x="70" y="180" width="240" height="140" rx="24" fill="#ffffff" stroke="#4f8ff7" stroke-width="3"/>
+    <text x="190" y="240" fill="#315b9d" font-size="30" font-weight="800">SKILLS</text>
+
+    <rect x="890" y="180" width="240" height="140" rx="24" fill="#ffffff" stroke="#4f8ff7" stroke-width="3"/>
+    <text x="1010" y="240" fill="#315b9d" font-size="28" font-weight="800">REPL &amp; WEB</text>
+
+    <rect x="380" y="335" width="440" height="205" rx="34" fill="#f7fffc" stroke="#16b3a3" stroke-width="3" stroke-dasharray="10 8"/>
+    <text x="600" y="525" fill="#087f78" font-size="17" font-weight="700">PATH SANDBOX</text>
+    <g filter="url(#glow)">
+      <rect x="415" y="365" width="370" height="135" rx="26" fill="#ffffff" stroke="url(#accent)" stroke-width="5"/>
+      <text x="600" y="410" fill="#17324d" font-size="38" font-weight="800">PYTHONRT</text>
+      <text x="600" y="439" fill="#087f78" font-size="19" font-weight="700">CODE KERNEL</text>
+      <rect x="485" y="450" width="230" height="36" rx="18" fill="#eef4ff" stroke="#4f8ff7" stroke-width="2"/>
+      <text x="600" y="474" fill="#315b9d" font-size="16" font-weight="700">agent() -&gt; sub-agent</text>
+    </g>
+
+    <text x="600" y="602" fill="#17324d" font-size="68" font-weight="800">XKAgent</text>
+    <text x="600" y="646" fill="url(#accent)" font-size="30" font-weight="700">Code over Tools</text>
+  </g>
+</svg>

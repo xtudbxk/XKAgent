@@ -1,0 +1,30 @@
+# ════════════════════════════════════════════
+#  XKAgent — 依赖清单
+# ════════════════════════════════════════════
+#  分组说明:
+#    [BASE]    核心必选，缺了无法运行
+#    [FEATURE] 可选功能组，缺了对应功能降级
+# ════════════════════════════════════════════
+#
+#  合并说明（develop_tools ✕ develop_web）:
+#    - LLM 调用层采用 web 分支的 requests 直连方案（去 litellm，导入快、零重依赖）
+#    - 沙箱统一为 pythonrt（去 bashkit / pyeryx）
+#    - 保留 tools 分支的技能搜索增强（numpy）与内置 git（dulwich）
+# ════════════════════════════════════════════
+
+# ── [BASE] 核心依赖 ──
+# LLM 调用层（codes/llm.py）直接使用 requests + 标准库，不再依赖 litellm
+requests>=2.31.0
+
+# ── [FEATURE] 技能语义搜索（FAISS + ONNX + Transformers） ──
+faiss-cpu>=1.7.0
+onnxruntime>=1.27.0
+transformers>=4.29.0
+numpy>=1.26.0
+
+# ── [FEATURE] Web 界面 ──
+fastapi>=0.115.0
+uvicorn>=0.32.0
+
+# ── [FEATURE] 内置 git（pythonrt dulwich 扩展；可选，缺失时 git 操作不可用） ──
+dulwich>=0.21.0
