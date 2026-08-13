@@ -1,0 +1,59 @@
+# ═══════════════════════════════════════════════════════════════
+#  XKAgent — Provider 配置模板
+# ═══════════════════════════════════════════════════════════════
+#  用法:
+#    1. 复制本文件为 `<workdir>/.xkagent/provider.config`
+#       或项目根目录 `provider.config`
+#    2. 填入你的 api_key 后保存，无需重启即可生效（自动热加载）
+#
+#  配置文件查找: <workdir>/.xkagent/provider.config → <项目根>/provider.config
+#  API Key 解析: api_key → api_key_env 指向的变量 → 推导的 PROVIDER_API_KEY
+#
+#  格式: [节名] = provider 名；key: value（或 key = value）
+#  注释: # 或 ; 开头
+# ═══════════════════════════════════════════════════════════════
+
+# ── [default] 全局默认 ──
+# provider: 默认使用的 provider 名（必须在下方配置对应节）
+[default]
+provider: openai
+
+# ═══════════════════════════════════════════════════════════════
+#  OpenAI 范式（openai / deepseek / 各类 OpenAI 兼容中转）
+# ═══════════════════════════════════════════════════════════════
+# type: openai | anthropic（缺省按 model 前缀自动推导）
+# api_key: 直接填 key（优先）; 也可用 api_key_env 指向环境变量
+# base_url: 官方端点可省略；中转站必须填
+# default_model: 该 provider 的默认模型
+# models.别名: 供 /model 别名解析使用（如 /model flash）
+[openai]
+type: openai
+# api_key: sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+api_key_env: OPENAI_API_KEY
+# base_url: https://api.openai.com/v1
+default_model: gpt-4o
+models.flash: gpt-4o-mini
+models.pro: gpt-4o
+
+# ═══════════════════════════════════════════════════════════════
+#  Anthropic 范式（claude 系列）
+# ═══════════════════════════════════════════════════════════════
+# 注意: anthropic 范式走 anthropic_api_key 参数，
+#       不需要 base_url（官方端点）；仅自定义中转时才填 base_url
+[anthropic]
+type: anthropic
+# api_key: sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+api_key_env: ANTHROPIC_API_KEY
+default_model: claude-sonnet-4
+models.flash: claude-haiku-4
+models.pro: claude-sonnet-4
+
+# ── 自定义 provider 示例（必须显式配置对应节）──
+# [myapi3]
+# type: openai
+# base_url: https://api3.xhub.chat/v1
+# default_model: gpt-5.4
+# [deepv4]
+# type: openai
+# base_url: https://api.deepseek.com/v1
+# default_model: deepseek-v4-flash

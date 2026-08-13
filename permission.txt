@@ -1,0 +1,9 @@
+# 实际读取位置：<workdir>/.xkagent/permission.txt
+# 项目根目录此文件仅作格式示例，不会被运行时自动读取。
+# 每行: <目录路径> <ro|ro/rw>   （v2 语法，按 mode 区分权限）
+#   ro    = plan / build 均只读
+#   ro/rw = plan 只读 / build 可写
+#
+# 示例:
+# /home/user/data    ro
+# /workspace/output  ro/rw

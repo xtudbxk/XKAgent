@@ -1,0 +1,25 @@
+__pycache__/*
+*/__pycache__/*
+*/*/__pycache__/*
+*/*/*/__pycache__/*
+*/*/*/*/__pycache__/*
+*.bak*
+*/*.bak*
+*/*/*.bak*
+*/*/*/*.bak*
+*/*/*/*/*.bak*
+.xkagent/historys/
+.xkagent/logs/
+.xkagent/skills/
+.xkagent/search_index/
+.xkagent/files/
+.xkagent/docs/*/
+.xkagent/history.txt
+.xkagent/permission.txt
+.xkagent/search_ranges.txt
+.xkagent/provider.config
+.trash/
+models/
+
+# ── 敏感配置：provider api_key 不入库 ──
+provider.config
