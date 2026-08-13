@@ -2,11 +2,11 @@
 
 [简体中文](01-入口与启动.md) | English
 
-This guide starts with installation, then explains how to launch the REPL or Web interface and what `--workdir`, session options, and the startup directory actually affect.
+This guide starts with installation, then explains how to launch the CLI or Web interface and what `--workdir`, session options, and the startup directory actually affect.
 
 ## Install the capabilities you need
 
-XKAgent's REPL and LLM layer require only Python and `requests`:
+XKAgent's CLI and LLM layer require only Python and `requests`:
 
 ```bash
 python -m pip install requests
@@ -18,7 +18,7 @@ To use the Web interface, semantic search, and Git inside the sandbox, install a
 python -m pip install -r requirements.txt
 ```
 
-These dependencies are grouped by capability. Missing an optional group does not prevent the core REPL from starting:
+These dependencies are grouped by capability. Missing an optional group does not prevent the core CLI from starting:
 
 - `faiss-cpu`, `onnxruntime`, `transformers`, and `numpy` support semantic Skill search; if the group is incomplete, search falls back to ngram/keyword matching.
 - `fastapi` and `uvicorn` provide the Web interface.
@@ -27,7 +27,7 @@ These dependencies are grouped by capability. Missing an optional group does not
 
 At startup, XKAgent reports the availability of the core, semantic-search, and Web components. The current check does not list `dulwich` separately.
 
-## Start the REPL
+## Start the CLI
 
 Run this from the repository root:
 
@@ -63,15 +63,15 @@ You can also use the dedicated entry point:
 python -m codes.web_main --workdir /path/to/project
 ```
 
-`codes.web_main` reuses the same arguments and startup flow but always selects Web mode; even `--mode repl` will not make it start the REPL.
+`codes.web_main` reuses the same arguments and startup flow but always selects Web mode; even `--mode repl` will not make it start the CLI.
 
 ## Option reference
 
 - `--mode {repl,web}`: runtime mode; defaults to `repl`.
 - `--workdir PATH`: base directory for the project scope and runtime data.
-- `-s, --session NAME`: select a REPL session.
+- `-s, --session NAME`: select a CLI session.
 - `--resume`: resume an existing session; without a name, selects the most recent session.
-- `-p, --prompt TEXT`: send one REPL input and exit.
+- `-p, --prompt TEXT`: send one CLI input and exit.
 - `--host HOST`, `--port PORT`: Web listen address and port; defaults to `127.0.0.1:7860`.
 - `--user USER`, `--password PASSWORD`: Web login credentials; the username defaults to `admin`.
 
@@ -103,4 +103,4 @@ Unified argument handling and mode dispatch live in `codes/main.py`; `codes/__ma
 
 - [Configuration](02-configuration.md)
 - [Infrastructure](03-infrastructure.md)
-- [REPL and Web](10-frontends.md)
+- [CLI and Web](10-frontends.md)

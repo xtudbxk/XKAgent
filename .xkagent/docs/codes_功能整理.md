@@ -31,7 +31,7 @@ Status 不是后台守护进程，而是每轮动态生成的上下文前缀。�
 ## 一轮请求如何流动
 
 ```text
-REPL / Web
+CLI / Web
   → commands 分流 slash 命令，普通消息进入当前 session 队列
   → Agent 检查会话锁，解析 @路径并清理非法 Unicode
   → 检索建议 Skills 与相关信息，生成 Status
@@ -39,7 +39,7 @@ REPL / Web
   → system prompt + 有效历史 + 本轮图片发送给 LLM
   → llm.py 统一输出 reasoning / text / tool calls / usage
   → 工具调用按顺序执行，结果落库后继续下一次 LLM 调用
-  → Agent 产生结构化事件，由 REPL 或 WebSocket 渲染
+  → Agent 产生结构化事件，由 CLI 或 WebSocket 渲染
 ```
 
 `agent.py` 是这条主链的协调者：组装上下文、驱动 LLM/工具循环并持久化消息。`llm.py` 使用 `requests` 适配 OpenAI-compatible 与 Anthropic 两类 API，统一 SSE 流、重试、中断、usage 和工具调用片段。前端只消费 thinking、文本、工具、权限、锁、错误和回合结束等事件，不需要理解 Provider 细节；仅供展示的 thinking 记录也不会重新进入 LLM 上下文。
@@ -58,7 +58,7 @@ REPL / Web
 - `skill.py` 与 `search.py` 提供能力发现、内容抽取、检索和长期文档写入。
 - `agent_runner.py` 与 `agent_worker.py` 承载隔离的子 Agent 循环。
 
-基础设施同样独立：`history.py` 管理 SQLite，`lock.py` 管理 session lease，`_log.py` 管理标准库日志和轮转。交互层的 `commands.py` 只注册一次命令，REPL 和 Web 复用相同分发语义；两端再分别处理终端输入或 FastAPI、WebSocket、认证与文件接口。
+基础设施同样独立：`history.py` 管理 SQLite，`lock.py` 管理 session lease，`_log.py` 管理标准库日志和轮转。交互层的 `commands.py` 只注册一次命令，CLI 和 Web 复用相同分发语义；两端再分别处理终端输入或 FastAPI、WebSocket、认证与文件接口。
 
 ## 执行权限不是安全容器
 
@@ -96,7 +96,7 @@ SQLite 当前持久化消息与命令、Provider/模型、累计和最近一轮 
 │  ├─ provider.config                     # workdir 级 Provider 配置
 │  ├─ permission.txt                      # 静态路径授权
 │  ├─ search_ranges.txt                   # 全局搜索增补与排除
-│  └─ history.txt                         # REPL / Web 共享输入历史
+│  └─ history.txt                         # CLI / Web 共享输入历史
 ├─ skills/                                # 随代码发布的内置 Skills
 ├─ system_prompt.txt                      # 主 Agent 提示
 ├─ system_prompt_compact.txt              # 压缩提示
@@ -111,7 +111,7 @@ SQLite 当前持久化消息与命令、Provider/模型、累计和最近一轮 
 - Provider 和模型通过 `provider.config` 增加，保存后按 mtime 自动重载。
 - 沙箱库能力通过 `register_extension` 放行，并为可能绕过 Python 文件 API 的入口补充校验。
 - 新辅助工具在 `tools.py` 定义 schema 与执行器，再绑定到每个 Agent 的独立工具表。
-- 新 slash 命令在 `commands.py` 注册，REPL 与 Web 会同时获得该能力。
+- 新 slash 命令在 `commands.py` 注册，CLI 与 Web 会同时获得该能力。
 - 新搜索范围通过 `/info` 或 `search_ranges.txt` 配置；新前端则复用 `AgentManager` 队列和结构化事件。
 
 ## 专题文档
@@ -125,4 +125,4 @@ SQLite 当前持久化消息与命令、Provider/模型、累计和最近一轮 
 - [07 · 技能系统](07-技能系统.md)：Skill 目录、frontmatter、选择与缓存。
 - [08 · 搜索与记忆](08-搜索与记忆.md)：检索范围、ngram/embedding 与长期文档。
 - [09 · 命令系统](09-命令系统.md)：共享命令、状态变更与审计。
-- [10 · 前端界面](10-前端界面.md)：REPL、Web、文件接口与认证。
+- [10 · 前端界面](10-前端界面.md)：CLI、Web、文件接口与认证。

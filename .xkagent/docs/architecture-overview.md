@@ -31,7 +31,7 @@ These mechanisms form the foundation for long-running tasks and memory; they are
 ## Request Flow
 
 ```text
-REPL / Web
+CLI / Web
   → commands routes slash commands; plain messages enter the current session queue
   → Agent checks the session lock, resolves @ paths, and removes invalid Unicode
   → suggested Skills and relevant information are retrieved to generate Status
@@ -39,7 +39,7 @@ REPL / Web
   → system prompt + effective history + images for this turn are sent to the LLM
   → llm.py produces a unified stream of reasoning / text / tool calls / usage
   → tool calls run sequentially; each result is persisted before the next LLM call
-  → Agent emits structured events rendered by the REPL or WebSocket
+  → Agent emits structured events rendered by the CLI or WebSocket
 ```
 
 `agent.py` coordinates this main path: it assembles context, drives the LLM/tool loop, and persists messages. `llm.py` uses `requests` to support OpenAI-compatible and Anthropic APIs while unifying SSE streaming, retries, interruption, usage, and tool-call fragments. Frontends consume events for thinking, text, tools, permissions, locks, errors, and turn completion without needing to understand Provider-specific details. Thinking records retained only for display are not sent back into the LLM context.
@@ -58,7 +58,7 @@ The runtime kernel is concentrated in these groups of files:
 - `skill.py` and `search.py` provide capability discovery, content extraction, retrieval, and long-term document writing.
 - `agent_runner.py` and `agent_worker.py` host the isolated sub-Agent loop.
 
-Infrastructure is similarly separated: `history.py` manages SQLite, `lock.py` manages session leases, and `_log.py` manages standard-library logging and rotation. At the interaction layer, `commands.py` registers commands once so the REPL and Web share the same dispatch semantics. Each frontend then handles either terminal input or FastAPI, WebSocket, authentication, and file APIs.
+Infrastructure is similarly separated: `history.py` manages SQLite, `lock.py` manages session leases, and `_log.py` manages standard-library logging and rotation. At the interaction layer, `commands.py` registers commands once so the CLI and Web share the same dispatch semantics. Each frontend then handles either terminal input or FastAPI, WebSocket, authentication, and file APIs.
 
 ## Execution Permissions Are Not a Security Container
 
@@ -96,7 +96,7 @@ Sub-Agents use a message loop isolated from the main conversation. Their model, 
 │  ├─ provider.config                     # workdir-level Provider configuration
 │  ├─ permission.txt                      # static path permissions
 │  ├─ search_ranges.txt                   # global search additions and exclusions
-│  └─ history.txt                         # input history shared by REPL / Web
+│  └─ history.txt                         # input history shared by CLI / Web
 ├─ skills/                                # built-in Skills distributed with the code
 ├─ system_prompt.txt                      # main Agent prompt
 ├─ system_prompt_compact.txt              # compaction prompt
@@ -111,7 +111,7 @@ When the workdir is the XKAgent repository root, both the project's topic docume
 - Add Providers and models through `provider.config`; changes are reloaded automatically based on mtime.
 - Enable sandboxed library capabilities through `register_extension`, and add checks to entry points that could bypass Python's file APIs.
 - Define the schema and executor for a new helper tool in `tools.py`, then bind it to each Agent's independent tool table.
-- Register a new slash command in `commands.py`; both the REPL and Web will receive it.
+- Register a new slash command in `commands.py`; both the CLI and Web will receive it.
 - Configure new search scopes through `/info` or `search_ranges.txt`. A new frontend can reuse the `AgentManager` queues and structured events.
 
 ## Topic Guides
@@ -125,4 +125,4 @@ When the workdir is the XKAgent repository root, both the project's topic docume
 - [07 · Skills](07-skills.md): Skill directories, frontmatter, selection, and caching.
 - [08 · Search and Memory](08-search-and-memory.md): Retrieval scopes, ngram/embedding, and long-term documents.
 - [09 · Command System](09-commands.md): Shared commands, state changes, and auditing.
-- [10 · Frontends](10-frontends.md): REPL, Web, file APIs, and authentication.
+- [10 · Frontends](10-frontends.md): CLI, Web, file APIs, and authentication.

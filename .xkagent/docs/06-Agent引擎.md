@@ -33,7 +33,7 @@ Status 只是告诉模型“现在在哪里、可以做什么”，并不执行�
 
 `plan`、`build` 和 `build-unsafe` 直接决定下一次 `pythonrt` 使用的 profile。模式切换不会动态改变已经启动的 worker；详细权限和风险见 [05 · 沙箱与工具执行](05-沙箱与工具执行.md)。
 
-Agent 会向 REPL/Web 输出 thinking、text、tool call、tool progress、tool result、usage、stats 和 interrupted 等结构化事件。前端负责渲染这些事件，执行状态仍由 Agent 线程持有。
+Agent 会向 CLI/Web 输出 thinking、text、tool call、tool progress、tool result、usage、stats 和 interrupted 等结构化事件。前端负责渲染这些事件，执行状态仍由 Agent 线程持有。
 
 Ctrl+C 通过线程安全 Event 向下传播：LLM 流约每 50 ms 检查一次，工具父进程也持续轮询并在命中时 kill worker；主循环在模型 chunk 和工具执行前还有额外检查点。内部 `_InterruptTurn` 只结束当前 turn，不会杀死 session 的 Agent 线程。未得到结果的工具调用会补入 killed 结果，避免恢复后留下不完整的工具消息。
 

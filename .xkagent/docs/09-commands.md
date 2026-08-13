@@ -4,7 +4,7 @@
 
 ---
 
-In both the REPL and Web interface, plain text is passed to the Agent, input beginning with `/` is handled by XKAgent, and input beginning with `!` is sent directly to the host shell. The two interfaces share the same slash-command registry; their main differences are interactive confirmation, session selection, and how they exit. Enter `/help` at any time to view the built-in help.
+In both the CLI and Web interface, plain text is passed to the Agent, input beginning with `/` is handled by XKAgent, and input beginning with `!` is sent directly to the host shell. The two interfaces share the same slash-command registry; their main differences are interactive confirmation, session selection, and how they exit. Enter `/help` at any time to view the built-in help.
 
 ## Distinguishing the Three History Operations
 
@@ -42,7 +42,7 @@ If the context has simply grown too long, use `/compact`. To continue with an em
 - `/session stop <name>`: Stop the session's Agent while preserving its data.
 - `/session sync [name]`: Run a SQLite WAL checkpoint.
 
-The REPL can request interactive confirmation when deleting or renaming a session, or when a fuzzy match produces multiple results. Because Web cannot offer terminal-style multi-selection, it returns the candidate names instead. If another process holds a session, the current instance enters read-only observer mode and rejects chat input and state-changing commands.
+The CLI can request interactive confirmation when deleting or renaming a session, or when a fuzzy match produces multiple results. Because Web cannot offer terminal-style multi-selection, it returns the candidate names instead. If another process holds a session, the current instance enters read-only observer mode and rejects chat input and state-changing commands.
 
 ## Models and Execution Modes
 
@@ -90,13 +90,13 @@ Each image is limited to 10 MB, and its path is stored in the current session. T
 - `/mount refresh`: Reload `permission.txt`.
 - `/unmount <path>`: Remove a dynamic mount from the current session.
 
-Dynamic mounts are saved in the session database and restored after restart. `/mount save` converts them into global configuration. In `plan` mode, all mounts are treated as read-only. Dangerous paths require confirmation: the REPL prompts the user, while Web requires the command to be explicitly resubmitted with `--force`. Mounts and the sandbox are soft boundaries that reduce the risk of accidental operations; they are not security containers.
+Dynamic mounts are saved in the session database and restored after restart. `/mount save` converts them into global configuration. In `plan` mode, all mounts are treated as read-only. Dangerous paths require confirmation: the CLI prompts the user, while Web requires the command to be explicitly resubmitted with `--force`. Mounts and the sandbox are soft boundaries that reduce the risk of accidental operations; they are not security containers.
 
 ## Compaction, Restart, and Exit
 
 - `/compact`: Summarize the session in a dedicated model turn and reset the context used from that point forward.
 - `/restart [overrides]`: Stop the current Agent and restart the process, optionally overriding startup arguments such as `--mode`, `-s`, `--port`, `--resume`, and `--workdir`.
-- `/exit`: Exit the REPL; in Web, shut down the server.
+- `/exit`: Exit the CLI; in Web, shut down the server.
 
 `/compact` is not part of the ordinary command registry. The frontend rewrites it into a dedicated message, and a streaming model turn generates the summary; it is not an immediately completed local command. If summarization fails or the turn is interrupted, the original history remains unchanged.
 
@@ -107,7 +107,7 @@ Dynamic mounts are saved in the session database and restored after restart. `/m
 !python -m pytest
 ```
 
-The REPL or Web interface passes the text after `!` directly to the host's default shell. stdout, stderr, and the exit code are displayed and recorded in the current session's command history. This channel bypasses Agent tool calls and is not constrained by `plan`, `build`, or the `pythonrt` sandbox.
+The CLI or Web interface passes the text after `!` directly to the host's default shell. stdout, stderr, and the exit code are displayed and recorded in the current session's command history. This channel bypasses Agent tool calls and is not constrained by `plan`, `build`, or the `pythonrt` sandbox.
 
 Run only commands you fully understand. Do not paste untrusted one-line scripts, secrets, or destructive commands. Exceptions from slash commands are converted into error text and returned to the frontend; `!shell` instead runs with host privileges and therefore has a fundamentally different risk boundary.
 
@@ -117,4 +117,4 @@ Run only commands you fully understand. Do not paste untrusted one-line scripts,
 - [05 · Sandbox and Tool Execution](05-sandbox-and-tools.md): Modes, mounts, and execution boundaries.
 - [07 · Skills](07-skills.md): Skill definitions, overrides, and loading.
 - [08 · Search and Memory](08-search-and-memory.md): Status, scopes, embeddings, and Compact.
-- [10 · Frontends](10-frontends.md): Interaction differences between the REPL and Web.
+- [10 · Frontends](10-frontends.md): Interaction differences between the CLI and Web.

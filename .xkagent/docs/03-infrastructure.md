@@ -84,7 +84,7 @@ When the logging module is first imported, it creates the following file for the
 <workdir>/.xkagent/logs/YYYY-MM-DD_HH-MM-SS.log
 ```
 
-Each line includes the time to millisecond precision, level, module, function, line number, and message. The file records `DEBUG` and higher, while the console initially displays `INFO` and higher. After entering the REPL, the console threshold changes to `ERROR` so routine logs do not interrupt input.
+Each line includes the time to millisecond precision, level, module, function, line number, and message. The file records `DEBUG` and higher, while the console initially displays `INFO` and higher. After entering the CLI, the console threshold changes to `ERROR` so routine logs do not interrupt input.
 
 After a file reaches approximately 100 MB, it rotates through `.1`, `.2`, and so on, retaining up to seven numbered backups. Seven refers to the number of backups, not days. The implementation uses the standard library's `logging.FileHandler`; logs are written synchronously and do not depend on a third-party logging library.
 

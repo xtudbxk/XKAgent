@@ -25,7 +25,7 @@ The model may return multiple tool calls in one response, which the engine execu
 
 XKAgent does not rely only on a fixed system prompt. Every user message is accompanied by the current local time, runtime mode, workdir and mount permissions, suggested Skills, recommended information, and any one-time request for a Skill explicitly named by the user. This prefix is persisted with the message, allowing a restored session to reconstruct the state the model saw at the time. The frontend removes the prefix for display and shows only the original message body.
 
-Status only tells the model where it is and what it can do; it does not enforce permissions. Actual path, import, and process restrictions are enforced by the `pythonrt` runtime. The long-running task orchestration and full long-term Memory described in [README](../../README.en.md) remain on the Roadmap. What exists today is status injection, retrieval-based recommendations, document persistence through `summary`, and session history persistence. These must not be treated as a complete Memory system.
+Status only tells the model where it is and what it can do; it does not enforce permissions. Actual path, import, and process restrictions are enforced by the `pythonrt` runtime. The long-running task orchestration and full long-term Memory described in [README](../../README.md) remain on the Roadmap. What exists today is status injection, retrieval-based recommendations, document persistence through `summary`, and session history persistence. These must not be treated as a complete Memory system.
 
 When automatic Skill selection is enabled, the engine makes an additional LLM call to choose a Skill. On first use, the complete `skill.md` is injected; subsequent turns may inject only a semantic anchor if the version has not changed. When selection is disabled, the engine still builds the basic status but does not make this extra selection call.
 
@@ -33,7 +33,7 @@ When automatic Skill selection is enabled, the engine makes an additional LLM ca
 
 `plan`, `build`, and `build-unsafe` directly determine the profile used by the next `pythonrt` call. Switching modes does not dynamically alter a worker that has already started. See [05 · Sandbox and Tool Execution](05-sandbox-and-tools.md) for detailed permissions and risks.
 
-The Agent emits structured events to the REPL and Web UI, including thinking, text, tool calls, tool progress, tool results, usage, stats, and interrupted events. The frontend renders these events, while the Agent thread remains responsible for execution state.
+The Agent emits structured events to the CLI and Web UI, including thinking, text, tool calls, tool progress, tool results, usage, stats, and interrupted events. The frontend renders these events, while the Agent thread remains responsible for execution state.
 
 Ctrl+C propagates through a thread-safe Event. The LLM stream checks it approximately every 50 ms, and a tool's parent process also polls continuously and kills the worker when the event is set. The main loop has additional checkpoints before model chunks and tool execution. The internal `_InterruptTurn` ends only the current turn; it does not terminate the session's Agent thread. Tool calls that did not produce a result receive killed results so that restoring the session does not leave incomplete tool messages.
 

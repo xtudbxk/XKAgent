@@ -28,7 +28,7 @@ Recommended information
 Message body
 ```
 
-This prefix is written to the current session history and sent to the model together with the message body. The REPL and Web UI display the status separately, preserving only the readable body when showing past user messages.
+This prefix is written to the current session history and sent to the model together with the message body. The CLI and Web UI display the status separately, preserving only the readable body when showing past user messages.
 
 Recommended information searches documents, other session histories, and logs by default. Results from `skills` are handled separately by the Skill recommendation channel, and the current session's history is excluded because it is already present in the active context. Thinking, tool results, and helper messages used for Skill injection are filtered out. At most two excerpts are retained from each file, and only a small number of paths and short excerpts are ultimately injected. Retrieval failures degrade silently and do not block the conversation.
 
