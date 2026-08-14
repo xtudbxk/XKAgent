@@ -1,4 +1,4 @@
-[简体中文](README.zh-CN.md) | English
+[简体中文](README.zh-CN.md) | English | [📕 图文介绍](rednote.md)
 
 <p align="center">
   <img src="./xkagent-hero.svg" alt="XKAgent — Code over Tools" width="100%">
