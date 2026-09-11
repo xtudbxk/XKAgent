@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>📂 Files — XKAgent</title>
+<style>
+  :root {
+    --bg: #f3f5fb; --surface: #ffffff; --surface2: #f6f6f6; --border: rgba(28,31,35,.08);
+    --text: #1c1f23; --text-muted: #57606a; --accent: #0066ff; --accent-hover: #0052cc;
+    --err: #dc2626; --radius: 10px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+  }
+  .topbar {
+    padding: 14px 24px; background: var(--surface); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .topbar h1 { font-size: 16px; color: var(--accent); font-weight: 600; }
+  .crumb { font-size: 13px; color: var(--text-muted); display: flex; align-items: center; gap: 2px; flex-wrap: wrap; }
+  .crumb a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .crumb a:hover { text-decoration: underline; }
+  .actions { margin-left: auto; display: flex; gap: 8px; }
+  .actions button, .actions select {
+    padding: 6px 14px; border: 1px solid var(--border); border-radius: 9999px;
+    background: var(--surface); color: var(--text); cursor: pointer; font-size: 12px;
+  }
+  .actions button:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #listing { max-width: 960px; margin: 24px auto; padding: 0 24px; }
+  table {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+    background: var(--surface); border-radius: 12px; overflow: hidden;
+    box-shadow: 0 1px 3px rgba(28,31,35,.05);
+  }
+  th, td { text-align: left; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  th { color: var(--text-muted); font-weight: 600; font-size: 12px; background: var(--surface2); }
+  tr:hover td { background: #f7f9fc; }
+  .name { cursor: pointer; }
+  .name .icon { margin-right: 6px; }
+  .dir .name { color: var(--accent); font-weight: 500; }
+  .parent-row .name { color: var(--text-muted); font-style: italic; }
+  .size { color: var(--text-muted); text-align: right; }
+  .mtime { color: var(--text-muted); }
+  .empty { padding: 48px; text-align: center; color: var(--text-muted); }
+  .err { padding: 16px 24px; color: var(--err); font-size: 13px; }
+  #loading { padding: 48px; text-align: center; color: var(--text-muted); }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <h1>📂 Files</h1>
+  <div class="crumb" id="crumbs"></div>
+  <div class="actions">
+    <select id="root-sel" title="允许根（workdir + 挂载）"></select>
+    <button onclick="refresh()" title="Refresh">🔄 Refresh</button>
+    <button onclick="window.close()" title="Close this tab">✖ Close</button>
+  </div>
+</div>
+<div id="listing"><div id="loading">Loading...</div></div>
+<script>
+const BASE = (function(){ var p = location.pathname; return p.endsWith('/') ? p : p.substring(0, p.lastIndexOf('/') + 1); })();
+let currentPath = '';
+let rootIndex = 0;
+let rootsList = [];
+let canUp = false;
+let parentPath = '';
+const qpInit = new URLSearchParams(location.search);
+const currentSession = qpInit.get('session') || '';
+
+function fmtSize(n) {
+  if (n == null) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+function fmtTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const p = (x) => String(x).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+function joinPath(base, name) {
+  if (!name) return base || '';
+  if (!base) return name;
+  return base + '/' + name;
+}
+
+function renderCrumbs(rel, rootLabel) {
+  const crumb = document.getElementById('crumbs');
+  crumb.innerHTML = '';
+  const home = document.createElement('a');
+  home.textContent = rootLabel || 'root';
+  home.onclick = () => load('', rootIndex);
+  crumb.appendChild(home);
+  const parts = rel ? rel.split('/').filter(Boolean) : [];
+  let acc = '';
+  parts.forEach((p, i) => {
+    const sep = document.createElement('span');
+    sep.textContent = ' / ';
+    crumb.appendChild(sep);
+    acc = acc ? acc + '/' + p : p;
+    const a = document.createElement('a');
+    a.textContent = p;
+    if (i === parts.length - 1) {
+      a.style.color = 'var(--text)';
+      a.style.cursor = 'default';
+    } else {
+      const pathCopy = acc;
+      a.onclick = () => load(pathCopy, rootIndex);
+    }
+    crumb.appendChild(a);
+  });
+}
+
+function load(path, ri) {
+  if (ri !== undefined) rootIndex = ri;
+  currentPath = path || '';
+  const listing = document.getElementById('listing');
+  listing.innerHTML = '<div id="loading">Loading...</div>';
+  const q = 'path=' + encodeURIComponent(currentPath)
+    + '&root_index=' + rootIndex
+    + (currentSession ? '&session=' + encodeURIComponent(currentSession) : '');
+  fetch(BASE + 'api/files/list?' + q)
+    .then(r => {
+      if (!r.ok) return r.json().then(d => { throw new Error(d.detail || '加载失败'); });
+      return r.json();
+    })
+    .then(data => {
+      rootIndex = data.root_index ?? rootIndex;
+      canUp = !!data.can_up;
+      parentPath = data.parent != null ? data.parent : '';
+      rootsList = data.roots || rootsList;
+      const rootLabel = (rootsList.find(r => r.index === rootIndex) || {}).label || 'root';
+      renderCrumbs(data.path || '', rootLabel);
+      renderList(data.entries || []);
+      syncRootSel(rootsList);
+    })
+    .catch(err => {
+      listing.innerHTML = '';
+      const errorEl = document.createElement('div');
+      errorEl.className = 'err';
+      errorEl.textContent = '❌ ' + err.message;
+      listing.appendChild(errorEl);
+    });
+}
+
+function renderList(entries) {
+  const listing = document.getElementById('listing');
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  thead.innerHTML = '<tr><th>Name</th><th class="size">Size</th><th>Modified</th></tr>';
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  const sessQ = currentSession ? '&session=' + encodeURIComponent(currentSession) : '';
+  const riQ = '&root_index=' + rootIndex;
+
+  if (canUp) {
+    const tr = document.createElement('tr');
+    tr.className = 'dir parent-row';
+    const tdName = document.createElement('td');
+    tdName.className = 'name';
+    tdName.innerHTML = '<span class="icon">⬆️</span>..';
+    tdName.onclick = () => load(parentPath, rootIndex);
+    tr.appendChild(tdName);
+    tr.appendChild(document.createElement('td'));
+    tr.appendChild(document.createElement('td'));
+    tbody.appendChild(tr);
+  }
+
+  if (!entries.length) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 3;
+    td.className = 'empty';
+    td.textContent = '(空目录)';
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+
+  entries.forEach(e => {
+    const tr = document.createElement('tr');
+    tr.className = e.is_dir ? 'dir' : 'file';
+    const tdName = document.createElement('td');
+    tdName.className = 'name';
+    const icon = document.createElement('span');
+    icon.className = 'icon';
+    icon.textContent = e.is_dir ? '📁' : '📄';
+    tdName.appendChild(icon);
+    tdName.appendChild(document.createTextNode(e.name));
+    tdName.onclick = () => {
+      const next = joinPath(currentPath, e.name);
+      if (e.is_dir) {
+        load(next, rootIndex);
+      } else {
+        openFile(next, e.name);
+      }
+    };
+    const tdSize = document.createElement('td');
+    tdSize.className = 'size';
+    tdSize.textContent = e.is_dir ? '' : fmtSize(e.size);
+    const tdTime = document.createElement('td');
+    tdTime.className = 'mtime';
+    tdTime.textContent = fmtTime(e.mtime);
+    tr.appendChild(tdName);
+    tr.appendChild(tdSize);
+    tr.appendChild(tdTime);
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  listing.innerHTML = '';
+  listing.appendChild(table);
+}
+
+// ── 在线预览分发（2026-09-08）：图片/HTML 新标签原生渲染；pdf + 文本类 → viewer.html 预览页（md 渲染）──
+const INLINE_EXTS = /\.(png|jpe?g|gif|webp|bmp|svg|ico|html?)$/i;
+const VIEWER_EXTS = /\.(pdf|txt|md|markdown|json|ya?ml|csv|log|xml|ini|cfg|conf|toml|py|js|ts|jsx|tsx|go|rs|rb|sh|bash|c|cc|cpp|h|hpp|java|php|sql|css|tex|rst|ipynb)$/i;
+
+function openFile(relPath, name) {
+  const q = 'path=' + encodeURIComponent(relPath)
+    + '&root_index=' + rootIndex
+    + (currentSession ? '&session=' + encodeURIComponent(currentSession) : '');
+  if (INLINE_EXTS.test(name)) {
+    window.open(BASE + 'api/files/download?' + q + '&preview=1');
+  } else if (VIEWER_EXTS.test(name)) {
+    window.open(BASE + 'viewer.html?' + q);
+  } else {
+    window.open(BASE + 'api/files/download?' + q);
+  }
+}
+
+function refresh() { load(currentPath, rootIndex); }
+
+function syncRootSel(roots) {
+  rootsList = roots || rootsList;
+  const sel = document.getElementById('root-sel');
+  if (!sel) return;
+  sel.innerHTML = '';
+  rootsList.forEach(r => {
+    const opt = document.createElement('option');
+    opt.value = String(r.index);
+    opt.textContent = r.label;
+    sel.appendChild(opt);
+  });
+  sel.value = String(rootIndex);
+  sel.onchange = () => load('', parseInt(sel.value, 10) || 0);
+}
+
+function loadRoots() {
+  fetch(BASE + 'api/files/roots' + (currentSession ? '?session=' + encodeURIComponent(currentSession) : ''))
+    .then(r => r.json())
+    .then(data => { syncRootSel(data.roots || []); })
+    .catch(() => {});
+}
+
+const qp = new URLSearchParams(location.search);
+rootIndex = parseInt(qp.get('root_index') || '0', 10) || 0;
+load(qp.get('path') || '', rootIndex);
+loadRoots();
+</script>
+</body>
+</html>

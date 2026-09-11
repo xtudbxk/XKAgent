@@ -1,3 +1,4 @@
+# deps: stdlib only
 """history_parser — WAL 安全 SQLite 连接读模块
 
 解决 WASM 沙箱只读环境下 WAL 模式 SQLite 数据库无法直接连接的问题。

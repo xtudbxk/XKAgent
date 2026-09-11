@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# deps: stdlib only
 """Syntax checker: uses ast.parse() to validate .py files.
 
 Pure stdlib, zero dependencies. Compatible with WASM Python (no -m flag needed).

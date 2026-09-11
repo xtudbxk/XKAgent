@@ -11,7 +11,7 @@
 Phase 1 → 技能名 = code_review, 描述 = Python 代码审查, 目标模式 = build
 Phase 2 → 主类型 = workflow（核心是审查流程）
 Phase 3 → 拆解步骤：
-            S1 读文件       → 已有 bash cat，无需工具
+            S1 读文件       → pythonrt 读取（open+print），无需额外脚本
             S2 复杂度分析   → 可脚本化 → complexity.py
             S3 反模式检查   → LLM 处理
             S4 命名检查     → 可脚本化（合并到 complexity.py）

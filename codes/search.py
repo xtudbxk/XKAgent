@@ -67,11 +67,10 @@ from codes._log import logger
 _ONNX_MODEL_PARENT_DIR = Path(__file__).resolve().parent.parent / "models"
 _ONNX_MODEL_NAME = "all-MiniLM-L6-v2-onnx"
 _ONNX_MODEL_DIR = str(_ONNX_MODEL_PARENT_DIR / _ONNX_MODEL_NAME)
-_ONNX_MODEL_DOWNLOAD_URL = (
-    "https://connectpolyu-my.sharepoint.com/personal/22040257r_connect_polyu_hk/"
-    "_layouts/15/download.aspx?SourceUrl=%2Fpersonal%2F22040257r%5Fconnect%5Fpolyu%5Fhk%2F"
-    "Documents%2FAttachments%2FMiniLM%2DL6%2Dv2%2Donnx%2Etar%2Egz"
-)
+# 模型下载源（可选）：指向一个包含 all-MiniLM-L6-v2-onnx 模型目录的 tar.gz 打包。
+# 默认留空 —— 缺失模型时提示手动准备（把模型目录放入 models/ 即可）；如需自动下载，可自行配置来源 URL。
+# _ONNX_MODEL_DOWNLOAD_URL = "https://<your-host>/all-MiniLM-L6-v2-onnx.tar.gz"
+_ONNX_MODEL_DOWNLOAD_URL = ""
 _MODEL_DOWNLOAD_TIMEOUT_SECONDS = 300
 _DOWNLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
 _DATA_PART_SUFFIX = ".part-"
@@ -184,7 +183,7 @@ def _download_file(
     _validate_positive_int(chunk_size, "chunk_size")
 
     destination_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info(f"开始下载 ONNX 模型压缩包: {url}")
+    logger.info("开始下载 ONNX 模型压缩包")
 
     request = urllib.request.Request(
         url.strip(),
@@ -255,7 +254,7 @@ def _safe_extract_tar(archive_path: Path, extract_dir: Path) -> None:
 def _find_extracted_model_dir(extract_dir: Path, expected_dir_name: str) -> Path:
     """在解压目录中查找可用模型目录。
 
-    SharePoint 下载包的顶层目录结构可能变化，因此这里做一次搜索，
+    下载包的顶层目录结构可能变化，因此这里做一次搜索，
     优先选择目录名匹配的结果，避免未来打包方式变化导致路径写死失效。
     """
     if not isinstance(extract_dir, Path):
@@ -304,6 +303,11 @@ def _download_and_prepare_model(model_dir: Path) -> None:
         archive_path = temp_dir / f"{model_dir.name}.tar.gz"
         extract_dir = temp_dir / "extract"
 
+        if not _ONNX_MODEL_DOWNLOAD_URL:
+            raise FileNotFoundError(
+                "本地 ONNX 模型不存在，且未配置下载源（_ONNX_MODEL_DOWNLOAD_URL 为空）。"
+                "请手动准备 all-MiniLM-L6-v2-onnx 模型目录并放入 models/ 下"
+                "（参考：sentence-transformers/all-MiniLM-L6-v2）后重试。")
         _download_file(_ONNX_MODEL_DOWNLOAD_URL, archive_path)
         _safe_extract_tar(archive_path, extract_dir)
 
@@ -503,38 +507,28 @@ def _get_db(db_path: str) -> sqlite3.Connection:
 #  检索层 — FAISS 内存缓存（lazy + dirty 标记）
 # ═══════════════════════════════════════════════════════════════
 #
-#  _FAISS_INDEX  : faiss.IndexFlatIP（L2 归一化后内积 = 余弦相似度）
-#  _FAISS_KEYS   : List[str]，与 index 行顺序一一对应的 key（可重复）
-#                  例如: ["web_search", "web_search", "plan", "check", "check"]
-#  _FAISS_DB_PATH: 当前缓存对应的 db 路径
-#  _FAISS_DIRTY  : 数据变更后标记为 True，下次 search 时重建
+#  _FAISS_CACHE: 规范 DB 绝对路径 → 独立 index/keys/version 缓存
+#  所有缓存访问和 FAISS search 均由 _FAISS_CACHE_LOCK 串行保护
 # ═══════════════════════════════════════════════════════════════
 
-_FAISS_INDEX = None
-_FAISS_KEYS: List[str] = []
-_FAISS_DB_PATH: str = ""
-_FAISS_DIRTY: bool = True
-_FAISS_VERSION: int = 0      # 数据变更时自增
-_CACHED_VERSION: int = -1    # 当前缓存的版本
+_FAISS_CACHE: dict = {}
+_FAISS_CACHE_LOCK = threading.RLock()
+
+
+def _db_cache_key(db_path: str) -> str:
+    """返回 DB 的规范绝对路径，避免相对路径别名共享或串用缓存。"""
+    return str(Path(db_path).expanduser().resolve())
 
 
 def _rebuild_index(db_path: str):
-    """从 SQLite 重建 FAISS 索引（完全精确，适合小规模 N）"""
-    global _FAISS_INDEX, _FAISS_KEYS, _FAISS_DB_PATH, _FAISS_DIRTY, _CACHED_VERSION
-
+    """从 SQLite 重建 FAISS 索引；调用方可持锁，函数内也用 RLock 保护写入。"""
+    cache_key = _db_cache_key(db_path)
+    with _FAISS_CACHE_LOCK:
+        entry = _FAISS_CACHE.setdefault(cache_key, {"version": 0})
+        ver = entry["version"]
     conn = _get_db(db_path)
     rows = conn.execute("SELECT id, key, vector FROM vec_store ORDER BY id").fetchall()
     conn.close()
-
-    _FAISS_DB_PATH = db_path
-    _FAISS_DIRTY = False
-    _CACHED_VERSION = _FAISS_VERSION
-
-    if not rows:
-        _FAISS_INDEX = None
-        _FAISS_KEYS = []
-        return
-
     vectors: List[List[float]] = []
     keys: List[str] = []
     for _, key_str, vec_json in rows:
@@ -545,31 +539,26 @@ def _rebuild_index(db_path: str):
         vectors.append(vec)
         keys.append(key_str)
 
-    if not vectors:
-        _FAISS_INDEX = None
-        _FAISS_KEYS = []
-        return
-
-    if faiss is None or np is None:
-        # faiss/numpy 缺失：无法构建向量索引 → 保持无索引，上层降级纯 ngram
-        _FAISS_INDEX = None
-        _FAISS_KEYS = []
-        return
-
-    vec_np = np.array(vectors, dtype=np.float32)
-    faiss.normalize_L2(vec_np)  # L2 归一化后 Inner Product = Cosine Similarity
-
-    dim = vec_np.shape[1]
-    _FAISS_INDEX = faiss.IndexFlatIP(dim)
-    _FAISS_INDEX.add(vec_np)
-    _FAISS_KEYS = keys
+    index = None
+    if vectors and faiss is not None and np is not None:
+        vec_np = np.array(vectors, dtype=np.float32)
+        faiss.normalize_L2(vec_np)
+        index = faiss.IndexFlatIP(vec_np.shape[1])
+        index.add(vec_np)
+    with _FAISS_CACHE_LOCK:
+        entry = _FAISS_CACHE.setdefault(cache_key, {"version": 0})
+        if entry["version"] != ver:
+            return entry
+        entry.update({"index": index, "keys": keys if index is not None else [],
+                      "cached_version": ver})
+        return entry
 
 
-def _mark_dirty():
-    """标记 FAISS 缓存为脏，下次 search 时自动重建"""
-    global _FAISS_DIRTY, _FAISS_VERSION
-    _FAISS_DIRTY = True
-    _FAISS_VERSION += 1
+def _mark_dirty(db_path: str):
+    """仅标记指定 DB 的 FAISS 缓存为脏。"""
+    with _FAISS_CACHE_LOCK:
+        entry = _FAISS_CACHE.setdefault(_db_cache_key(db_path), {"version": 0})
+        entry["version"] += 1
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -591,18 +580,20 @@ _RESERVE_RATIO = 3
 
 
 
-def _search_unique(query_np: "np.ndarray", top_k: int) -> List[Tuple[str, float]]:
+def _search_unique(query_np: "np.ndarray", top_k: int, entry: dict) -> List[Tuple[str, float]]:
     """FAISS 搜索 + 去重，返回不重复的 (key, score) 列表"""
-    if _FAISS_INDEX is None or _FAISS_INDEX.ntotal == 0:
+    index = entry.get("index")
+    keys = entry.get("keys") or []
+    if index is None or index.ntotal == 0:
         return []
 
-    k = min(top_k * _RESERVE_RATIO, _FAISS_INDEX.ntotal)
-    distances, indices = _FAISS_INDEX.search(query_np, k)
+    k = min(top_k * _RESERVE_RATIO, index.ntotal)
+    distances, indices = index.search(query_np, k)
 
     seen: set = set()
     results: List[Tuple[str, float]] = []
     for pos, idx in enumerate(indices[0]):
-        key_str = _FAISS_KEYS[idx]
+        key_str = keys[idx]
         if key_str not in seen:
             seen.add(key_str)
             results.append((key_str, float(distances[0][pos])))
@@ -643,7 +634,7 @@ def store(sentence: str, db_path: str, key: str) -> bool:
     conn.commit()
     conn.close()
 
-    _mark_dirty()
+    _mark_dirty(db_path)
     return True
 
 
@@ -688,7 +679,7 @@ def store_batch(sentences: List[str], db_path: str, key: str) -> bool:
     conn.commit()
     conn.close()
 
-    _mark_dirty()
+    _mark_dirty(db_path)
     return True
 
 
@@ -721,12 +712,12 @@ def search(sentence: str, db_path: str, top_k: int = 5) -> List[Tuple[str, float
     query_np = np.array([model.encode(sentence)], dtype=np.float32)
     faiss.normalize_L2(query_np)
 
-    # ② 重建 FAISS（如需）
-    if _FAISS_DIRTY or _FAISS_DB_PATH != db_path or _CACHED_VERSION != _FAISS_VERSION:
-        _rebuild_index(db_path)
-
-    # ③ 搜索 + 去重
-    return _search_unique(query_np, top_k)
+    # ② 每个 DB 独立检查/重建缓存；锁覆盖 FAISS search，避免并发重建时串用。
+    with _FAISS_CACHE_LOCK:
+        entry = _FAISS_CACHE.setdefault(_db_cache_key(db_path), {"version": 0})
+        if entry.get("cached_version", -1) != entry["version"]:
+            entry = _rebuild_index(db_path)
+        return _search_unique(query_np, top_k, entry)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -741,7 +732,7 @@ def delete(key: str, db_path: str) -> bool:
     conn.commit()
     conn.close()
     if deleted:
-        _mark_dirty()
+        _mark_dirty(db_path)
     return deleted
 
 
@@ -881,15 +872,28 @@ _SEARCH_CONST = {
 C = _SEARCH_CONST
 
 
-def _data_dir() -> Path:
-    """返回当前数据目录；兼容 config 尚未提供 DATA_DIR_NAME 的版本。"""
+def _canonical_workdir(workdir: "str | Path | None" = None) -> Path:
+    """规范化显式 workdir；未传时保持兼容，使用全局 config。"""
     from codes import config
-    return config.get_workdir() / getattr(config, "DATA_DIR_NAME", ".xkagent")
+    return Path(workdir if workdir is not None else config.get_workdir()).expanduser().resolve()
 
 
-def _search_index_dir() -> str:
+def _data_dir(workdir: "str | Path | None" = None) -> Path:
+    """返回指定工作目录的数据目录。"""
+    from codes import config
+    return _canonical_workdir(workdir) / getattr(config, "DATA_DIR_NAME", ".xkagent")
+
+
+def _search_index_dir(workdir: "str | Path | None" = None) -> str:
     """统一向量索引目录: .xkagent/search_index/"""
-    return str(_data_dir() / "search_index")
+    return str(_data_dir(workdir) / "search_index")
+
+
+def _index_db_path(scope: str, workdir: "str | Path | None" = None) -> str:
+    """返回指定 workdir/scope 唯一拥有的索引 DB 路径。"""
+    if not isinstance(scope, str) or not re.fullmatch(r"[\w.-]+", scope) or scope in (".", ".."):
+        raise ValueError(f"非法搜索 scope: {scope!r}")
+    return os.path.join(_search_index_dir(workdir), f"{scope}.db")
 
 
 @dataclass
@@ -904,41 +908,38 @@ class SearchHit:
     meta: dict = field(default_factory=dict)
 
 
-# ── 后缀路由表: 后缀 → (提取器名, 默认方案, 通道) ──────────────
+# ── 后缀路由表: 后缀 → (提取器名, 默认方案) ──────────────
 ROUTE_TABLE = {
-    # 语义型 → embedding（文档/注释/消息原文）
-    ".md":  ("extract_markdown", "embedding", "semantic"),
-    ".txt": ("extract_markdown", "embedding", "semantic"),
-    ".rst": ("extract_markdown", "embedding", "semantic"),
-    ".py":  ("extract_python",   "embedding", "semantic"),
-    ".pyw": ("extract_python",   "embedding", "semantic"),
-    ".c":   ("extract_c_like",   "embedding", "semantic"),
-    ".h":   ("extract_c_like",   "embedding", "semantic"),
-    ".cpp": ("extract_c_like",   "embedding", "semantic"),
-    ".hpp": ("extract_c_like",   "embedding", "semantic"),
-    ".rs":  ("extract_rust",     "embedding", "semantic"),
-    ".db":  ("extract_history",  "embedding", "semantic"),
-    # 精确型 → grep（配置/日志/脚本）
-    ".log":  ("extract_log", "grep", "raw"),
-    ".json": ("extract_raw", "grep", "raw"),
-    ".yaml": ("extract_raw", "grep", "raw"),
-    ".yml":  ("extract_raw", "grep", "raw"),
-    ".toml": ("extract_raw", "grep", "raw"),
-    ".ini":  ("extract_raw", "grep", "raw"),
-    ".cfg":  ("extract_raw", "grep", "raw"),
-    ".sh":   ("extract_raw", "grep", "raw"),
-    ".bash": ("extract_raw", "grep", "raw"),
-    ".html": ("extract_raw", "grep", "raw"),
-    ".css":  ("extract_raw", "grep", "raw"),
-    ".js":   ("extract_raw", "grep", "raw"),
-    ".ts":   ("extract_raw", "grep", "raw"),
-    ".go":   ("extract_raw", "grep", "raw"),
-    ".java": ("extract_raw", "grep", "raw"),
+    ".md":  ("extract_markdown", "embedding"),
+    ".txt": ("extract_markdown", "embedding"),
+    ".rst": ("extract_markdown", "embedding"),
+    ".py":  ("extract_python",   "embedding"),
+    ".pyw": ("extract_python",   "embedding"),
+    ".c":   ("extract_c_like",   "embedding"),
+    ".h":   ("extract_c_like",   "embedding"),
+    ".cpp": ("extract_c_like",   "embedding"),
+    ".hpp": ("extract_c_like",   "embedding"),
+    ".rs":  ("extract_rust",     "embedding"),
+    ".db":  ("extract_history",  "embedding"),
+    ".log":  ("extract_log", "grep"),
+    ".json": ("extract_raw", "grep"),
+    ".yaml": ("extract_raw", "grep"),
+    ".yml":  ("extract_raw", "grep"),
+    ".toml": ("extract_raw", "grep"),
+    ".ini":  ("extract_raw", "grep"),
+    ".cfg":  ("extract_raw", "grep"),
+    ".sh":   ("extract_raw", "grep"),
+    ".bash": ("extract_raw", "grep"),
+    ".html": ("extract_raw", "grep"),
+    ".css":  ("extract_raw", "grep"),
+    ".js":   ("extract_raw", "grep"),
+    ".ts":   ("extract_raw", "grep"),
+    ".go":   ("extract_raw", "grep"),
+    ".java": ("extract_raw", "grep"),
 }
-# 代码文件后缀（附带符号通道）
-_CODE_EXTS = {".py", ".pyw", ".c", ".h", ".cpp", ".hpp", ".rs"}
 
-# 范围根目录（相对 workdir）
+# 范围根目录（相对 workdir）；skills 实际生效路径由 _scope_roots 内 `codes.skill._skill_dirs()`
+# 动态决定（用户级 .xkagent/skills 优先 + 内置级兜底），此处 "skills" 仅作默认/文档值
 SCOPE_ROOTS = {
     "skills":   "skills",
     "docs":     ".xkagent/docs",
@@ -953,7 +954,7 @@ SCOPE_ROOTS = {
 SEARCH_CONFIG_FILE = "search_ranges.txt"
 
 
-def load_search_config() -> dict:
+def load_search_config(workdir: "str | Path | None" = None) -> dict:
     """读取全局搜索范围配置（.xkagent/search_ranges.txt）。
 
     行语法（对齐 permission.txt 风格）:
@@ -961,7 +962,7 @@ def load_search_config() -> dict:
       <path> deny           禁止搜索路径（前缀匹配，文件/子树均排除）
     返回 {"adds": [{"path": abs, "scope": str}], "denies": [abs]}。
     """
-    fp = os.path.join(str(_data_dir()), SEARCH_CONFIG_FILE)
+    fp = os.path.join(str(_data_dir(workdir)), SEARCH_CONFIG_FILE)
     adds: list = []
     denies: list = []
     if not os.path.isfile(fp):
@@ -977,7 +978,9 @@ def load_search_config() -> dict:
                 continue
             path_, action = parts[0], parts[1].lower()
             scope = parts[2] if len(parts) > 2 else "extra"
-            abs_path = os.path.abspath(os.path.expanduser(path_))
+            expanded = os.path.expanduser(path_)
+            abs_path = os.path.abspath(expanded if os.path.isabs(expanded)
+                                       else os.path.join(str(_canonical_workdir(workdir)), expanded))
             if not os.path.exists(abs_path):
                 logger.warning(f"[search] search_ranges.txt:{lineno}: {abs_path} does not exist, skipping")
                 continue
@@ -990,9 +993,10 @@ def load_search_config() -> dict:
     return {"adds": adds, "denies": denies}
 
 
-def _effective_search_config(session: str | None = None) -> dict:
+def _effective_search_config(session: str | None = None,
+                             workdir: "str | Path | None" = None) -> dict:
     """合并全局 + per-session 搜索范围配置（session 覆盖全局同 path；deny 取并集）。"""
-    cfg = load_search_config()
+    cfg = load_search_config(workdir)
     if not session:
         return cfg
     try:
@@ -1010,12 +1014,22 @@ def _effective_search_config(session: str | None = None) -> dict:
     return {"adds": list(adds.values()), "denies": sorted(denies)}
 
 
-def _scope_roots(session: str | None = None) -> dict:
+def _scope_roots(session: str | None = None,
+                 workdir: "str | Path | None" = None) -> dict:
     """生效的搜索范围根：内置 SCOPE_ROOTS + 配置 add（按 scope 分组，dict[scope]=[roots]）。"""
-    cfg = _effective_search_config(session)
+    cfg = _effective_search_config(session, workdir)
     roots: dict = {}
     for sc, root in SCOPE_ROOTS.items():
         roots.setdefault(sc, []).append(root)
+    # skills 范围与加载侧统一（用户级 .xkagent/skills 优先 + 内置级兜底）：
+    # 用 codes.skill._skill_dirs() 取代固定相对路径 "skills"，保证 searchskill/searchinfo
+    # 与 SkillLoader.list_skills / _find_skill_dir 检索同一批技能文件。
+    if "skills" in roots:
+        try:
+            from codes.skill import _skill_dirs
+            roots["skills"] = _skill_dirs(workdir)
+        except Exception:
+            pass  # 导入异常时保留默认 roots（"skills" 相对路径兜底）
     for it in cfg["adds"]:
         roots.setdefault(it["scope"] or "extra", []).append(it["path"])
     return roots
@@ -1032,74 +1046,6 @@ def _is_denied(path: str, denies: list) -> bool:
             return True
     return False
 
-
-
-# ── 签名持久化（索引生命周期: mtime+size 失效检测，重启不丢）────
-_SIG_TABLE = """
-CREATE TABLE IF NOT EXISTS file_sig (
-    path TEXT PRIMARY KEY,
-    mtime_ns INTEGER,
-    size INTEGER,
-    updated_at TEXT
-);
-"""
-
-
-def _sig_db(scope: str) -> str:
-    return os.path.join(_search_index_dir(), f"{scope}.sig.db")
-
-
-def _get_sig_conn(db: str) -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(db), exist_ok=True)
-    conn = sqlite3.connect(db)
-    conn.executescript(_SIG_TABLE)
-    return conn
-
-
-def _file_sig(path: str) -> tuple:
-    st = os.stat(path)
-    return (st.st_mtime_ns, st.st_size)
-
-
-def _needs_reindex(path: str, scope: str) -> bool:
-    """签名对比：DB 无记录或签名不同 → 需重建索引"""
-    try:
-        sig = _file_sig(path)
-    except OSError:
-        return False
-    conn = _get_sig_conn(_sig_db(scope))
-    try:
-        row = conn.execute("SELECT mtime_ns, size FROM file_sig WHERE path=?",
-                           (path,)).fetchone()
-    finally:
-        conn.close()
-    if row is not None and row[0] == sig[0] and row[1] == sig[1]:
-        return False
-    # 更新签名（标记为已索引）
-    conn = _get_sig_conn(_sig_db(scope))
-    try:
-        conn.execute(
-            "INSERT OR REPLACE INTO file_sig (path, mtime_ns, size, updated_at) "
-            "VALUES (?,?,?,datetime('now'))", (path, sig[0], sig[1]))
-        conn.commit()
-    finally:
-        conn.close()
-    return True
-
-
-def _remove_sig(path: str, scope: str) -> None:
-    """文件删除 → 清签名 + 向量索引（幽灵清理）"""
-    try:
-        conn = _get_sig_conn(_sig_db(scope))
-        conn.execute("DELETE FROM file_sig WHERE path=?", (path,))
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
-    try:
-        delete(path, os.path.join(_search_index_dir(), f"{scope}.db"))
-    except Exception:
-        pass
 
 
 # ── 提取器 ─────────────────────────────────────────────────────
@@ -1268,57 +1214,24 @@ def extract_log(path: str) -> list:
 
 
 def extract_history(path: str) -> list:
-    """historys db → 消息原文（WAL 安全读）"""
-    tmp_copy = None
-    tmpdir = None
-    if os.path.exists(path + "-wal"):
-        import tempfile as _tf
-        tmpdir = _tf.mkdtemp(prefix="search_hist_")
-        base_name = os.path.basename(path)
-        tmp_copy = os.path.join(tmpdir, base_name)
-        for ext in ("", "-wal", "-shm"):
-            src = path + ext
-            if os.path.exists(src):
-                with open(src, "rb") as fi, open(tmp_copy + ext, "wb") as fo:
-                    fo.write(fi.read())
-        conn_path = tmp_copy
-    else:
-        conn_path = path
+    """historys msgz → 消息原文（2026-08-24 msgz 切换：单文件 zlib 读）"""
     try:
-        conn = sqlite3.connect(f"file:{conn_path}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return []
-    blocks = []
-    try:
-        rows = conn.execute(
-            "SELECT id, role, content, extras FROM messages ORDER BY id").fetchall()
-        sess = os.path.basename(path).replace(".db", "")
-        for rid, role, content, extras in rows:
+        from codes.history_msgz import MsgzStore
+        store = MsgzStore(path, auto_sync=False)
+        blocks = []
+        sess = os.path.basename(path).replace(".msgz", "")
+        for m in store.messages:
+            content = m.get("content") or ""
             if not content:
                 continue
-            blocks.append(SearchHit(key=f"historys:{sess}:{rid}", scope="historys",
+            blocks.append(SearchHit(key=f"historys:{sess}:{m['id']}", scope="historys",
                                     channel="semantic", method="", score=0.0,
                                     snippet=content[:200],
-                                    meta={"text": content, "role": role,
-                                          "extras": extras}))
-    except sqlite3.Error:
-        pass
-    try:
-        conn.close()
+                                    meta={"text": content, "role": m.get("role"),
+                                          "extras": m.get("extras")}))
+        return blocks
     except Exception:
-        pass
-    if tmpdir:
-        try:
-            for fn in os.listdir(tmpdir):
-                try:
-                    os.remove(os.path.join(tmpdir, fn))
-                except OSError:
-                    pass
-            os.rmdir(tmpdir)
-        except OSError:
-            pass
-    return blocks
-
+        return []
 
 def extract_raw(path: str) -> list:
     """配置文件等 → 原文整块（grep）"""
@@ -1400,11 +1313,71 @@ def _char_ngrams(text: str, n_range: tuple = (2, 4)) -> collections.Counter:
         for i in range(len(clean) - n + 1))
 
 
-def _cosine_counter(a: collections.Counter, b: collections.Counter) -> float:
-    keys = set(a) | set(b)
-    dot = sum(a[k] * b[k] for k in keys)
-    na = math.sqrt(sum(v * v for v in a.values()))
-    nb = math.sqrt(sum(v * v for v in b.values()))
+# ── ngram 特征缓存（2026-08-23：historys 范围全量 ngram 匹配 ~9s 优化）──
+# 实测（08-23）：historys 4426 块/977 万字符，全量 char_ngrams≈4.7s + tokenize≈0.8s，
+# 且每轮 search_all 都重复计算相同文本 → 缓存 ≤2000 字符块的
+# (char_ngrams, frozenset tokens, norm) 跨轮复用（historys 内容两次 search 间基本不变）。
+# 内存实测：≤2000 字符块全量 ≈307MB（>2000 长块重算，避免全量 887MB 峰值）；机器内存充足可接受。
+# 长块（>2000）仅缓存 tokenize 结果（内存小），char_ngrams 每次重算。
+_NGRAM_CACHE_MAX_TEXT = 2000      # 仅缓存 ≤2000 字符的文本（长块每次重算）
+_NGRAM_CACHE_MAX = 4000           # LRU 上限（historys 短块 3316 + 余量）
+_ngram_cache: "collections.OrderedDict[str, tuple]" = collections.OrderedDict()
+_ngram_cache_lock = threading.Lock()
+
+# 长块 tokenize 缓存（frozenset tokens 内存小：4435 块 × ~200 token ≈ 50MB）
+_TOKEN_CACHE_MAX = 20000
+_token_cache: "dict[str, frozenset]" = {}
+_token_cache_lock = threading.Lock()
+
+
+def _cached_ngram_features(text: str):
+    """返回 (char_ngrams Counter, frozenset tokens, norm)；短文本走 LRU 缓存，
+    长文本（>_NGRAM_CACHE_MAX_TEXT）只缓存 tokenize 结果，char_ngrams 每次重算。"""
+    if len(text) <= _NGRAM_CACHE_MAX_TEXT:
+        with _ngram_cache_lock:
+            hit = _ngram_cache.get(text)
+            if hit is not None:
+                _ngram_cache.move_to_end(text)
+                return hit
+    if len(text) <= _NGRAM_CACHE_MAX_TEXT:
+        c = _char_ngrams(text)
+        t = frozenset(_tokenize(text))
+        nb = math.sqrt(sum(v * v for v in c.values()))
+        feats = (c, t, nb)
+        with _ngram_cache_lock:
+            _ngram_cache[text] = feats
+            if len(_ngram_cache) > _NGRAM_CACHE_MAX:
+                _ngram_cache.popitem(last=False)
+        return feats
+    # 长块：只缓存 tokenize（char_ngrams 每次重算）
+    with _token_cache_lock:
+        t = _token_cache.get(text)
+    if t is None:
+        t = frozenset(_tokenize(text))
+        with _token_cache_lock:
+            _token_cache[text] = t
+            if len(_token_cache) > _TOKEN_CACHE_MAX:
+                # 简单淘汰：清空一半（长块 tokenize 缓存为辅助，偶发清空可接受）
+                for k in list(_token_cache)[: len(_token_cache) // 2]:
+                    del _token_cache[k]
+    c = _char_ngrams(text)
+    nb = math.sqrt(sum(v * v for v in c.values()))
+    return (c, t, nb)
+
+
+def _cosine_counter(a: collections.Counter, b: collections.Counter,
+                    nb: float | None = None, na: float | None = None) -> float:
+    """余弦相似度，O(|a|)（a 为 query，通常远小于 b）：只遍历 a 的 gram 求交集点积；
+    nb/na 可传预计算范数，避免对 b 全量遍历（大块文本的主要开销）。"""
+    dot = 0.0
+    for k, av in a.items():
+        bv = b.get(k)
+        if bv:
+            dot += av * bv
+    if na is None:
+        na = math.sqrt(sum(v * v for v in a.values()))
+    if nb is None:
+        nb = math.sqrt(sum(v * v for v in b.values()))
     return dot / (na * nb) if na and nb else 0.0
 
 
@@ -1413,11 +1386,12 @@ def search_ngram(query: str, blocks: list, top_k: int = 5) -> list:
     q_ngrams = _char_ngrams(query)
     if sum(q_tokens.values()) < C["SHORT_QUERY_TOKENS"]:
         return []
+    q_norm = math.sqrt(sum(v * v for v in q_ngrams.values()))
     scored = []
     for b in blocks:
         text = b.meta.get("text", "")
-        sim = _cosine_counter(q_ngrams, _char_ngrams(text))
-        t_tokens = set(_tokenize(text))
+        c, t_tokens, nb = _cached_ngram_features(text)
+        sim = _cosine_counter(q_ngrams, c, nb, q_norm)
         kw = sum(q_tokens.get(tok, 0) for tok in t_tokens if tok in q_tokens)
         score = sim * 20.0 + kw * 2.0
         if score >= C["NGRAM_MIN_SCORE"]:
@@ -1427,11 +1401,11 @@ def search_ngram(query: str, blocks: list, top_k: int = 5) -> list:
                       score=s, snippet=b.meta.get("text", "")[:200], meta=b.meta)
             for s, b in scored[:top_k]]
 
-
 # ── embedding 方案（包装向量 search + 阈值降级）────────────────
 
 def search_embedding(query: str, blocks: list, top_k: int = 5,
-                     scopes: list | None = None):
+                     scopes: list | None = None,
+                     workdir: "str | Path | None" = None):
     """语义通道主方案：查各范围向量索引。
 
     返回 None = 模型不可用/索引为空/全部低分 → 触发上层降级 ngram。
@@ -1446,7 +1420,7 @@ def search_embedding(query: str, blocks: list, top_k: int = 5,
     _t0 = time.perf_counter()
     # 全部范围统一用 search_index/{scope}.db（skills 也统一，由 /updateembedding 维护）
     scopes = scopes if scopes else [scope]
-    dbs = [os.path.join(_search_index_dir(), f"{s}.db") for s in scopes]
+    dbs = [_index_db_path(s, workdir) for s in scopes]
     dbs = [d for d in dbs if os.path.exists(d)]
     if not dbs:
         return None
@@ -1513,7 +1487,7 @@ def _collect_file(path: str, scope: str, blocks: list) -> None:
     route = ROUTE_TABLE.get(ext)
     if not route:
         return
-    extractor_name, def_method, _chan = route
+    extractor_name, def_method = route
     try:
         if os.path.getsize(path) > C["MAX_FILE_SIZE"] and def_method == "embedding":
             return
@@ -1533,18 +1507,18 @@ def _collect_file(path: str, scope: str, blocks: list) -> None:
     blocks.extend(file_blocks)
 
 
-def collect_scope(scope: str, session: str | None = None) -> list:
+def collect_scope(scope: str, session: str | None = None,
+                  workdir: "str | Path | None" = None) -> list:
     """收集某范围全部文本块（按后缀路由到提取器）。
 
     roots = 内置 SCOPE_ROOTS + 配置 add（session=None 仅全局配置生效）；
     deny 前缀匹配过滤（文件/目录均可禁，可禁内置范围根）。
     """
-    roots = _scope_roots(session).get(scope) or []
-    denies = _effective_search_config(session)["denies"]
+    roots = _scope_roots(session, workdir).get(scope) or []
+    denies = _effective_search_config(session, workdir)["denies"]
     if not roots:
         return []
-    from codes import config
-    wd = str(config.get_workdir())
+    wd = str(_canonical_workdir(workdir))
     blocks = []
     for root in roots:
         abs_root = root if os.path.isabs(root) else os.path.join(wd, root)
@@ -1559,6 +1533,8 @@ def collect_scope(scope: str, session: str | None = None) -> list:
             if _is_denied(path_, denies):
                 continue
             _collect_file(path_, scope, blocks)
+    if scope == "skills":
+        blocks = _dedupe_skills_blocks(blocks, workdir)
     return blocks
 
 
@@ -1566,11 +1542,12 @@ def collect_scope(scope: str, session: str | None = None) -> list:
 
 def search_scope(query: str, scope: str, method: str | None = None,
                  top_k: int = 5, grep_context: int | None = None,
-                 session: str | None = None) -> dict:
+                 session: str | None = None,
+                 workdir: "str | Path | None" = None) -> dict:
     """单范围搜索：语义通道(embedding→ngram→grep) + 精确通道(grep→ngram)"""
     _t0 = time.perf_counter()
     logger.info(f"[search] 范围开始: {scope} query={query!r:.60}")
-    blocks = collect_scope(scope, session)
+    blocks = collect_scope(scope, session, workdir)
     _t_collect = (time.perf_counter() - _t0) * 1000
     logger.info(f"[search]   {scope} 收集完成: {len(blocks)} 块, 耗时={_t_collect:.1f}ms")
     semantic = [b for b in blocks if b.channel == "semantic"]
@@ -1584,7 +1561,7 @@ def search_scope(query: str, scope: str, method: str | None = None,
     if method == "embedding":
         # 显式强制 embedding（用户要求）：有结果用之；无 → ngram 防御
         _t1 = time.perf_counter()
-        sem_hits = search_embedding(query, semantic, top_k) or []
+        sem_hits = search_embedding(query, semantic, top_k, workdir=workdir) or []
         if sem_hits:
             logger.info(f"[search]   {scope} 语义通道命中: embedding(强制) ×{len(sem_hits)} "
                         f"耗时={(time.perf_counter()-_t1)*1000:.1f}ms")
@@ -1602,7 +1579,7 @@ def search_scope(query: str, scope: str, method: str | None = None,
         # embedding 附加: 默认关闭（EMBEDDING_ENABLED=False 时纯 ngram）；开启时索引存在才返回结果
         if C.get("EMBEDDING_ENABLED"):
             _t2 = time.perf_counter()
-            emb_hits = search_embedding(query, semantic, top_k)
+            emb_hits = search_embedding(query, semantic, top_k, workdir=workdir)
             if emb_hits:
                 sem_hits = _merge_sem_hits(sem_hits, emb_hits, top_k)
                 logger.info(f"[search]   {scope} embedding 附加合并 +{len(emb_hits)} → {len(sem_hits)} "
@@ -1632,7 +1609,9 @@ def search_scope(query: str, scope: str, method: str | None = None,
 
 def search_all(query: str, scope: str = "all", method: str | None = None,
                top_k: int = 5, grep_context: int | None = None,
-               session: str | None = None) -> dict:
+               session: str | None = None,
+               workdir: "str | Path | None" = None,
+               scopes: list | None = None) -> dict:
     """统一入口：scope=all 时按范围分组返回；否则单范围"""
     _t0 = time.perf_counter()
     logger.info(f"[search] 入口: scope={scope} query={query!r:.60} method={method} top_k={top_k}")
@@ -1640,13 +1619,14 @@ def search_all(query: str, scope: str = "all", method: str | None = None,
         logger.info(f"[search] 空查询，直接返回")
         return {}
     if scope != "all":
-        r = {scope: search_scope(query, scope, method, top_k, grep_context)}
+        r = {scope: search_scope(query, scope, method, top_k, grep_context, session, workdir)}
         _el = (time.perf_counter() - _t0) * 1000
         logger.info(f"[search] 完成: scope={scope} 总耗时={_el:.1f}ms")
         return r
     results = {}
-    for sc in _scope_roots(session):
-        results[sc] = search_scope(query, sc, method, top_k, grep_context)
+    scope_list = scopes if scopes is not None else list(_scope_roots(session, workdir))
+    for sc in scope_list:
+        results[sc] = search_scope(query, sc, method, top_k, grep_context, session, workdir)
     _el = (time.perf_counter() - _t0) * 1000
     _tot = sum(len(v["semantic"]) + len(v["symbols"]) for v in results.values())
     logger.info(f"[search] 完成: scope=all 总耗时={_el:.1f}ms 总命中={_tot}")
@@ -1656,8 +1636,9 @@ def search_all(query: str, scope: str = "all", method: str | None = None,
 def _skill_name_from_key(key: str) -> str:
     """从 skills 范围 block key 提取技能名。
 
-    key 形态: /abs/.../skills/<name>/skill.md#p0（extract_markdown）
-    → 取 "skills" 段之后第一段目录名。
+    key 形态: /abs/.../skills/<name>/skill.md#p0（内置级）
+              或 /abs/.../.xkagent/skills/<name>/skill.md#p0（用户级）
+    → 取 "skills" 段之后第一段目录名（两种形态均含独立的 skills 段）。
     """
     path_part = key.split("#", 1)[0].replace("\\", "/")
     segs = path_part.split("/")
@@ -1708,7 +1689,7 @@ def _searchskill_ranked(query: str, top_k: int = 5) -> list[dict]:
             name = _skill_name_from_key(h.key)
             if not name:
                 continue
-            path = _rel_path(h.key)
+            path = _rel_path(h.key, None)
             if h.method == "ngram":
                 if h.score < 2.0:
                     continue  # 与 frontmatter 阈值统一：<2.0 视为噪声（英文随机串 ngram 偶然重叠）
@@ -1754,6 +1735,7 @@ def _searchskill_ranked(query: str, top_k: int = 5) -> list[dict]:
     for name, (score, snippet, path, method) in ranked:
         if valid and name not in valid:
             continue
+        snippet = " ".join(snippet.split())[:80]  # 2026-09-04: 单行压缩+截断（建议技能单行化配套）
         out.append({
             "name": name,
             "description": (SkillLoader.load_meta(name) or {}).get("description", "") if valid else "",
@@ -1788,7 +1770,81 @@ def searchskill_detail(query: str, top_k: int = 5) -> list[dict]:
 _NOISE_HISTORY_ROLES = {"thinking", "tool"}
 
 
-def _rel_path(key: str) -> str:
+def _dir_contains(file_dir: str, dirpath: str, dir_stat=None) -> bool:
+    """file_dir 是否为 dirpath 自身或其子孙目录（inode 级判定）。
+
+    build 受限沙箱下 os.walk/scandir 返回的路径视角可能与模块
+    __file__/BUILTIN_SKILLS_DIR 的视角不一致（bind 别名），字符串
+    前缀比较会误判；inode（st_dev+st_ino）在 bind mount 两侧一致，可跨视角判定。
+    """
+    if dir_stat is None:
+        try:
+            dir_stat = os.stat(dirpath)
+        except OSError:
+            return False
+    cur = file_dir
+    hops = 0
+    while True:
+        try:
+            st = os.stat(cur)
+        except OSError:
+            pass
+        else:
+            if st.st_dev == dir_stat.st_dev and st.st_ino == dir_stat.st_ino:
+                return True
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur = parent
+        hops += 1
+        if hops > 64:  # 防环
+            return False
+
+
+def _dedupe_skills_blocks(blocks: list, workdir: "str | Path | None" = None) -> list:
+    """skills 范围块过滤：与加载侧一致，同名技能用户级覆盖内置级。
+
+    块 key 为绝对路径（extract_markdown）。对每个块按技能名在 _skill_dirs(workdir)
+    中定位有效目录（用户级优先），块文件不在有效目录下（即被用户级覆盖的内置级
+    同名技能文件）则丢弃，避免搜索命中被覆盖技能的旧内容。
+    """
+    _MISS = object()
+    try:
+        from codes.skill import _skill_dirs
+    except Exception:
+        return blocks
+    try:
+        skdirs = [os.path.realpath(p) for p in _skill_dirs(workdir)]
+    except Exception:
+        return blocks
+    eff_cache: dict = {}
+    out = []
+    for b in blocks:
+        name = _skill_name_from_key(b.key)
+        if not name:
+            out.append(b)
+            continue
+        eff = eff_cache.get(name, _MISS)
+        if eff is _MISS:
+            eff = None
+            for d in skdirs:
+                if os.path.isfile(os.path.join(d, name, "skill.md")):
+                    eff = d
+                    break
+            eff_cache[name] = eff
+        if eff is None:
+            out.append(b)
+            continue
+        # 路径视角别名兼容：受限沙箱 scandir 返回的视角可能与模块
+        # __file__ 不一致——realpath 前缀作快路径，跨视角
+        # 场景（前缀不匹配）用 _dir_contains inode 级兜底判定。
+        path_part = b.key.split("#", 1)[0].split(":", 1)[0]
+        if path_part == eff or path_part.startswith(eff + os.sep) or _dir_contains(
+                os.path.dirname(path_part), eff):
+            out.append(b)
+    return out
+
+def _rel_path(key: str, session: str | None = None) -> str:
     """从 SearchHit.key 反解相对 workdir 的文件路径。
 
     key 形态:
@@ -1797,10 +1853,10 @@ def _rel_path(key: str) -> str:
       /abs/.../xxx.log:123   → /abs/.../xxx.log（extract_log 行号后缀）
     """
     from codes import config
-    wd = str(config.get_workdir())
+    wd = str(config.get_session_context(str(session)).workdir) if session else str(config.get_workdir())
     if key.startswith("historys:"):
         sess = key.split(":", 2)[1]
-        return os.path.join(".xkagent", "historys", f"{sess}.db")
+        return os.path.join(".xkagent", "historys", f"{sess}.msgz")
     path_part = key.split("#", 1)[0].split(":", 1)[0]  # log 行号: 与路径分隔
     if not path_part:
         return ""
@@ -1848,7 +1904,9 @@ def searchinfo(dirs_paths: list, query: str, top_k: int = 5,
     if not query or not query.strip() or not dirs_paths:
         return []
     from codes import config
+    from codes.path_guard import allowed_roots_for_session, path_in_roots
     wd = str(config.get_workdir())
+    roots = allowed_roots_for_session(session)
     denies = _effective_search_config(session)["denies"]
     blocks: list = []
     seen_files: set = set()
@@ -1857,6 +1915,9 @@ def searchinfo(dirs_paths: list, query: str, top_k: int = 5,
             continue
         dstr = str(d)
         abs_root = dstr if os.path.isabs(dstr) else os.path.abspath(os.path.join(wd, dstr))
+        if not path_in_roots(abs_root, roots):
+            logger.info(f"[searchinfo] 路径越界，跳过: {abs_root}")
+            continue
         if _is_denied(abs_root, denies):
             continue
         if os.path.isfile(abs_root):
@@ -1869,6 +1930,8 @@ def searchinfo(dirs_paths: list, query: str, top_k: int = 5,
             continue
         for path_ in _walk_files(abs_root):
             if path_ in seen_files:
+                continue
+            if not path_in_roots(path_, roots):
                 continue
             seen_files.add(path_)
             if _is_denied(path_, denies):
@@ -1903,7 +1966,7 @@ def searchinfo(dirs_paths: list, query: str, top_k: int = 5,
     # 路径反解 + per-file cap 2（对齐 recommend_info）
     per_file: dict = {}
     for h in hits:
-        rel = _rel_path(h.key)
+        rel = _rel_path(h.key, session)
         if not rel:
             continue
         per_file.setdefault(rel, []).append((h, rel))
@@ -1944,7 +2007,8 @@ def recommend_info(query: str, top_k: int = 5, exclude_session: str | None = Non
     if not query or not query.strip():
         return []
     try:
-        r = search_all(query, scope="all", method=None, top_k=2, session=session)
+        _scopes = [sc for sc in _scope_roots(session) if sc != "logs"]  # 2026-08-23: 推荐信息不搜 logs
+        r = search_all(query, scope="all", method=None, top_k=2, session=session, scopes=_scopes)
     except Exception as e:
         logger.warning(f"[search] recommend_info 检索失败，静默降级: {e}")
         return []
@@ -1953,19 +2017,21 @@ def recommend_info(query: str, top_k: int = 5, exclude_session: str | None = Non
     for _sc, res in r.items():
         if _sc == "skills":
             continue
+        if _sc == "logs":
+            continue  # 2026-08-23: logs excluded from recommend_info
         hits.extend(res.get("semantic") or [])
         hits.extend(res.get("symbols") or [])
     if not hits:
         return []
     excl_path = None
     if exclude_session:
-        excl_path = os.path.join(".xkagent", "historys", f"{exclude_session}.db")
+        excl_path = os.path.join(".xkagent", "historys", f"{exclude_session}.msgz")
     # 噪声过滤 + 路径反解 + 当前 session 排除
     filtered = []
     for h in hits:
         if _is_noise_hit(h):
             continue
-        rel = _rel_path(h.key)
+        rel = _rel_path(h.key, session)
         if not rel:
             continue
         if excl_path and rel == excl_path:
@@ -2013,6 +2079,14 @@ def write_doc(session, content, source="summary", title="", tags=None, model="")
     from codes import config
     wd = str(config.get_workdir())
     sess_safe = re.sub(r'[^\w\-.]', '_', str(session or "default"))
+    # 2026-09-10: 目录名仍用 session name（ASCII key，路径稳定）；frontmatter 附展示标题，
+    # 仅供人读/检索辨识，未设置时与 sess_safe 一致（fallback name）。
+    try:
+        from codes import session_registry as _sreg
+        _sctx = _sreg.get(str(session or ""))
+        sess_title = (_sctx.title if _sctx else "") or sess_safe
+    except Exception:
+        sess_title = sess_safe
     ts = datetime.now()
     fname = f"{ts:%Y%m%d_%H%M%S}_{source}.md"
     rel_dir = os.path.join(_DOC_ROOT, sess_safe)
@@ -2031,6 +2105,7 @@ def write_doc(session, content, source="summary", title="", tags=None, model="")
         "---\n"
         f"created_at: {ts:%Y-%m-%dT%H:%M:%S}\n"
         f"session: {sess_safe}\n"
+        f"session_title: {sess_title}\n"
         f"source: {source}\n"
         f"title: {title}\n"
         f"model: {model or ''}\n"
@@ -2075,7 +2150,66 @@ def _merge_sem_hits(ngram_hits: list, emb_hits: list, top_k: int) -> list:
     return out[:top_k]
 
 
-def update_embeddings(verbose: bool = True) -> dict:
+def _atomic_write_json(path: str, data: dict) -> None:
+    """在目标目录内写临时文件后原子替换 JSON。"""
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{Path(path).name}.", suffix=".tmp",
+                                    dir=str(Path(path).parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+
+
+def _build_scope_index(scope: str, sentences: list, manifest: dict,
+                       workdir: "str | Path | None" = None) -> None:
+    """完整构建临时 SQLite；仅全部成功后替换 scope 的现有索引。"""
+    idx_dir = _search_index_dir(workdir)
+    os.makedirs(idx_dir, exist_ok=True)
+    db_path = _index_db_path(scope, workdir)
+    fd, tmp_db = tempfile.mkstemp(prefix=f".{scope}.", suffix=".db.tmp", dir=idx_dir)
+    os.close(fd)
+    try:
+        # 即使没有 semantic 内容也生成有效空库，以原子方式清除旧向量。
+        conn = _get_db(tmp_db)
+        conn.execute("CREATE TABLE IF NOT EXISTS index_manifest (id INTEGER PRIMARY KEY CHECK (id=1), data TEXT NOT NULL)")
+        conn.execute("INSERT OR REPLACE INTO index_manifest (id, data) VALUES (1, ?)",
+                     (json.dumps(manifest, ensure_ascii=False, sort_keys=True),))
+        conn.commit()
+        conn.close()
+        groups: dict = {}
+        for text, key in sentences:
+            groups.setdefault(key, []).append(text)
+        for key, texts in groups.items():
+            if not store_batch(texts, tmp_db, key):
+                raise RuntimeError(f"写入索引失败: scope={scope}, key={key}")
+        with open(tmp_db, "rb") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp_db, db_path)
+        _mark_dirty(db_path)
+        try:
+            _atomic_write_json(os.path.join(idx_dir, f"{scope}.manifest.json"), manifest)
+        except OSError as exc:
+            # DB 内 manifest 与索引原子提交；旁路 JSON 失败不回滚已完成的 DB 替换。
+            logger.warning(f"[search] {scope} manifest JSON 写入失败: {exc}")
+    finally:
+        with _FAISS_CACHE_LOCK:
+            _FAISS_CACHE.pop(_db_cache_key(tmp_db), None)
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(tmp_db + suffix)
+            except FileNotFoundError:
+                pass
+
+
+def update_embeddings(verbose: bool = True, workdir: "str | Path | None" = None,
+                      session: str | None = None, scopes=None) -> dict:
     """为生效范围（skills/docs/historys/logs，codes 默认关闭）重建向量索引。
 
     复用 collect_scope 提取器产出 semantic 文本块，统一写入
@@ -2083,20 +2217,25 @@ def update_embeddings(verbose: bool = True) -> dict:
     skills 额外写入 frontmatter（description+triggers）句子，提升技能级召回。
     返回 {scope: 写入 key 数}。
     """
-    from codes import config
-    idx_dir = _search_index_dir()
+    canonical_workdir = _canonical_workdir(workdir)
+    idx_dir = _search_index_dir(canonical_workdir)
     os.makedirs(idx_dir, exist_ok=True)
     result: dict = {}
-    for scope in _scope_roots(None):
-        blocks = collect_scope(scope)
+    effective_roots = _scope_roots(session, canonical_workdir)
+    selected_scopes = list(effective_roots) if scopes is None else (
+        [scopes] if isinstance(scopes, str) else list(scopes))
+    for scope in selected_scopes:
+        blocks = collect_scope(scope, session, canonical_workdir)
         semantic = [b for b in blocks if b.channel == "semantic"]
         # (text, key) 列表
         sentences = []
         # skills 额外: frontmatter description + triggers（按技能名 key）
         if scope == "skills":
             try:
+                from codes import config
                 from codes.skill import SkillLoader
-                for name in SkillLoader.list_skills():
+                same_workdir = workdir is None or canonical_workdir == Path(config.get_workdir()).resolve()
+                for name in SkillLoader.list_skills() if same_workdir else []:
                     meta = SkillLoader.load_meta(name)
                     if not meta:
                         continue
@@ -2114,39 +2253,35 @@ def update_embeddings(verbose: bool = True) -> dict:
             text = (b.meta.get("text") or b.snippet or "").strip()
             if text:
                 sentences.append((text, b.key))
-        db_path = os.path.join(idx_dir, f"{scope}.db")
-        # 无 semantic 内容（如 logs 纯 raw 通道）：不建库；
-        # 若存在旧库则删除（避免幽灵向量命中已删除文件）
-        if not sentences:
-            try:
-                if os.path.exists(db_path):
-                    os.remove(db_path)
-                    if verbose:
-                        print(f"  \U0001f5d1\ufe0f {scope}: 无 semantic 内容，删除旧库 {db_path}")
-            except OSError:
-                pass
-            result[scope] = 0
-            continue
-        # 重建: 删旧库（签名表保留在 .sig.db 不受影响）
+        groups = {key for _, key in sentences}
+        manifest = {
+            "schema_version": 1,
+            "canonical_workdir": str(canonical_workdir),
+            "scope": scope,
+            "built_at": datetime.now(timezone.utc).isoformat(),
+            "build": {"strategy": "atomic-full-rebuild", "format": "sqlite-json-vectors"},
+            "config": {
+                "session": session,
+                "roots": effective_roots.get(scope, []),
+                "effective": _effective_search_config(session, canonical_workdir),
+                "index_window": C["INDEX_WINDOW"],
+                "index_overlap": C["INDEX_OVERLAP"],
+            },
+            "model": {"name": _ONNX_MODEL_NAME, "directory": str(Path(_ONNX_MODEL_DIR).resolve())},
+            "counts": {"blocks": len(blocks), "semantic_blocks": len(semantic),
+                       "sentences": len(sentences), "keys": len(groups)},
+        }
         try:
-            if os.path.exists(db_path):
-                os.remove(db_path)
-        except OSError:
-            pass
-        # 按 key 分组批量写入
-        groups: dict = {}
-        for text, key in sentences:
-            groups.setdefault(key, []).append(text)
-        n = 0
-        for key, texts in groups.items():
-            try:
-                if store_batch(texts, db_path, key):
-                    n += 1
-            except Exception:
-                continue
-        result[scope] = n
+            _build_scope_index(scope, sentences, manifest, canonical_workdir)
+        except Exception as exc:
+            logger.warning(f"[search] {scope} 索引重建失败，保留旧索引: {exc}")
+            result[scope] = 0
+            if verbose:
+                print(f"  ❌ {scope}: 重建失败，旧索引保持不变")
+            continue
+        result[scope] = len(groups)
         if verbose:
-            print(f"  📂 {scope}: {len(semantic)} 块 / {n} key -> {db_path}")
+            print(f"  📂 {scope}: {len(semantic)} 块 / {len(groups)} key -> {_index_db_path(scope, canonical_workdir)}")
     return result
 
 
@@ -2164,14 +2299,26 @@ def _load_models_sync():
         return
     try:
         _get_model()  # 加载 ONNX Runtime 模型（单例）
-        idx_dir = _search_index_dir()
-        if os.path.isdir(idx_dir):
+        from codes import config
+        from codes.session_registry import list_contexts
+        workdirs = {config.get_default_workdir().resolve()}
+        workdirs.update(context.workdir.resolve() for context in list_contexts())
+        for workdir in workdirs:
+            idx_dir = _search_index_dir(workdir)
+            if not os.path.isdir(idx_dir):
+                continue
             for fn in sorted(os.listdir(idx_dir)):
-                if fn.endswith(".db"):
-                    try:
-                        search("warmup", os.path.join(idx_dir, fn), top_k=1)
-                    except Exception:
-                        continue
+                if not fn.endswith(".db"):
+                    continue
+                manifest_path = os.path.join(idx_dir, f"{fn[:-3]}.manifest.json")
+                try:
+                    if os.path.isfile(manifest_path):
+                        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+                        if manifest.get("canonical_workdir") != str(workdir):
+                            continue
+                    search("warmup", os.path.join(idx_dir, fn), top_k=1)
+                except Exception:
+                    continue
         _EMB_READY = True
     except Exception:
         pass  # 加载失败保持 False，embedding 附加自动跳过（纯 ngram）

@@ -31,6 +31,30 @@ from pathlib import Path
 
 from codes import config as _config
 
+_title_cache = {"t": 0.0, "map": {}}
+
+
+def _session_title_map() -> dict:
+    """session name -> title（1s 进程内缓存，避免列表每次渲染都读 registry 文件）。"""
+    now = time.time()
+    if now - _title_cache["t"] > 1.0:
+        try:
+            from codes import session_registry as _sreg
+            _title_cache["map"] = {c.name: c.title for c in _sreg.list_contexts()}
+            _title_cache["t"] = now
+        except Exception:
+            pass
+    return _title_cache["map"]
+
+
+def _session_display(name: str) -> str:
+    """展示名：title 优先，未设置回退 name；有 title 时附 name 便于定位。"""
+    title = _session_title_map().get(name) or ""
+    if title and title != name:
+        return f"{title} ({name})"
+    return name
+
+
 def _get_history_file() -> str:
     """获取 REPL 命令历史文件路径（workdir/.xkagent/history.txt）。"""
     d = _config.get_data_dir()
@@ -144,6 +168,22 @@ class Style:
         return cls.YELLOW + cls.BOLD + text + cls.RESET
 
 
+
+def _repl_bang_cwd(manager) -> str | None:
+    """! 命令执行目录：优先当前 focus session 注册的 workdir；未知回退 None（继承 server cwd）。"""
+    sess = getattr(manager, "focus", None)
+    if not sess:
+        return None
+    try:
+        from codes.session_registry import get as _reg_get
+        ctx = _reg_get(sess)
+        wd = str(ctx.workdir) if ctx else None
+        # 目录失效回退 None（继承 server cwd），避免 subprocess.run 抛 FileNotFoundError
+        return wd if wd and os.path.isdir(wd) else None
+    except Exception:
+        return None
+
+
 def _build_prompt_str(mgr) -> str:
     """Build prompt using AgentManager's cached info.
 
@@ -159,7 +199,6 @@ def _build_prompt_str(mgr) -> str:
 
     mode_icon = mode_icons.get(mode, '🔧')
     mode_color = mode_colors.get(mode, Style.WARN)
-    skill_indicator = ' 🎯' if getattr(mgr, '_focus_skill_select', True) else ' 🚫'
 
     # Observing mode tag
     observe_tag = ""
@@ -173,7 +212,7 @@ def _build_prompt_str(mgr) -> str:
     # 会话名使用独立醒目颜色（MAGENTA+BOLD），与模式标签色区分，方便翻阅历史时定位
     session_color = Style.MAGENTA + Style.BOLD
     prompt = (f"{session_color}{session}{Style.RESET} {mode_icon} {mode_color}[{mode}]{Style.RESET}"
-              f"{observe_tag}{skill_indicator} >>> ")
+              f"{observe_tag} >>> ")
     return prompt
 
 
@@ -711,17 +750,13 @@ def _restore_terminal():
 
 
 def _record_repl_command(manager, cmd_text, result, *, kind="slash", exit_code=None):
-    """repl 端命令历史落库（对齐 web 端 _record_web_cmd_history）。
-
-    连接解析：取 focus agent 的 db（manager.focus.db）；无 focus 或写失败时
-    静默降级为日志（观察者只读连接 / 数据库锁竞争不阻断交互）。
-    """
+    """repl 端命令历史落库（对齐 web 端 _record_web_cmd_history）。"""
     try:
-        agent = manager.focus
-        if agent is None:
+        session = manager.focus
+        if not session:
             return
-        from codes.history import add_command
-        add_command(agent.db, cmd_text, result, kind=kind, exit_code=exit_code)
+        from codes.history import add_command, get_conn
+        add_command(get_conn(session), cmd_text, result, kind=kind, exit_code=exit_code)
     except Exception:
         logger.warning(f"记录 command 历史失败: {cmd_text!r}", exc_info=True)
 
@@ -741,7 +776,7 @@ def _repl_cmd_context(manager, reader) -> CommandContext:
     def _switch_hook(name: str) -> None:
         """切换会话后：展示 rounds + 刷新 prompt（T7: session 名 + 占用状态）。"""
         _print_rounds(manager)
-        if reader.active:
+        if reader is not None and reader.active:
             reader.replace_prompt(_build_prompt_str(manager))
 
     def _pick_session(matches, current: str, name: str):
@@ -761,14 +796,14 @@ def _repl_cmd_context(manager, reader) -> CommandContext:
         return None
 
     ctx.confirm_handler = _confirm
-    ctx.save_history = reader.save_history
+    ctx.save_history = reader.save_history if reader is not None else (lambda: None)
     ctx.get_session = lambda: manager.focus
     ctx.switch_session_hook = _switch_hook
     ctx.pick_session = _pick_session
     ctx.format_session_line = (
-        lambda si, mark: f"  {mark} {si.session}  [{si.status}]{_phase_tag(si)}{_lock_tag(si.session)}"
+        lambda si, mark: f"  {mark} {_session_display(si.session)}  [{si.status}]{_phase_tag(si)}{_lock_tag(si.session)}"
     )
-    ctx.format_other_session = lambda s: f"    ○ {s}{_lock_tag(s)}"
+    ctx.format_other_session = lambda s: f"    ○ {_session_display(s)}{_lock_tag(s)}"
     ctx.help_extra = (
         "Shortcuts:\n"
         "  !<command>        Execute as bash command (shows exit code)\n"
@@ -884,8 +919,11 @@ def run_repl(args):
 
 # ── Non-tty mode: simple line-by-line input ──
     if not sys.stdin.isatty():
+        _ctx = _repl_cmd_context(manager, None)
         for line in sys.stdin:
             line = line.strip()
+            if not line:
+                continue
             if line.startswith("!"):
                 cmd = line[1:].strip()
                 if not cmd:
@@ -893,14 +931,23 @@ def run_repl(args):
                 r = subprocess.run(
                     cmd, shell=True,
                     capture_output=True, text=True, errors="replace",
+                        cwd=_repl_bang_cwd(manager),
                 )
                 if r.stdout:
                     sys.stdout.write(r.stdout)
                 if r.stderr:
                     sys.stderr.write(r.stderr)
-                print(f"  \u2514 exit: {r.returncode}")
+                out = f"└ exit: {r.returncode}"
+                print(f"  {out}")
+                _record_repl_command(manager, line, out, kind="bang", exit_code=r.returncode)
             elif line.lower() in {"exit", "quit", "q"}:
                 break
+            elif line.startswith("/"):
+                from codes.commands import dispatch
+                result = dispatch(manager, line, _ctx)
+                if result:
+                    print(result)
+                _record_repl_command(manager, line, result or "")
             else:
                 if line.strip().lower() == "/compact":
                     line = COMPACT_MARKER + COMPACT_PROMPT
@@ -945,14 +992,10 @@ def run_repl(args):
                 _tab_pressed = False
                 current_mode = getattr(manager, '_focus_mode', 'plan')
                 new_mode = MODE_CYCLE.get(current_mode, 'plan')
-                if manager.send_command("set_mode", {"mode": new_mode}):
-                    manager._focus_mode = new_mode
-                else:
-                    # 命令未送达（无聚焦 agent / agent 未运行）：回读真实 mode，防 UI 假象
-                    info = manager.get_focus_info(timeout=2.0)
-                    if info:
-                        manager._focus_mode = info.get("mode", manager._focus_mode)
-                    print("  ⚠️ 模式切换失败：无聚焦 agent 或 agent 未运行", flush=True)
+                from codes.commands import _set_mode
+                err = _set_mode(manager, new_mode)
+                if err:
+                    print(f"  {err}", flush=True)
                 reader.replace_prompt(_build_prompt_str(manager))
 
             # ── Handle Ctrl+N / Ctrl+P (cycle sessions) ──
@@ -1017,6 +1060,7 @@ def run_repl(args):
                     r = subprocess.run(
                         cmd, shell=True,
                         capture_output=True, text=True, errors="replace",
+                            cwd=_repl_bang_cwd(manager),
                     )
                     if r.stdout:
                         sys.stdout.write(r.stdout)
@@ -1134,7 +1178,6 @@ def _handle_event(event: dict, manager) -> str | None:
             manager._focus_mode = data.get("mode", manager._focus_mode)
             manager._focus_observing = data.get("is_observing", False)
             manager._focus_holder_info = data.get("holder_info", None)  # T6 补: 与 _lock_status 分支字段对齐
-            manager._focus_skill_select = data.get("skill_select_enabled", manager._focus_skill_select)
         elif cmd == "set_mode":
             if data:
                 manager._focus_mode = data
@@ -1143,8 +1186,6 @@ def _handle_event(event: dict, manager) -> str | None:
                 info = manager.get_focus_info(timeout=2.0)
                 if info:
                     manager._focus_mode = info.get("mode", manager._focus_mode)
-        elif cmd == "set_skill_select" and isinstance(data, bool):
-            manager._focus_skill_select = data
         return None  # 不渲染
     
     # ── _lock_status: update lock state cache ──
@@ -1200,21 +1241,8 @@ def _drain_output(manager, timeout=0.1) -> bool:
 
 
 def _drain_until_turn_end(manager, total_timeout=3.0):
-    """Drain output queue until _turn_end is received, discarding events.
-
-    Used after Ctrl+C during a turn to prevent stale events from leaking
-    into the next user interaction.
-    """
-    deadline = time.time() + total_timeout
-    while time.time() < deadline:
-        try:
-            event = manager.read_output(timeout=0.5)
-        except Exception:
-            break
-        if event is None:
-            break
-        if isinstance(event, dict) and event.get("type") == "_turn_end":
-            break
+    """等待当前回合结束，不再通过消费共享输出队列同步生命周期。"""
+    manager.wait_for_turn_end(timeout=total_timeout)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1380,17 +1408,12 @@ def _render_event(event: dict) -> str:
             return "\n".join(parts) + "\n"
         return _close_thinking_prefix()
 
-    elif t == "skill_selected":
-        name = event.get("name", "")
-        reason = event.get("reason") or ""
-        suffix = f"（{reason}）" if reason else ""
-        return "  " + "🎯" + " " + Style.bold("技能选择: ") + Style.cmd(name) + suffix + "\n"
-
     elif t == "skill_req":
         return "  " + Style.ICON_INFO + " " + Style.info("Skill loaded: ") + Style.muted(event.get("name", "")) + "\n"
 
-    elif t == "no_skill":
-        return "  " + "🎯" + " " + Style.bold("技能选择: 无") + "\n"
+    elif t == "info":
+        # 非错误提示（如 autocompact 拒绝连续压缩 / 自动压缩通知）— 对齐 web 前端 addMsg('info')
+        return "\n  ℹ️ " + str(event.get("data", "")) + "\n"
 
     elif t == "error":
         err_msg = event.get("data", "")

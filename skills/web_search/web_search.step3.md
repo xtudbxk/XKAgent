@@ -1,24 +1,36 @@
 ## 💻 步骤③ — 执行搜索
 
-使用 `pythonrt` 调用 `search.py`：
+使用 `pythonrt` 调用 `search.py`（沙箱双路径，见 makeskill 规则 13）：
 
-### 方式1: pythonrt（build-unsafe 无限制模式推荐）
+### 方式1: plan/build 沙箱（importlib 动态加载——沙箱禁 import 项目内模块）
+
+```python
+# 路径 = 相对技能库根基准（规则 18）；挂载环境映射为 ../../xkagent_v0902/skills/web_search/search.py
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("search", "skills/web_search/search.py")
+m = importlib.util.module_from_spec(spec); sys.modules["search"] = m
+spec.loader.exec_module(m)
+
+# 按源搜索（返回 list[dict]）
+results = m.search_baidu("搜索词")
+results = m.search_github("fastapi")
+results = m.search_arxiv("multi-agent survey")
+results = m.search_auto("深圳到北京高铁")
+print(m.format_output("auto", "深圳到北京高铁", results))
+
+# 如需加速（WASM 沙箱内），传入宿主回调
+m.set_http_request_callback(http_request)
+results = m.search_baidu("搜索词")  # 自动走回调
+```
+
+### 方式2: build-unsafe（直接 import）
 
 ```python
 from skills.web_search import search
-
-# 按源搜索
-results = search.search_baidu("搜索词")
-results = search.search_github("fastapi")
-results = search.search_arxiv("multi-agent survey")
 results = search.search_auto("深圳到北京高铁")
-
-# 如需加速（WASM 沙箱内），传入宿主回调
-search.set_http_request_callback(http_request)
-results = search.search_baidu("搜索词")  # 自动走回调
 ```
 
-### 方式2: bash 工具（build-unsafe 模式）
+### 方式3: bash 工具（宿主执行，相对技能库根路径）
 
 ```bash
 python3 skills/web_search/search.py -s baidu "搜索词"

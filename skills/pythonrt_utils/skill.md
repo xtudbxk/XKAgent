@@ -32,6 +32,21 @@ pythonrt_utils 教 LLM 两件核心事（对应两条主路径）：
 
 ---
 
+## 🔀 与 preflight / pythonrt_prompt 的分工（2026-08-30）
+
+pythonrt 知识体系分四层（总索引：项目根 `pythonrt_docs/ARCHITECTURE.md`）：
+
+| 层 | 载体 | 职责 |
+|----|------|------|
+| L1 常驻注入 | 实例根 `pythonrt_prompt.txt`（agent.py 动态注入） | LLM 编写规范：骨架/硬规则/模板/失败归因 |
+| L1 调用层兜底 | `codes/pythonrt_preflight.py`（tools.py 自动调用） | LLM 笔误自动修复：F1 补 import / F2 shutil+pathlib stub / F3 open 编码 / F4 删除改 .trash |
+| L2 按需技能 | **本技能** | **新第三方库接入沙箱**：audit 安全判定 + hacking register_extension 五接入点 |
+| L3 人类文档 | 项目根 `pythonrt_docs/` | usage_guide.md（诊断档案）+ ARCHITECTURE.md（总索引） |
+
+判断规则：报"第三方模块被拒"时——shutil/pathlib 已被 preflight stub 兜底不会报；其余库三条出路顺序不变：stdlib 重实现 → build-unsafe → 本技能 audit+hacking。preflight 的 stub 是内置特例，任意新库仍走本技能路径。
+
+---
+
 ## 🌳 树状文档结构
 
 ```

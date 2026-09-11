@@ -1,3 +1,4 @@
+# deps: stdlib only
 """web_search 技能 — 多源搜索工具（stdlib 版，兼容 WASM 沙箱 + Host Callbacks）
 
 用法:

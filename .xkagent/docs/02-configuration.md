@@ -18,7 +18,7 @@ Each directory is created automatically when its associated feature is first acc
 
 ```text
 <workdir>/.xkagent/
-├── historys/    # One SQLite database per session
+├── historys/    # One .msgz store file per session
 ├── logs/        # Logs for the current process and previous runs
 ├── docs/        # Project documentation and per-session summary/compact data
 └── skills/      # User Skills, which take precedence over built-ins with the same name

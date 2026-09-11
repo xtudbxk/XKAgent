@@ -1,3 +1,4 @@
+# deps: stdlib only
 """history_parser — 核心消息提取引擎（7 种提取模式）
 
 提供 7 种提取模式函数，支持 JSON / Markdown / Text 三种输出格式。

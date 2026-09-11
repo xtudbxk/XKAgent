@@ -3,6 +3,7 @@
 设计意图（对应多轮方案讨论的收敛结论）：
   - 威胁模型：只防 LLM 误用（写错路径 / 越权 import / 误碰系统文件），
     不防对抗性诱导（__subclasses__ gadget 等）→ 可疑代码由调用方引导 build-unsafe。
+    plan/build 沙箱不保证对抗性越狱安全；Web 暴露时须配合认证与路径白名单（见 path_guard）。
   - 与 pyeryx 的取舍：牺牲 WASM 硬边界，换取"纯 stdlib、跨平台、无二进制依赖"。
   - 实现"五层 + 一横切"防护（对齐多轮方案收敛结论）：
       层1 内置函数处理：BUILTIN_BLOCK 剔除 + builtins/io.open 兜底 patch（_gate_open）
@@ -29,6 +30,7 @@ import json
 import os
 import sys
 from codes import config
+from codes.path_guard import root_contains
 
 # ── 模块级配置（可被构造参数覆盖，避免硬编码）──
 
@@ -565,8 +567,22 @@ class Sandbox:
         if isinstance(path, int):  # fd 直通（已受控来源）
             return self._real_open(path, mode, *args, **kwargs)
         require_w = any(c in mode for c in "wax+")
-        self._resolve(path, require_writable=require_w)
-        return self._real_open(path, mode, *args, **kwargs)
+        resolved = self._resolve(path, require_writable=require_w)
+        if hasattr(os, "O_NOFOLLOW") and "opener" not in kwargs:
+            flags = os.O_RDWR if "+" in mode else os.O_WRONLY if require_w else os.O_RDONLY
+            if "w" in mode:
+                flags |= os.O_CREAT | os.O_TRUNC
+            elif "a" in mode:
+                flags |= os.O_CREAT | os.O_APPEND
+            elif "x" in mode:
+                flags |= os.O_CREAT | os.O_EXCL
+            fd = self._raw_os["open"](resolved, flags | os.O_NOFOLLOW, 0o666)
+            try:
+                return self._real_open(fd, mode, *args, **kwargs)
+            except Exception:
+                os.close(fd)
+                raise
+        return self._real_open(resolved, mode, *args, **kwargs)
 
     # ────────────── os 路径写包装 ──────────────
     def _make_os_wrapper(self, name, require_writable: bool = False):
@@ -575,7 +591,7 @@ class Sandbox:
             if self._in_resolve:  # 重入保护：_resolve 内部调用直通原始函数，防递归
                 return raw(path, *args, **kwargs)
             if not isinstance(path, int):  # fd 直通（shutil.rmtree 的 scandir/stat(fd)）
-                self._resolve(path, require_writable=require_writable)
+                path = self._resolve(path, require_writable=require_writable)
             return raw(path, *args, **kwargs)
         wrapper.__name__ = name
         wrapper.__doc__ = getattr(raw, "__doc__", None)
@@ -1220,8 +1236,9 @@ def main() -> None:
         # ── build-unsafe profile：无限制执行（任意路径/import/subprocess/网络）──
         code = params.get("code", "")
         cwd = params.get("cwd") or os.getcwd()
-        # ── 数据目录保护：含 build-unsafe 模式 ──
-        _protected_dir = os.path.realpath(os.path.join(cwd, config.DATA_DIR_NAME))
+        # ── 数据目录保护：含 build-unsafe 模式（protected_dir 由宿主传入 agent 真实数据目录）──
+        _protected_dir = os.path.realpath(
+            params.get("protected_dir") or os.path.join(cwd, config.DATA_DIR_NAME))
 
         def _is_protected_path(p) -> bool:
             if isinstance(p, int):
@@ -1286,7 +1303,17 @@ def main() -> None:
             except OSError:
                 pass
             try:
-                exec(compile(code, "<pythonrt-unsafe>", "exec"))
+                # build-unsafe 下同样使用隔离命名空间（对齐受限模式 exec(code, g)）：
+                # 否则顶层 import/赋值写入函数帧临时 locals，而模块级 def 的 __globals__
+                # 指向 sandbox 模块全局 → 函数内引用模块级名称/导入模块报 NameError。
+                # 单参 exec(code, g) 令 globals=locals=g，顶层绑定与函数 __globals__ 同源。
+                # __builtins__ 注入已 gate 的 builtins（open 写保护仍生效）。
+                _unsafe_g = {
+                    "__builtins__": builtins,
+                    "__name__": "__main__",
+                    "__file__": "<pythonrt-unsafe>",
+                }
+                exec(compile(code, "<pythonrt-unsafe>", "exec"), _unsafe_g)
                 result = {"ok": True, "stdout": buf_out.getvalue(),
                           "stderr": buf_err.getvalue(), "exit_code": 0}
             except SystemExit as e:

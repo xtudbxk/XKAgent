@@ -1,3 +1,4 @@
+# deps: stdlib only
 """download_arxiv.py - Download paper TeX source / PDF from arXiv.
 
 Usage (python):

@@ -43,8 +43,7 @@ def is_valid_json(s: str) -> bool:
     if not s:
         return False
     try:
-        json.loads(s)
-        return True
+        return isinstance(json.loads(s), dict)
     except Exception:
         return False
 
@@ -259,7 +258,7 @@ def run_agent(
         schemas.append(t.to_openai_schema())
 
     deadline = time.time() + float(timeout)
-    usage_agg = {"prompt_tokens": 0, "completion_tokens": 0}
+    usage_agg = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}
     steps = 0
 
     def finalize(status: str, content, error: str | None = None) -> dict:
@@ -295,8 +294,16 @@ def run_agent(
         usage = extras.get("usage", {})
         pt = usage.get("prompt_tokens", 0)
         ct = usage.get("completion_tokens", 0)
+        # 思考 token 拆分（与主 agent 一致：有字段用字段，无字段用长度比估算）
+        from codes.llm import split_reasoning_tokens
+        rt, _content_ct = split_reasoning_tokens(
+            usage,
+            reasoning_len=extras.get("reasoning_len", 0),
+            content_len=extras.get("content_len", 0),
+        )
         usage_agg["prompt_tokens"] += pt
         usage_agg["completion_tokens"] += ct
+        usage_agg["reasoning_tokens"] += rt
         if usage_callback is not None:
             usage_callback(pt, ct)
         steps = step
@@ -323,8 +330,10 @@ def run_agent(
                         interrupt_event=interrupt_event,
                     )
                     reply = (c2 or "").strip()
-                except Exception:
-                    pass
+                except Exception as e:
+                    return finalize("error", reply or None, f"JSON 终态修复失败: {e}")
+            if not is_valid_json(reply):
+                return finalize("error", reply or None, "子 agent 最终输出不是 JSON 对象")
             return finalize("ok", reply)
 
         messages.append({
@@ -343,6 +352,8 @@ def run_agent(
             if not isinstance(tool_args, dict):
                 tool_args = {}
             print(f"[agent:tool_call] step {step}: {tool_name} args={args_raw}", flush=True)
+            if interrupt_event is not None and interrupt_event.is_set():
+                return finalize("interrupted", None, "子 agent 被用户中断")
             tool = find_tool(tool_name)
             if tool is None:
                 result = type('AnonymousResult', (), {'stdout': '', 'stderr': '', 'error': f'Unknown tool: {tool_name}'})()

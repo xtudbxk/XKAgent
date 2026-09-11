@@ -54,17 +54,15 @@ After saving it to `.xkagent/skills/release_check/skill.md`, run `/validate rele
 
 ## How a Skill Enters a Turn
 
-At the start of a normal message, the system locally matches against the Skill body and the frontmatter `description` and `triggers`, then places candidate Skills in Status. Automatic Skill selection is enabled by default. Once selected, the Skill body enters the current session context. After the same version has been injected in full, later turns use a content anchor to reduce repeated token usage.
+At the start of a normal message, the system locally matches against the Skill body and the frontmatter `description` and `triggers`, then places candidate Skills in Status (no extra model call). To follow a Skill workflow, the Agent loads the full text of a Skill with the `selectskill` tool; after the same version has been injected in full, later turns use a content anchor to reduce repeated token usage.
 
 Common commands include:
 
 - `/skills`, `/showskills`: List currently loadable Skills.
 - `/validate [names]`: Validate all Skills or the named Skills.
 - `/skill <name>`: Read a Skill and add it to the current Agent's active Skill list.
-- `/turnonskill`, `/skillson`: Enable automatic Skill selection.
-- `/turnoffskill`, `/skillsoff`: Disable automatic Skill selection.
 
-`/skill` and automatic selection during a normal turn are independent paths. The current implementation does not treat `/skill` as "force this Skill to run on the next turn." To verify a Skill's behavior, enable automatic selection, send a real task, and observe the candidate and final selections shown in the UI.
+`/skill` and the in-turn `selectskill` path are independent. The current implementation does not treat `/skill` as "force this Skill to run on the next turn." To verify a Skill's behavior, send a real task and observe the candidate Skills and the final load result shown in the UI.
 
 ## When Changes Take Effect
 
@@ -74,7 +72,7 @@ Several implementation boundaries are worth noting:
 
 - Loading a Skill does not automatically validate its format; run `/validate` after making changes.
 - `__init__.py` is not imported, and code in the directory does not automatically become a tool.
-- The loader reads `.xkagent/skills`, while the search system's default `skills` scope points to `<workdir>/skills`. Custom Skills can still be recommended through their frontmatter, but their bodies may not enter that scope.
+- Skill loading and retrieval share the same directories (user-level `.xkagent/skills` first, built-in `skills` as fallback), keeping both sides consistent.
 - Skills affect only prompts and workflows. Actual read and write capabilities remain governed by `plan`, `build`, `build-unsafe`, and mount configuration.
 
 ## Related Documentation

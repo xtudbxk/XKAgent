@@ -57,13 +57,13 @@ The service does not open a browser automatically. It selects the most recent se
 
 ### Sessions and Live Status
 
-The sidebar can create, switch, stop, and fork sessions. Stopping a session ends only its Agent thread; it does not delete messages from SQLite. Switching back starts the Agent again and restores the session. Changing focus also leaves turns running in other sessions uninterrupted.
+The sidebar can create, switch, stop, and fork sessions. Stopping a session ends only its Agent thread; it does not delete messages from the msgz store. Switching back starts the Agent again and restores the session. Changing focus also leaves turns running in other sessions uninterrupted.
 
 The page initially loads the 50 most recent messages and can paginate backward. New messages and Agent events stream over WebSocket. The interface displays LLM, tool execution, lock, crash, and recovery states as they change. If another process holds the lock for the same session, the current instance can only observe it and cannot submit state-changing operations.
 
 Model responses are appended as plain text while streaming, then rendered as Markdown with file-path links when the turn ends. Tool calls, progress, results, Thinking, and Summary use separate collapsible sections, and the same view is restored from history after a refresh or session switch. **Clear View** clears only the current browser view; it does not delete session data, so reopening the session loads its history again.
 
-Mode buttons and the automatic Skill-selection toggle apply to the current session. A model can be set for either the current session or all sessions that have already started. Slash commands use the same registry as the CLI. Because Web cannot provide terminal-style confirmation, dangerous mounts must be explicitly resubmitted with `--force` when prompted.
+Mode buttons apply to the current session. A model can be set for either the current session or all sessions that have already started. Slash commands use the same registry as the CLI. Because Web cannot provide terminal-style confirmation, dangerous mounts must be explicitly resubmitted with `--force` when prompted.
 
 ### File Browsing and Uploads
 
@@ -75,7 +75,7 @@ The file page permits browsing, opening, and downloading only within these roots
 
 The backend normalizes the target with `realpath` before checking whether it is within an allowed root, so a symbolic link pointing outside a root cannot bypass the restriction.
 
-Uploaded files are written to `<workdir>/.xkagent/files/`. The service retains only the basename, adds a timestamp when a name already exists, and writes files in 1 MB chunks. Images can then be used as session attachments; other files can be referenced by their returned paths. The current upload endpoint has no total size limit, so disk usage must be monitored separately.
+Uploaded files are written to `<workdir>/.xkagent/files/`. The service retains only the basename, adds a timestamp when a name already exists, and writes files in 1 MB chunks. Images can then be used as session attachments; other files can be referenced by their returned paths. A single upload is limited to 50 MB (exceeding it returns HTTP 413); disk usage should still be monitored.
 
 ## Authentication and Deployment Boundaries
 
@@ -85,7 +85,7 @@ Web authentication is disabled by default and enabled only when `--password` is 
 python -m codes --mode web --workdir <project-directory> --user admin --password <password>
 ```
 
-After a successful login, the service stores the token in process memory and writes it to a session cookie. The cookie expires when the browser closes, and old tokens become invalid when the process restarts. This mechanism provides only single-account access protection. It is not a multi-user authorization system and does not provide TLS; every authenticated user shares the same workdir and Agent capabilities.
+After a successful login, the service stores the token in process memory and writes it to a cookie with an expiry (12 hours by default); old tokens become invalid as soon as the process restarts. This mechanism provides only single-account access protection. It is not a multi-user authorization system and does not provide TLS; every authenticated user shares the same workdir and Agent capabilities.
 
 Listening on `127.0.0.1` by default narrows the reachable surface, but it is not authentication. Other users or processes on the same host may still access a service with authentication disabled. Recommended practices:
 
@@ -95,7 +95,7 @@ Listening on `127.0.0.1` by default narrows the reachable surface, but it is not
 - Do not store secrets in chat, command history, or uploaded files.
 - Use `build-unsafe` and `!shell` only in trusted environments; neither is protected by the regular sandbox.
 
-Finally, the CLI and Web interface share `.xkagent/history.txt` for input history, whereas `/cmds` reads command records from the current session database. `/exit` leaves the interactive loop in the CLI and requests server shutdown in Web.
+Finally, the CLI and Web interface share `.xkagent/history.txt` for input history, whereas `/cmds` reads command records from the current session store. `/exit` leaves the interactive loop in the CLI and requests server shutdown in Web.
 
 ## Further Reading
 

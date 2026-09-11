@@ -67,20 +67,22 @@
   3. 如果用户不确定，建议简化为单模式
 ```
 
-### Q8: 生成的 skill 在 plan 模式下无法 import 脚本
+### Q8: 生成的 skill 在沙箱（plan/build）模式下无法 import 脚本
 
 ```
-情景: 目标模式为 plan，生成的 skill.md 要求 from skills.<name> import func
-     但 plan 模式下 skills/ 目录是只读的，脚本可能不存在
+情景: 生成的 skill.md 若要求 from skills.<name> import func，在 plan/build 沙箱下不可行
+     （_ImportGate 拒项目内模块 + 文件搜索层不可见 skills 目录，见 rules_detail 规则 13）
 处理:
-  生成的 skill.md 应为 plan 模式使用 importlib 动态加载:
+  生成的 skill.md 一律使用 importlib 动态加载（沙箱双路径）:
   
   ```python
-  import importlib.util
-  spec = importlib.util.spec_from_file_location("cond", "/tmp/<name>/<script>.py")
-  module = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(module)
+  import importlib.util, sys
+  spec = importlib.util.spec_from_file_location("<script>", "skills/<name>/<script>.py")
+  m = importlib.util.module_from_spec(spec); sys.modules["<script>"] = m
+  spec.loader.exec_module(m)
+  m.<func>(...)
   ```
+  注：build-unsafe 下可直接 from skills.<name>.<script> import <func>
 ```
 
 ### Q9: compatible_modes 只出现在元数据中，但系统如何识别？
@@ -95,4 +97,16 @@
       - plan
       - build
   - 系统将来可能基于此字段做模式路由或兼容性检查
+```
+
+### Q10: 新技能放用户目录还是系统目录？
+
+```
+情景: Phase 1 询问落盘位置时，用户不确定选 A（用户级）还是 B（系统级）
+说明:
+  - A 用户级 `.xkagent/skills/<name>/`：仅当前项目会话可见，`list_skills` 优先加载；
+    `.xkagent` 全模式只读（[vfs] read-only），需宿主 `!cmd` 复制写入
+  - B 系统级 `xkagent_v0902/skills/<name>/`：全局所有会话可见，挂载 ro/rw 后 pythonrt 直接写
+  - 工作目录 `skills/` 不被技能系统索引（不在 `_skill_dirs`），放那里 `selectskill`/`searchskill` 检索不到
+  - 建议：个人/项目专用技能 → A；通用/跨会话技能 → B
 ```

@@ -1,3 +1,4 @@
+# deps: stdlib only, dulwich（沙箱白名单库）
 """example_dulwich.py — dulwich 在受限沙箱内的完整流程演示。
 
 用法（build/build-unsafe 下）：

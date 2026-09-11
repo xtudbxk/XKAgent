@@ -143,6 +143,8 @@ def main() -> None:
 
     from codes import config
     config.set_workdir(args.workdir)
+    from codes.session_registry import migrate_legacy
+    migrate_legacy(config.get_workdir())
 
     # ── 第 2 步：现在才导入其他模块（路径常量已就绪） ──
     from codes._log import logger, LOG_FILE

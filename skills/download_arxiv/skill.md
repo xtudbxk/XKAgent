@@ -136,4 +136,4 @@ result = mod.download_arxiv("2406.02507", output_dir="/tmp/arxivs")
 
 ## 与 paper_lib 的对接（可选修复）
 
-`scripts/paper_lib.py` 的 `download_tex()` 目前依赖缺失的 opencode 脚本（`~/.config/opencode/skills/arxiv-tex-source/scripts/download_arxiv_source.py`），恒返回 `False`。可将 `download_tex` 的下载逻辑改为调用本技能脚本（`python skills/download_arxiv/download_arxiv.py <id> --output-dir <paper_dir>`），从而复用同一套下载实现。
+`scripts/paper_lib.py` 的 `download_tex()` 目前依赖一个未随仓库附带的外部脚本，恒返回 `False`。可将 `download_tex` 的下载逻辑改为调用本技能脚本（`python skills/download_arxiv/download_arxiv.py <id> --output-dir <paper_dir>`），从而复用同一套下载实现。

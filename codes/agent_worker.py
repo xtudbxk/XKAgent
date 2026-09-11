@@ -115,10 +115,12 @@ def main():
     except Exception as e:
         print("__AGENT_RESULT__" + json.dumps(
             {"status": "error", "content": None, "steps": 0,
-             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0},
              "error": f"[agent_worker] params 解析失败: {e}"}, ensure_ascii=False))
         return
 
+    from codes import config
+    config.set_workdir(params.get("cwd") or os.getcwd())
     from codes.agent_runner import run_agent
     from codes.llm import complete
     from codes.tools import _tool_result_to_str

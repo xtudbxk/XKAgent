@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# deps: stdlib only
 """
 OpenReview 论文 Review + Rebuttal 下载器
 

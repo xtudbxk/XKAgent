@@ -1,3 +1,4 @@
+# deps: stdlib only
 """scheduled_task_waiter - 循环等待条件满足后退出
 
 在 pythonrt（统一 Python 运行时）中运行。

@@ -24,7 +24,7 @@ Candidate Skills are selected primarily through ngram and frontmatter matching; 
 
 Status is not a background daemon. It is a context prefix generated dynamically on every turn. Before the model acts, Status describes the current time, execution mode, path permissions, suggested Skills, relevant retrieval excerpts, and the user's explicit requirements, allowing each request to continue from the current runtime state.
 
-The current implementation already provides three layers of recoverable context: the effective conversation for the current turn; each session's SQLite history and state; and searchable documents written to `.xkagent/docs/<session>/` by `summary` or `/compact`. Recommendations search `skills`, `docs`, `historys`, and `logs` by default while excluding the current session's history. The `codes` source directory is not included in recommendations by default, but it can be added explicitly through search-scope configuration.
+The current implementation already provides three layers of recoverable context: the effective conversation for the current turn; each session's msgz history and state; and searchable documents written to `.xkagent/docs/<session>/` by `summary` or `/compact`. A session-level **Status Info** board (`addinfo` / `listinfo` / `rminfo`) adds writable, per-turn-injected runtime memory that survives compaction. Recommendations search `skills`, `docs`, `historys`, and `logs` by default while excluding the current session's history. The `codes` source directory is not included in recommendations by default, but it can be added explicitly through search-scope configuration.
 
 These mechanisms form the foundation for long-running tasks and memory; they are not the complete product capability. **Automatic orchestration of long-running tasks, plan scheduling, memory-importance assessment, forgetting and conflict resolution, and comprehensive long-term Memory management are not yet implemented.** `summary` and `/compact` must be triggered by the Agent or the user, and there is no standalone memory-management service.
 
@@ -35,7 +35,7 @@ CLI / Web
   → commands routes slash commands; plain messages enter the current session queue
   → Agent checks the session lock, resolves @ paths, and removes invalid Unicode
   → suggested Skills and relevant information are retrieved to generate Status
-  → the user message is written to session SQLite
+  → the user message is written to the session msgz store
   → system prompt + effective history + images for this turn are sent to the LLM
   → llm.py produces a unified stream of reasoning / text / tool calls / usage
   → tool calls run sequentially; each result is persisted before the next LLM call
@@ -58,7 +58,7 @@ The runtime kernel is concentrated in these groups of files:
 - `skill.py` and `search.py` provide capability discovery, content extraction, retrieval, and long-term document writing.
 - `agent_runner.py` and `agent_worker.py` host the isolated sub-Agent loop.
 
-Infrastructure is similarly separated: `history.py` manages SQLite, `lock.py` manages session leases, and `_log.py` manages standard-library logging and rotation. At the interaction layer, `commands.py` registers commands once so the CLI and Web share the same dispatch semantics. Each frontend then handles either terminal input or FastAPI, WebSocket, authentication, and file APIs.
+Infrastructure is similarly separated: `history.py` manages msgz storage, `lock.py` manages session leases, and `_log.py` manages standard-library logging and rotation. Cross-session collaboration is carried by `mailbox.py` (global bus) and `manager.py`'s MailPostman (delivery), exposed through the `callagent` tool; see [11 · Multi-Agent Communication](11-multi-agent-communication.md). At the interaction layer, `commands.py` registers commands once so the CLI and Web share the same dispatch semantics. Each frontend then handles either terminal input or FastAPI, WebSocket, authentication, and file APIs.
 
 ## Execution Permissions Are Not a Security Container
 
@@ -74,11 +74,11 @@ This remains a soft boundary intended to reduce the risk of accidental LLM opera
 
 ## Sessions, State, and Concurrency
 
-Each session has a SQLite database and an independent Agent thread with input and output queues at runtime. `AgentManager` sends new input only to the focused session, but other sessions can continue turns in the background. Stopping a thread does not delete its history, and switching back to the session can restore it.
+Each session has a msgz store and an independent Agent thread with input and output queues at runtime. `AgentManager` sends new input only to the focused session, but other sessions can continue turns in the background. Stopping a thread does not delete its history, and switching back to the session can restore it.
 
-SQLite currently persists messages and commands, the Provider and model, cumulative and most-recent-turn token counts, dynamic mounts, search scopes, and one-time image state. The execution mode and automatic Skill-selection toggle are runtime state: when the Agent restarts, they return to their defaults rather than being fully persisted. `/compact` preserves the original database records, rebuilds the effective context from a truncation marker and an LLM summary, and writes the summary to docs. `/drop` only adds a marker and clears the current effective context; it does not create a long-term summary.
+The msgz store currently persists messages and commands, the Provider and model, cumulative and most-recent-turn token counts, dynamic mounts, search scopes, and one-time image state. The execution mode is runtime state: when the Agent restarts, it returns to its default rather than being fully persisted. `/compact` preserves the original stored records, rebuilds the effective context from a truncation marker and an LLM summary, and writes the summary to docs. `/drop` only adds a marker and clears the current effective context; it does not create a long-term summary.
 
-Each session uses a `<session>.db.lockdir/` lease for exclusive writes. Owner metadata and heartbeats identify the holder, recover stale locks, and handle crashes within the same process. Other processes that open the session enter observer mode. This lock prevents concurrent writes from corrupting a session; it is not a database backup or transactional file rollback.
+Each session uses a `<session>.lockdir/` lease for exclusive writes. Owner metadata and heartbeats identify the holder, recover stale locks, and handle crashes within the same process. Other processes that open the session enter observer mode. This lock prevents concurrent writes from corrupting a session; it is not a session backup or transactional file rollback.
 
 Sub-Agents use a message loop isolated from the main conversation. Their model, available tools, step limit, total timeout, and image input can be configured, and their final result must be valid JSON. By default, a sub-Agent cannot call `exit` or invoke another `agent`; nesting is allowed only when explicitly enabled.
 
@@ -87,8 +87,9 @@ Sub-Agents use a message loop isolated from the main conversation. Their model, 
 ```text
 <workdir>/
 ├─ .xkagent/
-│  ├─ historys/<session>.db[/-wal/-shm]  # messages, commands, and session state
-│  ├─ historys/<session>.db.lockdir/      # lease and owner metadata
+│  ├─ historys/<session>.msgz             # messages, commands, and session state (single file)
+│  ├─ historys/<session>.lockdir/         # lease and owner metadata
+│  ├─ state/<session>.json                # per-session KV (status board)
 │  ├─ logs/                               # process logs and rotated files
 │  ├─ docs/<session>/                     # long-term summary / compact documents
 │  ├─ skills/                             # user Skills; override built-ins of the same name
@@ -118,7 +119,7 @@ When the workdir is the XKAgent repository root, both the project's topic docume
 
 - [01 · Entry and Startup](01-entry-and-startup.md): Startup sequence, arguments, and frontend dispatch.
 - [02 · Configuration](02-configuration.md): Workdir, Providers, models, and hot reloading.
-- [03 · Infrastructure](03-infrastructure.md): SQLite, logging, and session leases.
+- [03 · Infrastructure](03-infrastructure.md): msgz storage, logging, and session leases.
 - [04 · LLM Layer](04-llm-layer.md): Protocol adapters, SSE, retries, interruption, and usage.
 - [05 · Sandbox and Tool Execution](05-sandbox-and-tools.md): `pythonrt`, execution profiles, and protection boundaries.
 - [06 · Agent Engine](06-agent-engine.md): Main loop, events, multiple sessions, and sub-Agents.
@@ -126,3 +127,4 @@ When the workdir is the XKAgent repository root, both the project's topic docume
 - [08 · Search and Memory](08-search-and-memory.md): Retrieval scopes, ngram/embedding, and long-term documents.
 - [09 · Command System](09-commands.md): Shared commands, state changes, and auditing.
 - [10 · Frontends](10-frontends.md): CLI, Web, file APIs, and authentication.
+- [11 · Multi-Agent Communication](11-multi-agent-communication.md): mail bus, callagent, and scheduled/long-running collaboration.

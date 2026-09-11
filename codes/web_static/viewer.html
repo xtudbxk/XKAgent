@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>预览 — XKAgent</title>
+<style>
+  :root {
+    --bg: #f3f5fb; --surface: #ffffff; --surface2: #f6f6f6; --border: rgba(28,31,35,.08);
+    --text: #1c1f23; --text-muted: #57606a; --accent: #0066ff; --err: #dc2626; --code-bg: #f6f8fa;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column;
+  }
+  .topbar {
+    padding: 9px 20px; background: var(--surface); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: none;
+  }
+  .topbar .fname { font-size: 14px; font-weight: 600; }
+  .topbar .fpath { font-size: 12px; color: var(--text-muted); word-break: break-all; }
+  .topbar .spacer { flex: 1; }
+  .topbar a, .topbar button {
+    padding: 5px 12px; border: 1px solid var(--border); border-radius: 9999px;
+    background: var(--surface); color: var(--text); cursor: pointer; font-size: 12px; text-decoration: none;
+    white-space: nowrap;
+  }
+  .topbar a:hover, .topbar button:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #content { flex: 1; min-height: 0; overflow: auto; }
+  .status { padding: 48px; text-align: center; color: var(--text-muted); font-size: 13px; }
+  .err { padding: 20px 24px; color: var(--err); font-size: 13px; white-space: pre-wrap; }
+  pre.plain {
+    margin: 20px auto; max-width: 1200px; padding: 18px 20px; overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+    background: var(--surface); border-radius: 12px; box-shadow: 0 1px 3px rgba(28,31,35,.05);
+  }
+  iframe.fill { width: 100%; height: 100%; border: 0; display: block; background: #fff; }
+  .pic-wrap { padding: 24px; text-align: center; }
+  img.pic { max-width: 100%; max-height: 86vh; border-radius: 8px; box-shadow: 0 2px 12px rgba(28,31,35,.12); cursor: zoom-in; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 26px 26px 80px; }
+  .md { font-size: 14.5px; line-height: 1.75; }
+  .md h1, .md h2, .md h3 { margin: 1.2em 0 .6em; line-height: 1.3; }
+  .md h1 { font-size: 1.6em; border-bottom: 1px solid var(--border); padding-bottom: .3em; }
+  .md h2 { font-size: 1.35em; border-bottom: 1px solid var(--border); padding-bottom: .25em; }
+  .md h3 { font-size: 1.15em; }
+  .md p { margin: .6em 0; }
+  .md ul, .md ol { margin: .5em 0 .5em 1.7em; }
+  .md li { margin: .25em 0; }
+  .md blockquote { margin: .8em 0; padding: .2em 1em; border-left: 3px solid var(--accent); color: var(--text-muted); background: rgba(0,102,255,.04); }
+  .md hr { border: 0; border-top: 1px solid var(--border); margin: 1.2em 0; }
+  .md code { background: var(--code-bg); padding: .12em .35em; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; }
+  .md pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; overflow: auto; margin: .8em 0; }
+  .md pre code { background: none; padding: 0; font-size: 12.5px; line-height: 1.55; }
+  .md table { border-collapse: collapse; margin: .8em 0; font-size: 13px; display: block; overflow-x: auto; }
+  .md th, .md td { border: 1px solid var(--border); padding: 6px 10px; }
+  .md th { background: var(--surface2); }
+  .md img.md-img { max-width: 100%; max-height: 640px; border-radius: 8px; border: 1px solid var(--border); margin: 8px 0; cursor: zoom-in; }
+  /* 2026-09-09: 图片加载失败 → 文件名占位（替代裂图） */
+  .md-img-missing { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 4px 10px; margin: 8px 0; border: 1px dashed var(--border); border-radius: 8px; color: var(--text-muted); background: var(--code-bg); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; cursor: pointer; word-break: break-all; }
+  .md-img-missing:hover { border-color: var(--accent); color: var(--accent); }
+  .md a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <span class="fname" id="fname">预览</span>
+  <span class="fpath" id="fpath"></span>
+  <span class="spacer"></span>
+  <a id="btn-download" href="#">⬇ 下载</a>
+  <a id="btn-raw" href="#" target="_blank" rel="noopener">↗ 原始打开</a>
+  <button onclick="window.close()">✖ 关闭</button>
+</div>
+<div id="content"><div class="status">Loading...</div></div>
+<script>
+// ── 统一文件预览页（2026-09-08）：md 渲染排版 / pdf·html iframe 嵌入 / 图片 / 文本 pre ──
+const BASE = (function () { var p = location.pathname; return p.endsWith('/') ? p : p.substring(0, p.lastIndexOf('/') + 1); })();
+const qp = new URLSearchParams(location.search);
+const FILE_PATH = qp.get('path') || '';
+const ROOT_INDEX = qp.get('root_index') || '0';
+const SESSION = qp.get('session') || '';
+const FILE_NAME = FILE_PATH.split('/').pop() || '';
+const MD_DIR = FILE_PATH.indexOf('/') >= 0 ? FILE_PATH.substring(0, FILE_PATH.lastIndexOf('/')) : '';
+const SESS_Q = SESSION ? '&session=' + encodeURIComponent(SESSION) : '';
+
+const IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp|svg|ico)$/i;
+const MD_RE = /\.(md|markdown)$/i;
+const HTML_RE = /\.html?$/i;
+const PDF_RE = /\.pdf$/i;
+const TEXT_RE = /\.(txt|json|ya?ml|csv|log|xml|ini|cfg|conf|toml|py|js|ts|jsx|tsx|go|rs|rb|sh|bash|c|cc|cpp|h|hpp|java|php|sql|css|tex|rst|ipynb)$/i;
+
+function dlUrl(preview) {
+  return BASE + 'api/files/download?path=' + encodeURIComponent(FILE_PATH)
+    + '&root_index=' + encodeURIComponent(ROOT_INDEX) + SESS_Q
+    + (preview ? '&preview=1' : '') + '&resolve=1';
+}
+
+// ── Markdown 渲染（自 index.html 移植，零依赖；先 escape 防 XSS，URL 协议白名单）──
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+// 2026-09-09: 图片加载失败 → 文件名占位，替代裂图（data-name=原始 md 路径优先）
+function mdImgName(img) {
+  var n = img.getAttribute('data-name') || img.getAttribute('alt') || '';
+  if (!n) {
+    try { n = new URL(img.src, location.href).searchParams.get('path') || ''; } catch (e) { n = ''; }
+  }
+  n = String(n).split(/[?#]/)[0];
+  return n.split('/').pop() || n || '(图片)';
+}
+function mdImgError(img) {
+  if (!img || img.getAttribute('data-failed')) return;
+  img.setAttribute('data-failed', '1');
+  var name = mdImgName(img), src = img.src;
+  var span = document.createElement('span');
+  span.className = 'md-img-missing';
+  span.textContent = '📄 ' + name;
+  span.title = '图片加载失败：' + name + '\n点击尝试打开';
+  span.onclick = function () { window.open(src, '_blank', 'noopener'); };
+  img.replaceWith(span);
+}
+function mdImgFallback(img) {
+  // 图片相对路径先按 md 所在目录解析；加载失败回退按预览根解析（兼容两种约定）
+  // 2026-09-09: 回退也失败 → 文件名占位（替代裂图）
+  var fb = img.getAttribute('data-fallback');
+  if (!fb) { mdImgError(img); return; }
+  img.removeAttribute('data-fallback');
+  img.src = BASE + 'api/files/download?path=' + fb + '&preview=true&resolve=1' + SESS_Q;
+}
+function mdInline(t) {
+  const codeSlots = [];
+  t = String(t).replace(/`([^`]+)`/g, function (m, inner) {
+    codeSlots.push('<code>' + inner + '</code>');
+    return '\u0000C' + (codeSlots.length - 1) + '\u0000';
+  });
+  // 图片语法 ![alt](路径|URL)；本地路径相对 md 目录优先，onerror 回退相对根
+  t = t.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, function (m, alt, src0) {
+    if (/^(?:https?:\/\/|\/\/)/i.test(src0)) {
+      return '<img class="md-img" src="' + src0 + '" alt="' + escapeHtml(alt) + '" data-name="' + escapeHtml(alt || src0) + '" loading="lazy" title="' + escapeHtml(alt || src0) + '" onerror="mdImgError(this)" onclick="window.open(this.src)">';
+    }
+    var rel = String(src0).replace(/^\.\//, '');
+    var first = MD_DIR ? (MD_DIR + '/' + rel) : rel;
+    return '<img class="md-img" src="' + BASE + 'api/files/download?path=' + encodeURIComponent(first) + '&preview=true&resolve=1' + SESS_Q
+      + '" alt="' + escapeHtml(alt) + '" data-name="' + escapeHtml(rel) + '" loading="lazy" title="' + escapeHtml(alt || rel)
+      + '" data-fallback="' + escapeHtml(encodeURIComponent(rel))
+      + '" onerror="mdImgFallback(this)" onclick="window.open(this.src)">';
+  });
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  t = t.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  t = t.replace(/(^|[^_])_([^_\n]+)_/g, '$1<em>$2</em>');
+  t = t.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+  t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+|mailto:[^)\s]+|#[^\s)]*)\)/g,
+                '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  t = t.replace(/\u0000C(\d+)\u0000/g, function (m, i) { return codeSlots[Number(i)]; });
+  return t;
+}
+function mdBlock(raw) {
+  // 逐块解析：代码围栏 / 表格 / 标题 / 引用 / 列表 / 分隔线 / 段落（自 index.html 移植）
+  const lines = String(raw).replace(/\r\n/g, '\n').split('\n');
+  let html = '', i = 0, listStack = [];
+  const closeLists = (to) => { while (listStack.length > to) { html += '</' + listStack.pop() + '>'; } };
+  const esc = escapeHtml;
+  while (i < lines.length) {
+    const line = lines[i];
+    const fence = line.match(/^```(\w*)\s*$/);
+    if (fence) {
+      closeLists(0);
+      const lang = fence[1];
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) { buf.push(lines[i]); i++; }
+      i++;
+      if (lang === 'mermaid') {
+        html += '<pre class="mermaid">' + esc(buf.join('\n')) + '</pre>\n';
+        continue;
+      }
+      const cls = lang ? ' class="lang-' + esc(lang) + '"' : '';
+      html += '<pre' + cls + '><code>' + esc(buf.join('\n')) + '</code></pre>\n';
+      continue;
+    }
+    if (i + 1 < lines.length && /^\|.*\|$/.test(line) && /^\|[\s:|-]+\|$/.test(lines[i + 1])) {
+      closeLists(0);
+      const headers = line.split('|').slice(1, -1).map(s => s.trim());
+      const aligns = lines[i + 1].split('|').slice(1, -1).map(s =>
+        s.includes(':') ? (s.startsWith(':') && s.endsWith(':') ? ' style="text-align:center"' :
+                           (s.startsWith(':') ? ' style="text-align:left"' : ' style="text-align:right"')) : '');
+      html += '<table><thead><tr>';
+      headers.forEach((h, idx) => { html += '<th' + aligns[idx] + '>' + mdInline(esc(h)) + '</th>'; });
+      html += '</tr></thead><tbody>';
+      i += 2;
+      while (i < lines.length && /^\|.*\|$/.test(lines[i])) {
+        const cells = lines[i].split('|').slice(1, -1).map(s => s.trim());
+        html += '<tr>';
+        cells.forEach((c, idx) => { html += '<td' + (aligns[idx] || '') + '>' + mdInline(esc(c)) + '</td>'; });
+        html += '</tr>';
+        i++;
+      }
+      html += '</tbody></table>\n';
+      continue;
+    }
+    const h = line.match(/^(#{1,3})\s+(.*)$/);
+    if (h) { closeLists(0); html += '<h' + h[1].length + '>' + mdInline(esc(h[2])) + '</h' + h[1].length + '>\n'; i++; continue; }
+    if (/^>\s?/.test(line)) {
+      closeLists(0);
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^>\s?/, '')); i++; }
+      html += '<blockquote>' + mdInline(esc(buf.join(' '))) + '</blockquote>\n';
+      continue;
+    }
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (ul || ol) {
+      const tag = ul ? 'ul' : 'ol';
+      if (listStack[listStack.length - 1] !== tag) { closeLists(0); html += '<' + tag + '>'; listStack.push(tag); }
+      html += '<li>' + mdInline(esc((ul || ol)[1])) + '</li>\n';
+      i++;
+      continue;
+    }
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) { closeLists(0); html += '<hr>\n'; i++; continue; }
+    if (!line.trim()) { closeLists(0); html += '\n'; i++; continue; }
+    closeLists(0);
+    const buf = [line];
+    i++;
+    while (i < lines.length && lines[i].trim() && !/^```/.test(lines[i]) && !/^\|.*\|$/.test(lines[i]) &&
+           !/^(#{1,3})\s/.test(lines[i]) && !/^>\s?/.test(lines[i]) &&
+           !/^\s*[-*+]\s+/.test(lines[i]) && !/^\s*\d+\.\s+/.test(lines[i])) {
+      buf.push(lines[i]); i++;
+    }
+    html += '<p>' + mdInline(esc(buf.join(' '))) + '</p>\n';
+  }
+  closeLists(0);
+  return html;
+}
+
+// ── 页面分发 ──
+function show(html) { document.getElementById('content').innerHTML = html; }
+function showError(msg) { show('<div class="err">❌ ' + escapeHtml(msg) + '</div>'); }
+
+function loadText(url, onOk) {
+  fetch(url).then(function (r) {
+    if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || ('HTTP ' + r.status)); },
+                                  function () { throw new Error('HTTP ' + r.status); });
+    return r.text();
+  }).then(onOk).catch(function (e) { showError('加载失败: ' + e.message); });
+}
+
+function render() {
+  document.title = (FILE_NAME ? FILE_NAME + ' — 预览' : '预览') + ' · XKAgent';
+  document.getElementById('fname').textContent = FILE_NAME || '(未指定文件)';
+  document.getElementById('fpath').textContent = FILE_PATH;
+  document.getElementById('btn-download').href = dlUrl(false);
+  document.getElementById('btn-raw').href = dlUrl(true);
+  if (!FILE_PATH) { showError('缺少 path 参数'); return; }
+
+  if (IMAGE_RE.test(FILE_NAME)) {
+    show('<div class="pic-wrap"><img class="pic" src="' + dlUrl(true) + '" alt="' + escapeHtml(FILE_NAME) + '" onerror="mdImgError(this)" onclick="window.open(this.src)"></div>');
+  } else if (PDF_RE.test(FILE_NAME) || HTML_RE.test(FILE_NAME)) {
+    show('<iframe class="fill" src="' + dlUrl(true) + '" title="' + escapeHtml(FILE_NAME) + '"></iframe>');
+  } else if (MD_RE.test(FILE_NAME)) {
+    loadText(dlUrl(false), function (txt) { show('<div class="wrap md">' + mdBlock(txt) + '</div>'); });
+  } else if (TEXT_RE.test(FILE_NAME)) {
+    loadText(dlUrl(false), function (txt) { show('<pre class="plain">' + escapeHtml(txt) + '</pre>'); });
+  } else {
+    show('<div class="status">该类型不支持在线预览，请下载查看。<br><br>'
+      + '<a href="' + dlUrl(false) + '" style="color:var(--accent)">⬇ 下载文件</a></div>');
+  }
+}
+render();
+</script>
+</body>
+</html>

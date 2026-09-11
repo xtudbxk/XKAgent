@@ -38,8 +38,37 @@ def _sanitize(s):
     return re.sub(r'[\ud800-\udfff]', '', s)
 
 
+# ── 工具输出截断（2026-09-11）──
+# 防止超大工具输出（如 pythonrt 打印大目录/大文件，曾出现 5.1MB≈350 万 tokens（方舟口径））
+# 撑爆 LLM 上下文（方舟 glm-5-3-flash 上限 1M tokens → 400 InvalidParameter）。
+# 截断发生在历史回填统一入口 _tool_result_to_str，不影响流式进度/实时结果。
+_TOOL_OUTPUT_MAX_CHARS = 100_000   # 保留前 100KB
+_TOOL_OUTPUT_TAIL_CHARS = 2_000    # 保留尾 2KB（错误/结果常在尾部）
+
+
+def _truncate_tool_text(text, max_chars=None, tail_chars=None, reason="输出过长"):
+    """超长文本截断：头 max_chars + 截断标记 + 尾 tail_chars（公共纯函数）。
+
+    2026-09-11: 提取为共享函数——tools._tool_result_to_str（历史回填截断）、
+    agent._prune_oversized_messages / history_msgz 修剪接口（存量修剪）共用同一格式。
+    """
+    max_chars = _TOOL_OUTPUT_MAX_CHARS if max_chars is None else max_chars
+    tail_chars = _TOOL_OUTPUT_TAIL_CHARS if tail_chars is None else tail_chars
+    total = len(text)
+    if total <= max_chars:
+        return text
+    head = text[:max_chars]
+    tail = text[-tail_chars:]
+    return (f"{head}\n\n...[{reason}: 原 {total} 字符，已截断保留前 "
+            f"{max_chars} + 尾 {tail_chars}]...\n\n{tail}")
+
+
 def _tool_result_to_str(r):
-    """将 ToolResult 渲染为纯文本，供消息历史回填。"""
+    """将 ToolResult 渲染为纯文本，供消息历史回填。
+
+    2026-09-11: 超长输出截断（头部 + 截断标记 + 尾部），防止单条工具输出
+    撑爆 LLM 上下文；截断标记告知 LLM 输出被截断，可据此缩小输出重试。
+    """
     parts = []
     if r.stdout:
         parts.append(r.stdout)
@@ -47,7 +76,8 @@ def _tool_result_to_str(r):
         parts.append('[stderr]\n' + r.stderr)
     if r.error:
         parts.append('[error] ' + r.error)
-    return _sanitize('\n'.join(parts))
+    text = _sanitize('\n'.join(parts))
+    return _truncate_tool_text(text)
 
 
 def _is_valid_json(s: str) -> bool:
@@ -79,8 +109,10 @@ TOOL_PYTHONRT_SCHEMA = ToolDef(
         "         （仅 workdir + permission.txt + /tmp 可写；/etc 等越界写被拦）\n"
         "多步逻辑、文件操作、数据处理均可在一个脚本内完成；需要结构化输出时用 print + 末尾 JSON 约定。\n"
         "支持一次回复提交多个调用（数组形式，引擎串行执行、结果一起返回）；独立探查/读取必须数组提交，禁止逐个小步调用\n"
-        "参数: workdir(str, 执行前 chdir 到的目录), code_or_filepath(str, Python 代码或 .py 文件路径), "
-        "timeout(int, 毫秒, 默认 30000)\n"
+        "参数名必须精确（写错即 tool_args_missing 被拒；历史错误: code_or_filerank / code_filepath / code / 漏 workdir）:\n"
+        "  - workdir(str, 必填, 执行前 chdir 到的目录)\n"
+        "  - code_or_filepath(str, 必填, Python 代码字符串 或 .py 文件路径)\n"
+        "  - timeout(int, 可选, 毫秒, 默认 30000)\n"
         "调用前必检：先核对 user msg「路径访问权限」段，确认 workdir/读写路径在当前 mode 可访问；"
         "越界 → 停止尝试，请求用户 /mount 挂载或切 build-unsafe（/mount 为用户命令，LLM 不可调用），勿反复硬试"
     ),
@@ -88,10 +120,48 @@ TOOL_PYTHONRT_SCHEMA = ToolDef(
         "type": "object",
         "properties": {
             "workdir": {"type": "string", "description": "Working directory to chdir to before execution"},
-            "code_or_filepath": {"type": "string", "description": "Python code string, or path to a .py file to read and execute"},
+            "code_or_filepath": {"type": "string", "description": "Python code string, or path to a .py file to read and execute. 参数名必须是 code_or_filepath（勿写成 code_filepath / code_or_filerank / code）"},
             "timeout": {"type": "integer", "description": "Execution timeout in milliseconds (default: 30000)"},
         },
         "required": ["workdir", "code_or_filepath"],
+    },
+    execute=None,
+)
+
+
+TOOL_CALLAGENT_SCHEMA = ToolDef(
+    name="callagent",
+    description=(
+        "给其他 agent 会话发一封全异步邮件（立即返回，不等待对方处理）。"
+        "用于跨会话协作/任务下发/自调度（to=自己+delay_seconds=定时循环）。"
+        "信封四头由工具自动填充（id/from=本会话/reply_to）。回信时必须显式传 "
+        "reply_to=对方来信的 msg_id、to=对方信封头 from 字段的值。"
+        "返回 {\"status\":\"sent\",\"msg_id\"}；XKAGENT_MAIL=off 时返回 mail_disabled（不写信）。"
+        "期望对方回复请显式置 need_reply=true（缺省 false=通知型邮件，不注入回信指引）。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "to": {
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "收件会话名或会话名列表（列表=广播：一封信多收件人，各收件人独立投递/重试（per-to 状态），"
+                         "收信方可见全体收件人；广播=通知型，不支持 need_reply=true；单名返回 msg_id。格式 "
+                         "^[a-zA-Z0-9_\-.]+$ 且 ≤100 字符，谱系命名兼容），可为自己（自调度）。注意：to 必须填 session name（ASCII key）；session 的可读标题（title，支持中文）仅用于展示，不可用作 to。",
+            },
+            "message": {"type": "string", "description": "信件正文（≤3500 字节，超限返回 error）"},
+            "reply_to": {"type": "string", "description": "回复的来信 msg_id（可选；回信必须填=对方来信的 msg_id，不填无法建立对话线）"},
+            "delay_seconds": {"type": "number", "description": "延迟投递秒数（可选，默认 0 立即；to=自己+延迟=定时任务/循环唤醒；与 deliver_at 同时给出时 deliver_at 优先）"},
+            "deliver_at": {"type": "number", "description": "绝对投递时间戳（可选，Unix 秒；定点定时精度 1s，跨容器有时钟偏移分钟级风险）"},
+            "priority": {"type": "integer", "description": "投递优先级（可选，默认 0，大者优先）"},
+            "provider": {"type": "string", "description": "收信方本次任务的 LLM provider（可选；纯 provider 名如 my-provider，"
+                         "或 provider/model 复合如 my-provider/gpt-5.4；model 可带 :effort 后缀（如 gpt-5.4:max，effort 拆出注入本 turn）。"
+                         "仅本次投递的 turn 生效，不修改收信会话自身配置；"
+                         "收信会话未配置 provider 时可用它指定）"},
+            "need_reply": {"type": "boolean", "description": "是否期望对方回复（默认 false）。true=指令中将注入 callagent "
+                          "回信指引（to/reply_to/message 三要素），收信方会主动回信；false/缺省=通知型邮件，不诱导回复。"},
+        },
+        "required": ["to", "message"],
     },
     execute=None,
 )
@@ -116,6 +186,7 @@ TOOL_SEARCHSKILL_SCHEMA = ToolDef(
     name="searchskill",
     description="搜索技能库中与用户需求最匹配的技能。当「建议技能」列表中的技能都不适用时，"
                 "调用此工具来发现其他可用的 skill。返回按匹配度排序的技能名列表。"
+                "⚡ 本工具几乎零 LLM 调用成本（本地索引检索），可放心多调（更换关键词）——结果计入上下文，建议关键词一次覆盖多意图。"
                 "级联策略: ngram 关键词主通道 + Embedding(FAISS) 附加（faiss/numpy 缺失时自动降级纯 ngram）。",
     parameters={
         "type": "object",
@@ -141,6 +212,7 @@ TOOL_SEARCHINFO_SCHEMA = ToolDef(
     description=(
         "按指定目录列表 + 关键词/查询搜索文件内容。当「推荐信息」或「建议技能」不符合要求、"
         "或需要进一步查看相关目录/文件信息时调用。返回匹配的文件相对路径与片段。"
+        "⚡ 本工具几乎零 LLM 调用成本（本地索引检索），无启动开销；信息不足时可多次调用（更换目录/关键词）收集更全面片段——注意结果计入上下文，建议批量一次调用覆盖多目录。"
     ),
     parameters={
         "type": "object",
@@ -161,6 +233,27 @@ TOOL_SEARCHINFO_SCHEMA = ToolDef(
             },
         },
         "required": ["dirs_paths", "query_or_keyword"],
+    },
+    execute=None,
+)
+
+
+TOOL_SELECT_SKILL_SCHEMA = ToolDef(
+    name="selectskill",
+    description=(
+        "从技能库选择并加载技能全文注入上下文。当「建议技能」中有合适技能、"
+        "或需要按技能工作流执行时调用。已注入过的技能返回锚点摘要（不重复注入）。"
+        "⚡ 本工具几乎零 LLM 调用成本（本地技能文件读取），可放心多次调用："
+        "对比多个候选技能时逐个读取后再决策——技能全文计入上下文。"
+        "参数: name(技能名, 必填), reason(选择理由, 可选)"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "技能名（必填）"},
+            "reason": {"type": "string", "description": "选择理由（可选）"},
+        },
+        "required": ["name"],
     },
     execute=None,
 )
@@ -196,6 +289,49 @@ TOOL_SUMMARY_SCHEMA = ToolDef(
             },
         },
         "required": ["title", "content"],
+    },
+    execute=None,
+)
+
+
+TOOL_ADDINFO_SCHEMA = ToolDef(
+    name="addinfo",
+    description=(
+        "写入/更新本 session 的状态信息（session 级 KV：key=短标识符，value=单行≤200字符）。"
+        "用于长时间运行中需跨回合记住的活状态（进度、当前分支、重试计数、用户偏好等）。"
+        "写入后下回合起自动注入用户消息头部「状态信息」字段；同 key 重复调用为覆盖更新。"
+        "与 summary 分工：短小运行态 KV 用本工具；结论/决策/长文本/跨会话信息用 summary。"
+        "状态板按首次写入顺序展示（更新不改变位置）——建议首次写入即按语义排槽：总览/计划 → 进度 → 阻塞 → 其他。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "key": {"type": "string", "description": "状态键名（[a-zA-Z_][a-zA-Z0-9_-]{0,31}，如 current_step、rejected_plan）"},
+            "value": {"type": "string", "description": "状态值（单行，≤200 字符；多行/长文本请用 summary）"},
+        },
+        "required": ["key", "value"],
+    },
+    execute=None,
+)
+
+
+TOOL_LISTINFO_SCHEMA = ToolDef(
+    name="listinfo",
+    description="列出本 session 当前全部状态信息（key: value 及更新来源/时间）。无参数。",
+    parameters={"type": "object", "properties": {}, "required": []},
+    execute=None,
+)
+
+
+TOOL_RMINFO_SCHEMA = ToolDef(
+    name="rminfo",
+    description="删除本 session 的一条状态信息。参数 key 必填；key 不存在时返回错误提示。",
+    parameters={
+        "type": "object",
+        "properties": {
+            "key": {"type": "string", "description": "要删除的状态键名"},
+        },
+        "required": ["key"],
     },
     execute=None,
 )
@@ -263,6 +399,86 @@ TOOL_AGENT_SCHEMA = ToolDef(
 #  执行函数（依赖注入 agent 实例）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def exec_callagent(agent, to: str | list[str], message: str, reply_to: str = "",
+                   delay_seconds: float = 0.0, deliver_at: float | None = None,
+                   priority: int = 0, provider: str = "",
+                   need_reply: bool = False) -> ToolResult:
+    """callagent 执行：写 send 行到 mail.jsonl 全局总线（全异步立即返回）。
+
+    - 信封自动填：id/from=当前会话/reply_to/deliver_at（now+delay_seconds）；
+    - need_reply=true 时信封写入期望回复标志（收信方指令将含回信指引）；
+    - XKAGENT_MAIL=off → mail_disabled（不写信，防堆积无人投）；
+    - to 支持单会话名或列表（列表=广播：单封信多收件人，逐收件人独立投递/重试，
+      收信方经 mail_meta.recipients 感知全体收件人）；逐个 validate_session_name，任一非法整体拒绝；
+    - provider 支持 provider/model:effort 语法（effort 由收信侧拆出注入本 turn）；
+    - 广播邮件不支持 need_reply=true（广播=通知型）。
+    """
+    mail_env = os.environ.get("XKAGENT_MAIL", "").strip().lower()
+    if mail_env in ("off", "0", "false", "none"):
+        return ToolResult(stdout=json.dumps(
+            {"status": "mail_disabled", "error": "XKAGENT_MAIL=off，邮件功能已禁用"}, ensure_ascii=False))
+    from codes.session_registry import validate_session_name
+    # to 规范化：单名→列表；列表去重保序；任一非法 → 整体拒绝（原子性，不发送）
+    if isinstance(to, str):
+        to_list = [to]
+    elif isinstance(to, (list, tuple)):
+        to_list = []
+        _seen = set()
+        for _t in to:
+            if isinstance(_t, str) and _t.strip() and _t not in _seen:
+                _seen.add(_t)
+                to_list.append(_t)
+    else:
+        return ToolResult(stdout=json.dumps(
+            {"status": "error",
+             "error": f"to 类型非法: {type(to).__name__}（应为字符串或字符串列表）"},
+            ensure_ascii=False))
+    if not to_list:
+        return ToolResult(stdout=json.dumps(
+            {"status": "error", "error": "to 列表为空"}, ensure_ascii=False))
+    for _t in to_list:
+        err = validate_session_name(_t)
+        if err:
+            return ToolResult(stdout=json.dumps(
+                {"status": "error", "error": f"to '{_t}' 非法: {err}"}, ensure_ascii=False))
+    provider = (provider or "").strip()
+    if provider:
+        from codes.mailbox import split_mail_provider
+        pname, _m = split_mail_provider(provider)
+        if not pname:
+            return ToolResult(stdout=json.dumps(
+                {"status": "error",
+                 "error": f"provider 格式非法: {provider!r}（应为 provider 名或 provider/model）"},
+                ensure_ascii=False))
+        try:
+            from codes import provider_config
+            provider_config.get_provider(pname)
+        except ValueError as e:
+            return ToolResult(stdout=json.dumps(
+                {"status": "error", "error": f"provider 不存在: {e}"}, ensure_ascii=False))
+    # 广播校验：广播邮件不支持 need_reply（通知型，不诱导人人回信）
+    if len(to_list) > 1 and need_reply:
+        return ToolResult(stdout=json.dumps(
+            {"status": "error",
+             "error": "广播邮件不支持 need_reply=true（广播=通知型，收件人不被要求回复）"},
+            ensure_ascii=False))
+    try:
+        from codes.mailbox import Mailbox
+        mb = Mailbox()
+        to_val = to_list if len(to_list) > 1 else to_list[0]
+        ok, info = mb.add_send(from_=agent.session, to=to_val, body=message,
+                               reply_to=(reply_to or None), delay_seconds=delay_seconds,
+                               deliver_at=deliver_at, priority=priority,
+                               provider=provider or None,
+                               need_reply=bool(need_reply))
+    except Exception as e:
+        return ToolResult(stdout=json.dumps(
+            {"status": "error", "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False))
+    if not ok:
+        return ToolResult(stdout=json.dumps({"status": "error", "error": info}, ensure_ascii=False))
+    return ToolResult(stdout=json.dumps({"status": "sent", "msg_id": info}, ensure_ascii=False))
+
+
 def exec_exit(agent, reason="", key=""):
         logger.info(f"exit 请求: reason={reason!r}, key={key!r}")
         agent._exit_requested = True
@@ -286,55 +502,175 @@ def exec_pythonrt(agent, workdir: str, code_or_filepath: str, timeout: int = 300
         If code_or_filepath ends with .py and is an existing file, it will be
         read and executed. Otherwise it is treated as raw Python code.
         """
-        # 防御：仅当参数是"纯文件路径"（无换行符）且文件存在时才读文件，
-        # 避免以 .py 结尾的多行代码字符串命中同名文件时被误读为路径。
-        if (code_or_filepath.endswith(".py") and "\n" not in code_or_filepath
-                and os.path.isfile(code_or_filepath)):
+        # 文件读取发生在宿主进程，必须先应用与沙箱一致的访问根校验；
+        # 否则 plan/build 可借绝对路径绕过 worker VFS 读取宿主敏感文件。
+        is_path = code_or_filepath.endswith(".py") and "\n" not in code_or_filepath
+        base = os.path.realpath(workdir or agent.cwd)
+        candidate = os.path.realpath(
+            code_or_filepath if os.path.isabs(code_or_filepath)
+            else os.path.join(base, code_or_filepath))
+        if is_path and os.path.isfile(candidate):
+            if agent.mode != "build-unsafe":
+                roots = [agent.cwd, "/tmp"]
+                roots.extend(path for path, _ in getattr(agent, "_perm_volumes", []))
+                roots.extend(m.get("path", "") for m in getattr(agent, "_dyn_mounts", []))
+                allowed = False
+                for root in roots:
+                    if not root:
+                        continue
+                    root = os.path.realpath(root)
+                    try:
+                        if os.path.commonpath([candidate, root]) == root:
+                            allowed = True
+                            break
+                    except ValueError:
+                        continue
+                if not allowed:
+                    return ToolResult(
+                        error=f"Python file is outside allowed roots: {code_or_filepath}",
+                        exit_code=1)
             try:
-                with open(code_or_filepath, "r", encoding="utf-8") as f:
+                with open(candidate, "r", encoding="utf-8") as f:
                     code = f.read()
             except Exception as e:
                 return ToolResult(error=f"Failed to read {code_or_filepath}: {e}", exit_code=1)
         else:
             code = code_or_filepath
-        return run_pythonrt(agent, code, workdir, timeout)
+        # [auto-fix] 参数预检与自动修复（宿主侧静态处理，详见 codes/pythonrt_preflight.py）
+        _fixes, _guides = [], []
+        try:
+            from codes.pythonrt_preflight import preflight
+            code, _fixes, _guides = preflight(code, unrestricted=(agent.mode == 'build-unsafe'))
+        except Exception as _pf_err:  # preflight 自身故障不阻塞执行
+            logger.warning('pythonrt preflight failed: %s', _pf_err)
+        _result = run_pythonrt(agent, code, workdir, timeout)
+        if _fixes or _guides:
+            _note = '\n'.join('[auto-fix] ' + x for x in (_fixes + _guides))
+            _result.stdout = (_note + '\n' + _result.stdout) if _result.stdout else _note
+        return _result
+
+
+# ── search worker 化（2026-08-21）：searchinfo/searchskill 改为子进程执行 ──
+# 背景：搜索类工具原本在 agent 进程内同步执行，阻塞期间无法响应中断事件
+# （_exec_thread 不结束 → 回合不结束 → 前端 busy 恒 True）。与 pythonrt 同构：
+# 经 _run_worker_streaming 启动子进程，50ms 轮询中断/超时 → SIGKILL。
+_SEARCH_WORKER_MARKER = "__SEARCH_RESULT__"
+_SEARCH_WORKER_CODE = (
+    "import sys; sys.path.insert(0, "
+    + repr(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    + "); from codes.search_worker import main; main()"
+)
+
+
+def _run_search_worker(agent, params: dict, timeout_ms: int = 120000) -> ToolResult:
+    """启动 search worker 子进程（searchinfo/searchskill 统一入口，可中断可超时）。"""
+    def _builder(data, stdout, stderr, rc):
+        if data is None:
+            return ToolResult(stderr=(stderr or stdout)[-2000:], exit_code=rc or 1)
+        return ToolResult(stdout=json.dumps(data, ensure_ascii=False))
+    return _run_worker_streaming(
+        agent, _SEARCH_WORKER_CODE, params, timeout_ms,
+        marker=_SEARCH_WORKER_MARKER, on_line=None,
+        result_builder=_builder, log_source="search",
+        timeout_msg=f"search timed out after {timeout_ms}ms",
+    )
+
+
+def _search_worker_payload(r: ToolResult) -> dict | None:
+    """解析 search worker 返回的 JSON payload；失败返回 None。"""
+    if r.exit_code != 0 or not r.stdout:
+        return None
+    try:
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+def searchinfo_items(agent, dirs_paths: list, query: str, top_k: int = 5,
+                     session: str | None = None) -> list:
+    """worker 化 searchinfo，返回原始 items（供技能选择阶段收集信息）。"""
+    params = {"kind": "searchinfo", "dirs_paths": list(dirs_paths),
+              "query": str(query), "top_k": int(top_k),
+              "session": session or getattr(agent, "session", None)}
+    payload = _search_worker_payload(_run_search_worker(agent, params, timeout_ms=120000))
+    return (payload or {}).get("items") or []
+
+
+def searchskill_names(agent, query: str, top_k: int = 5) -> list:
+    """worker 化 searchskill，返回技能名列表（供技能选择阶段使用）。"""
+    params = {"kind": "searchskill", "query": str(query), "top_k": int(top_k),
+              "session": getattr(agent, "session", None)}
+    payload = _search_worker_payload(_run_search_worker(agent, params, timeout_ms=60000))
+    return (payload or {}).get("names") or []
+
+
+def searchskill_details(agent, query: str, top_k: int = 5) -> list:
+    """worker 化 searchskill_detail，返回详情 dict 列表。"""
+    params = {"kind": "searchskill_detail", "query": str(query), "top_k": int(top_k),
+              "session": getattr(agent, "session", None)}
+    payload = _search_worker_payload(_run_search_worker(agent, params, timeout_ms=60000))
+    return (payload or {}).get("items") or []
 
 
 def exec_searchskill(agent, query: str, top_k: int = 5) -> ToolResult:
-        """搜索匹配的技能并返回格式化结果。"""
-        from codes.search import searchskill
-        from codes.skill import getskill, SkillLoader
-        names = searchskill(query, top_k=top_k)
-        if not names:
-            all_skills = SkillLoader.list_skills()
-            return ToolResult(
-                stdout=f"未找到匹配的技能。\n当前可用技能: {', '.join(all_skills)}"
-            )
-        lines = ["找到以下匹配技能:"]
-        for name in names:
-            desc = getskill(name)
-            lines.append(f"  • {desc}")
-        lines.append("")
-        lines.append("💡 请在回复首行切换技能选择: 🎯 技能选择: <技能名>")
-        return ToolResult(stdout="\n".join(lines))
+    """搜索匹配的技能并返回格式化结果（worker 子进程，可中断）。"""
+    names = searchskill_names(agent, query, top_k)
+    if not names:
+        all_skills = SkillLoader.list_skills()
+        return ToolResult(
+            stdout=f"未找到匹配的技能。\n当前可用技能: {', '.join(all_skills)}")
+    lines = ["找到以下匹配技能:"]
+    for name in names:
+        desc = getskill(name)
+        lines.append(f"  • {desc}")
+    lines.append("")
+    lines.append("💡 技能不匹配时可调用 searchskill 搜索技能库")
+    return ToolResult(stdout="\n".join(lines))
+
+
+def exec_selectskill(agent, name: str, reason: str = "") -> ToolResult:
+    """selectskill：读取技能全文返回（无自述承诺，普通 tool 语义）。
+
+    已注入过（marker 在上下文中，assistant/tool 角色均可）→ 返回锚点摘要；
+    未注入 → 返回技能全文（带 marker 供后续去重判定）。
+    纯只读（不 append messages）。
+    """
+    skill_dir = SkillLoader._find_skill_dir(name)
+    if skill_dir is None:
+        all_skills = SkillLoader.list_skills()
+        return ToolResult(
+            error=f"技能 {name} 不存在。可用技能: {', '.join(all_skills)}")
+    skill_md = (skill_dir / "skill.md").read_text(encoding="utf-8")
+    meta = SkillLoader.load_meta(name) or {}
+    version = meta.get("version", "")
+    # 2026-08-27: 记录技能使用回合（_skill_usage_alarm 状态缓存化，O(1) 判定）
+    try:
+        setattr(agent, "_last_skill_turn", getattr(agent, "_turn_count", 0))
+    except Exception:
+        pass
+    marker = agent._skill_full_marker(name, version)
+    # marker 已在上下文中（assistant 自述承诺或 tool 结果）→ 锚点，避免重复全文
+    if any(marker in (m.get("content") or "") for m in agent.messages):
+        body = agent._strip_frontmatter(skill_md)
+        anchor = agent._skill_anchor(body)
+        return ToolResult(
+            stdout=f"✅ 已读技能 {name}（锚点: {anchor}），无需重复注入全文。")
+    body = agent._strip_frontmatter(skill_md)
+    return ToolResult(stdout=f"{marker}\n{body}")
 
 
 def exec_searchinfo(agent, dirs_paths: list, query_or_keyword: str, top_k: int = 5) -> ToolResult:
-    """按指定目录搜索文件内容并返回格式化结果。"""
-    from codes.search import searchinfo
+    """按指定目录搜索文件内容并返回格式化结果（worker 子进程，可中断）。"""
     if not dirs_paths or not query_or_keyword:
         return ToolResult(stdout="searchinfo: dirs_paths 与 query_or_keyword 均必填。")
-    session = getattr(agent, "session", None)
-    try:
-        items = searchinfo(list(dirs_paths), str(query_or_keyword), top_k=top_k, session=session)
-    except Exception as e:
-        return ToolResult(error=f"searchinfo 执行失败: {e}")
+    items = searchinfo_items(agent, list(dirs_paths), str(query_or_keyword), top_k,
+                             session=getattr(agent, "session", None))
     if not items:
         return ToolResult(stdout="未找到匹配内容。")
     lines = ["在指定目录中找到以下相关片段:"]
     for it in items:
-        lines.append(f"  [{it['method']}] {it['path']} (score={it['score']})")
-        lines.append(f"      {it['snippet']}")
+        lines.append(f"  [{it.get('method', '?')}] {it.get('path', '?')} (score={it.get('score', '?')})")
+        lines.append(f"      {it.get('snippet', '')}")
     return ToolResult(stdout="\n".join(lines))
 
 
@@ -366,6 +702,42 @@ def exec_summary(agent, title: str, content: str, tags: list | None = None, key:
     if tags:
         parts.append(f"🏷️ tags: {', '.join(str(t) for t in tags)}")
     return ToolResult(stdout="\n".join(parts), stop_turn=True)
+
+
+def exec_addinfo(agent, key: str = '', value='', **_ignored) -> ToolResult:
+    """写入/更新本 session 状态信息（session 级 KV，下回合注入头部元信息区）。
+
+    **_ignored 容错：LLM 幻觉传多余参数时不抛 TypeError，走正常校验反馈。
+    """
+    from codes.session_info import add_info
+    sess = getattr(agent, "session", None)
+    if not sess:
+        return ToolResult(error="addinfo: 无法确定当前 session")
+    if not str(key or '').strip():
+        return ToolResult(stdout="❌ addinfo: 缺少必填参数 key")
+    if value is None:
+        return ToolResult(stdout="❌ addinfo: 缺少必填参数 value")
+    return ToolResult(stdout=add_info(sess, key, value, by="llm"))
+
+
+def exec_listinfo(agent, **_ignored) -> ToolResult:
+    """列出本 session 当前全部状态信息（活跃条目 + 已删除存档 key 名）。"""
+    from codes.session_info import list_info
+    sess = getattr(agent, "session", None)
+    if not sess:
+        return ToolResult(error="listinfo: 无法确定当前 session")
+    return ToolResult(stdout=list_info(sess))
+
+
+def exec_rminfo(agent, key: str = '', **_ignored) -> ToolResult:
+    """软删除本 session 的一条状态信息（状态板移除，存储保留存档）。"""
+    from codes.session_info import remove_info
+    sess = getattr(agent, "session", None)
+    if not sess:
+        return ToolResult(error="rminfo: 无法确定当前 session")
+    if not str(key or '').strip():
+        return ToolResult(stdout="❌ rminfo: 缺少必填参数 key")
+    return ToolResult(stdout=remove_info(sess, key))
 
 
 def _kill_and_reap(proc) -> None:
@@ -431,14 +803,14 @@ def _run_worker_streaming(agent, worker_code: str, params: dict, timeout_ms: int
             try:
                 for raw in stream:
                     if marker in raw:
-                        marker_hit["found"] = True
                         payload = raw.split(marker, 1)[1].strip()
+                        marker_hit["found"] = True
                         marker_hit["raw"] = payload
                         try:
                             marker_hit["data"] = json.loads(payload)
                         except Exception:
                             marker_hit["data"] = None
-                        break  # marker 后无更多内容
+                        continue
                     target.append(raw)
                     if on_line is not None:
                         try:
@@ -573,6 +945,7 @@ def run_pythonrt(agent, code: str, workdir: str | None = None,
         "code": code,
         "unrestricted": unrestricted,
         "stream_output": True,   # 方案2: worker 实时透传 stdout/stderr（进度事件）
+        "protected_dir": os.path.realpath(os.path.join(sandbox_cwd, config.DATA_DIR_NAME)),
     }
 
     worker_code = (
@@ -629,6 +1002,32 @@ def exec_agent(
     if not isinstance(timeout, (int, float)) or timeout <= 0:
         timeout = 120
 
+    _IMAGE_MAX_BYTES = 10 * 1024 * 1024
+    _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+    safe_images: list[str] = []
+    if images:
+        from codes.path_guard import allowed_roots_for_agent, path_in_roots
+        roots = allowed_roots_for_agent(agent)
+        files_dir = os.path.realpath(os.path.join(agent.cwd, config.DATA_DIR_NAME, "files"))
+        for ip in images:
+            ip = str(ip or "").strip()
+            if not ip:
+                continue
+            candidate = os.path.realpath(ip if os.path.isabs(ip) else os.path.join(agent.cwd, ip))
+            if not (path_in_roots(candidate, roots) or candidate.startswith(files_dir + os.sep)):
+                return ToolResult(error=f"image path outside allowed roots: {ip}", exit_code=1)
+            if not os.path.isfile(candidate):
+                return ToolResult(error=f"image not found: {ip}", exit_code=1)
+            ext = os.path.splitext(candidate)[1].lower()
+            if ext not in _IMAGE_EXTS:
+                return ToolResult(error=f"unsupported image type: {ext or '(none)'}", exit_code=1)
+            try:
+                if os.path.getsize(candidate) > _IMAGE_MAX_BYTES:
+                    return ToolResult(error=f"image too large (max {_IMAGE_MAX_BYTES} bytes): {ip}", exit_code=1)
+            except OSError as e:
+                return ToolResult(error=f"image stat failed: {e}", exit_code=1)
+            safe_images.append(candidate)
+
     worker_code = (
         "import sys; sys.path.insert(0, "
         + repr(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -645,7 +1044,7 @@ def exec_agent(
         "reasoning_effort": agent._resolve_effort(),
         "allow_agent_tool": allow_agent_tool,
         "allow_exit": allow_exit,
-        "images": images or [],
+        "images": safe_images,
         # AgentProxy 构造数据（纯数据，跨进程 JSON 传递）
         "cwd": str(agent.cwd),
         "mode": agent.mode,

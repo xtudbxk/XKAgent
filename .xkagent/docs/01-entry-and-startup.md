@@ -86,7 +86,7 @@ On Linux and macOS, you can also run:
 ./run.sh --workdir /path/to/project --mode web --port 9090
 ```
 
-`run.sh` locates the repository directory but does not change the caller's current directory. It checks whether `requests` is available in the current Python installation; if not, it installs the full `requirements.txt`, then runs `codes/main.py` by absolute path and forwards all arguments unchanged.
+`run.sh` locates the repository directory but does not change the caller's current directory; it runs `codes/main.py` by absolute path and forwards all arguments unchanged. Dependencies must be installed beforehand (the core needs only `requests`; optional groups are listed in `requirements.txt`)—the script no longer installs them automatically.
 
 The script neither changes the cwd nor sets `PYTHONPATH`. The Python entry point adds the project root to `sys.path` based on its own location, so imports do not depend on where the script was invoked. Accordingly:
 

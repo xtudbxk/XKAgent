@@ -47,7 +47,11 @@ Skill 把领域知识、工作流程、参考资料和脚本组织在独立目�
 
 ### 🧭 Status · 长程任务与 Memory 的状态底座
 
-Agent 不应只看到用户最后一句话。XKAgent 在每轮请求中注入时间、运行模式、路径权限、建议技能和检索信息，让模型知道“当前处于什么状态、可以做什么、有哪些与当前任务相关的长期记忆、项目文档或外部知识”。Status 注入已经实现；完整的长程任务编排和长期 Memory 尚未实现，它们将建立在这层稳定的状态接口之上。
+Agent 不应只看到用户最后一句话。XKAgent 在每轮请求中注入时间、运行模式、路径权限、建议技能和检索信息，让模型知道“当前处于什么状态、可以做什么、有哪些与当前任务相关的长期记忆、项目文档或外部知识”。除了只读的系统字段，会话还可以用 `addinfo` / `listinfo` / `rminfo`（或 `/addinfo` 等命令）维护一层可写的**状态信息**——短小、跨回合稳定、每回合注入、压缩后依然生效。Status 注入已经实现；完整的长程任务编排和长期 Memory 尚未实现，它们将建立在这层稳定的状态接口之上。
+
+### 📮 多 Agent 通信 · 会话之间的异步协作
+
+多个会话可以互相发信协作：`callagent` 把异步邮件写入全局 `mail.jsonl` 总线，由轮次邮差投递给任意会话——支持延迟/定点唤醒、优先级、回复链、广播与收件方 provider 覆盖。定时唤醒、信息交换与长程任务托管都建立在这层原语之上。详见 [11 · 多 Agent 通信](.xkagent/docs/11-多Agent通信.md)。
 
 ### 🛡️ Sandbox · 渐进信任，而不是绝对安全
 
@@ -207,7 +211,7 @@ flowchart LR
 | [🚀 安装与启动](.xkagent/docs/01-入口与启动.md) | [✨ LLM 调用](.xkagent/docs/04-LLM调用层.md) | [🧩 Skill 扩展](.xkagent/docs/07-技能系统.md) |
 | [⚙️ Provider 与配置](.xkagent/docs/02-配置管理.md) | [🛡️ pythonrt 与沙箱](.xkagent/docs/05-沙箱与工具执行.md) | [🧠 搜索与记忆](.xkagent/docs/08-搜索与记忆.md) |
 | [💾 存储与日志](.xkagent/docs/03-基础设施.md) | [🤖 Agent 引擎](.xkagent/docs/06-Agent引擎.md) | [⌨️ 命令参考](.xkagent/docs/09-命令系统.md) |
-| [🏗️ 架构总览](.xkagent/docs/codes_功能整理.md) |  | [💻 CLI 与 Web](.xkagent/docs/10-前端界面.md) |
+| [🏗️ 架构总览](.xkagent/docs/codes_功能整理.md) | [📮 多 Agent 通信](.xkagent/docs/11-多Agent通信.md) | [💻 CLI 与 Web](.xkagent/docs/10-前端界面.md) |
 
 ### 💬 不想阅读文档？直接问 XKAgent
 
@@ -226,6 +230,20 @@ pythonrt、Skills 和 Status 分别解决什么问题，它们之间如何协作
 ```
 
 这样即使没有预先通读全部文档，也可以从具体问题入手了解 XKAgent。涉及实现细节时，请以当前源码为准。
+
+---
+
+## 📝 更新说明 · 0.2.0
+
+本版聚焦多 Agent 协作与更简单的存储层：
+
+- **📮 多 Agent 通信**：新增全局 `mail.jsonl` 邮件总线、轮次邮差 MailPostman 与 `callagent` 工具，支持跨会话异步消息（延迟/定点投递、优先级、回复链、广播、收件方 provider 覆盖）。
+- **💾 存储升级：SQLite → msgz**：会话改为单文件 `.msgz`（zlib 压缩、内存主数据、原子落盘）；旧 `*.db` 保持只读兼容，可用 `codes/msgz_migrate.py` 迁移。
+- **🧭 状态信息（Status Info）**：会话级 KV 状态板（`addinfo` / `listinfo` / `rminfo`），每回合注入、压缩后保留。
+- **🧩 内置技能扩充**：`paper_collect`、`paper_discuss`、`pdfreader`、`playwright_web`、`callagent_workflows` 等。
+- **⚙️ 其他改进**：Web 会话标题与置顶、文件在线预览页；长上下文自动压缩与工具输出截断。
+
+详细说明见 [0.2.0 更新说明](docs/release_notes_0.2.0.md)。
 
 ---
 

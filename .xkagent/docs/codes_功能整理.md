@@ -18,13 +18,13 @@ XKAgent 是一个本地运行的轻量 Agent Runtime。它没有为每项任务�
 
 Skill 把领域知识、流程、参考资料和脚本放在独立目录中，核心只负责发现和加载。一个有效 Skill 至少包含 `skill.md`；`<workdir>/.xkagent/skills/` 中的同名 Skill 会覆盖仓库自带的 `skills/`，因此可以定制能力而无需修改 Agent 主循环。
 
-候选 Skill 主要通过 ngram 和 frontmatter 匹配，embedding 只在启用并具备依赖时作为补充。frontmatter 缓存使用文件 mtime 与大小失效，修改后可以热加载。首次选用时，Agent 会把 Skill 内容作为自述承诺写入会话；后续同版本通过锚点召回，避免反复注入全文。
+候选 Skill 主要通过 ngram 和 frontmatter 匹配，embedding 只在启用并具备依赖时作为补充。frontmatter 缓存使用文件 mtime 与大小失效，修改后可以热加载。需要按技能工作流执行时，Agent 通过 `selectskill` 工具加载：首次返回完整 `skill.md`（带版本标记），同一版本的后续调用返回语义锚点摘要，避免反复注入全文。
 
 ### Status：长程任务与 Memory 的底座
 
 Status 不是后台守护进程，而是每轮动态生成的上下文前缀。它在模型行动前说明当前时间、执行模式、路径权限、建议 Skills、相关检索片段和用户的显式要求，让一次请求能够接上当前运行状态。
 
-现有实现已经提供三层可恢复上下文：本轮有效对话、每个 session 的 SQLite 历史与状态，以及 `summary` 或 `/compact` 写入 `.xkagent/docs/<session>/` 的可检索文档。推荐信息默认搜索 `skills`、`docs`、`historys` 和 `logs`，同时排除当前 session 的历史；源码 `codes` 默认不参与推荐，可通过搜索范围配置显式加入。
+现有实现已经提供三层可恢复上下文：本轮有效对话、每个 session 的 msgz 历史与状态，以及 `summary` 或 `/compact` 写入 `.xkagent/docs/<session>/` 的可检索文档。另有会话级**状态信息**板（`addinfo` / `listinfo` / `rminfo`），每回合注入且在压缩后保留。推荐信息默认搜索 `skills`、`docs`、`historys` 和 `logs`，同时排除当前 session 的历史；源码 `codes` 默认不参与推荐，可通过搜索范围配置显式加入。
 
 这些机制是长程与记忆能力的底座，不等于完整产品能力。**自动长程任务编排、计划调度、记忆重要性评估、遗忘与冲突消解，以及完整的长期 Memory 管理目前都尚未实现。** `summary` 与 `/compact` 需要 Agent 或用户主动触发，也没有独立的记忆管理服务。
 
@@ -35,7 +35,7 @@ CLI / Web
   → commands 分流 slash 命令，普通消息进入当前 session 队列
   → Agent 检查会话锁，解析 @路径并清理非法 Unicode
   → 检索建议 Skills 与相关信息，生成 Status
-  → 用户消息写入 session SQLite
+  → 用户消息写入 session msgz 存储
   → system prompt + 有效历史 + 本轮图片发送给 LLM
   → llm.py 统一输出 reasoning / text / tool calls / usage
   → 工具调用按顺序执行，结果落库后继续下一次 LLM 调用
@@ -58,7 +58,7 @@ CLI / Web
 - `skill.py` 与 `search.py` 提供能力发现、内容抽取、检索和长期文档写入。
 - `agent_runner.py` 与 `agent_worker.py` 承载隔离的子 Agent 循环。
 
-基础设施同样独立：`history.py` 管理 SQLite，`lock.py` 管理 session lease，`_log.py` 管理标准库日志和轮转。交互层的 `commands.py` 只注册一次命令，CLI 和 Web 复用相同分发语义；两端再分别处理终端输入或 FastAPI、WebSocket、认证与文件接口。
+基础设施同样独立：`history.py` 管理 msgz 存储，`lock.py` 管理 session lease，`_log.py` 管理标准库日志和轮转。跨会话协作由 `mailbox.py`（全局总线）与 `manager.py` 的 MailPostman（投递）承载，并通过 `callagent` 工具暴露给模型；详见 [11 · 多 Agent 通信](11-多Agent通信.md)。交互层的 `commands.py` 只注册一次命令，CLI 和 Web 复用相同分发语义；两端再分别处理终端输入或 FastAPI、WebSocket、认证与文件接口。
 
 ## 执行权限不是安全容器
 
@@ -74,11 +74,11 @@ CLI / Web
 
 ## Session、状态与并发
 
-每个 session 对应一个 SQLite 数据库，以及运行时中的独立 Agent 线程和输入输出队列。`AgentManager` 只把新输入发送到当前焦点，但其他 session 可以继续在后台完成回合；停止线程不会删除历史，再次切回时可以恢复。
+每个 session 对应一份 msgz 存储，以及运行时中的独立 Agent 线程和输入输出队列。`AgentManager` 只把新输入发送到当前焦点，但其他 session 可以继续在后台完成回合；停止线程不会删除历史，再次切回时可以恢复。
 
-SQLite 当前持久化消息与命令、Provider/模型、累计和最近一轮 token、动态挂载、搜索范围及一次性图片状态。执行模式和 Skill 自动选择开关是运行时状态，Agent 重启后回到默认值，而不是完整持久化。`/compact` 保留原始数据库记录，用截断标记和 LLM 总结重建有效上下文，并把总结写入 docs；`/drop` 只标记并清空当前有效上下文，不生成长期总结。
+msgz 存储当前持久化消息与命令、Provider/模型、累计和最近一轮 token、动态挂载、搜索范围及一次性图片状态。执行模式是运行时状态，Agent 重启后回到默认值，而不是完整持久化。`/compact` 保留原始存储记录，用截断标记和 LLM 总结重建有效上下文，并把总结写入 docs；`/drop` 只标记并清空当前有效上下文，不生成长期总结。
 
-同一 session 通过 `<session>.db.lockdir/` lease 独占写入。owner 元数据和心跳用于识别持有者、恢复陈旧锁及处理同进程崩溃；其他进程打开该 session 时进入观察者状态。这个锁只防止并发写坏会话，不是数据库备份或事务式文件回滚。
+同一 session 通过 `<session>.lockdir/` lease 独占写入。owner 元数据和心跳用于识别持有者、恢复陈旧锁及处理同进程崩溃；其他进程打开该 session 时进入观察者状态。这个锁只防止并发写坏会话，不是会话备份或事务式文件回滚。
 
 子 Agent 与主对话使用隔离消息循环，可以配置模型、可用工具、步数、总超时和图片输入，最终结果必须是合法 JSON。它默认不能调用 `exit`，也不能继续调用 `agent`；只有显式开启后才允许嵌套。
 
@@ -87,8 +87,9 @@ SQLite 当前持久化消息与命令、Provider/模型、累计和最近一轮 
 ```text
 <workdir>/
 ├─ .xkagent/
-│  ├─ historys/<session>.db[/-wal/-shm]  # 消息、命令与会话状态
-│  ├─ historys/<session>.db.lockdir/      # lease 与 owner 元数据
+│  ├─ historys/<session>.msgz             # 消息、命令与会话状态（单文件）
+│  ├─ historys/<session>.lockdir/         # lease 与 owner 元数据
+│  ├─ state/<session>.json                # 会话级 KV（状态板）
 │  ├─ logs/                               # 进程日志与轮转文件
 │  ├─ docs/<session>/                     # summary / compact 长期文档
 │  ├─ skills/                             # 用户 Skill，覆盖内置同名项
@@ -118,7 +119,7 @@ SQLite 当前持久化消息与命令、Provider/模型、累计和最近一轮 
 
 - [01 · 入口与启动](01-入口与启动.md)：启动顺序、参数和前端调度。
 - [02 · 配置管理](02-配置管理.md)：workdir、Provider、模型与热加载。
-- [03 · 基础设施](03-基础设施.md)：SQLite、日志和 session lease。
+- [03 · 基础设施](03-基础设施.md)：msgz 存储、日志和 session lease。
 - [04 · LLM 调用层](04-LLM调用层.md)：协议适配、SSE、重试、中断与 usage。
 - [05 · 沙箱与工具执行](05-沙箱与工具执行.md)：`pythonrt`、执行 profile 与防护边界。
 - [06 · Agent 引擎](06-Agent引擎.md)：主循环、事件、多会话与子 Agent。
@@ -126,3 +127,4 @@ SQLite 当前持久化消息与命令、Provider/模型、累计和最近一轮 
 - [08 · 搜索与记忆](08-搜索与记忆.md)：检索范围、ngram/embedding 与长期文档。
 - [09 · 命令系统](09-命令系统.md)：共享命令、状态变更与审计。
 - [10 · 前端界面](10-前端界面.md)：CLI、Web、文件接口与认证。
+- [11 · 多 Agent 通信](11-多Agent通信.md)：mail 总线、callagent 与长程/定时协作。

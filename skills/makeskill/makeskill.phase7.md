@@ -110,14 +110,29 @@ YAML frontmatter → [ALWAYS]
 
 #### 步骤 4: 执行拆分
 
-```bash
-# 备份
-cp skills/<name>/skill.md skills/<name>/skill.md.bak
+```python
+# pythonrt 备份 + 写入 + 校验 三合一（不用 shutil/cp/bash）
+import os
 
-# 写入精简版 skill.md（仅含 [ALWAYS] 内容 + 导航树）
+name = '<name>'
+base = f'skills/{name}'
+src = os.path.join(base, 'skill.md')
 
-# 写入各子文件
-# ...
+# ① 备份（纯 open 二进制复制）
+with open(src, 'rb') as fh:
+    data = fh.read()
+with open(src + '.bak', 'wb') as fh:
+    fh.write(data)
+
+# ② 写入精简版 skill.md（仅含 [ALWAYS] 内容 + 导航树）与各子文件
+with open(src, 'w', encoding='utf-8') as fh:
+    fh.write(精简版_skill_md)
+for sub, content in 子文件.items():
+    with open(os.path.join(base, sub), 'w', encoding='utf-8') as fh:
+        fh.write(content)
+
+# ③ 读回校验：导航表行数 == 子文件数，路径均存在
+...（校验逻辑见 Phase 6）
 ```
 
 #### 步骤 5: 验证

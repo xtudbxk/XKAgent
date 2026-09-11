@@ -1,3 +1,4 @@
+# deps: stdlib only
 """
 skills/openreview — OpenReview 论文 Review + Rebuttal 下载器
 

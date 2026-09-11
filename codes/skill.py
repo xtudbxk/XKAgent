@@ -16,19 +16,24 @@ _FM_CACHE: dict[Path, tuple[int, int, dict]] = {}
 _FM_CACHE_LOCK = threading.Lock()
 
 
-def _skill_dirs() -> list[str]:
+def _skill_dirs(workdir: "str | Path | None" = None) -> list[str]:
     """返回技能目录优先级列表（用户级优先，内置级兜底）。
 
     用户级目录为 $workdir/.xkagent/skills，
     同名技能时用户级覆盖内置级；用户级目录不存在时仅返回内置级，
-    保持与改造前完全一致的行为。
+    加载（SkillLoader.list_skills / _find_skill_dir）与搜索（search.py skills 范围根）
+    统一使用本函数，保证加载与搜索的技能路径/优先级完全一致。
 
     只读语义：直接拼接路径 + is_dir() 判断，不调用 config.get_skills_dir()
     （后者会 mkdir 创建目录——搜索/列举是只读操作，不应有写副作用）。
     """
     from codes import config
+    if workdir is not None:
+        wd = Path(workdir).expanduser().resolve()
+    else:
+        wd = config.get_workdir()
     dirs: list[str] = []
-    user_dir = str(config.get_workdir() / config.DATA_DIR_NAME / "skills")
+    user_dir = str(Path(wd) / config.DATA_DIR_NAME / "skills")
     if Path(user_dir).is_dir():
         dirs.append(user_dir)
     dirs.append(BUILTIN_SKILLS_DIR)

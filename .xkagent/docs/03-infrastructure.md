@@ -2,7 +2,7 @@
 
 [简体中文](03-基础设施.md) | English
 
-Why is each session stored in a SQLite file? What happens when another process is already using a session with the same name, and where are logs written? This guide brings together the underlying mechanisms that rarely matter in day-to-day use but become important during backups and troubleshooting.
+Where is session data stored, what happens when another process already holds a session with the same name, and where are logs written? This guide brings together the underlying mechanisms that rarely matter in day-to-day use but become important during backups and troubleshooting.
 
 ## Where runtime data is stored
 
@@ -11,10 +11,10 @@ XKAgent keeps runtime data under `<workdir>/.xkagent/`. Depending on the enabled
 ```text
 <workdir>/.xkagent/
 ├── historys/
-│   ├── <session>.db
-│   ├── <session>.db-wal
-│   ├── <session>.db-shm
-│   └── <session>.db.lockdir/
+│   ├── <session>.msgz          # single-file session store (zlib-compressed JSON)
+│   └── <session>.lockdir/      # single-writer lease (owner.json)
+├── state/
+│   └── <session>.json          # per-session KV (status board)
 ├── logs/
 │   └── <启动时间>.log
 ├── docs/<session>/  # summary/compact runtime memory
@@ -23,43 +23,39 @@ XKAgent keeps runtime data under `<workdir>/.xkagent/`. Depending on the enabled
 └── search_ranges.txt
 ```
 
-SQLite sidecars, session locks, and some configuration files appear only when their related features are enabled or while a database is in use. When the repository root is the workdir, project documentation and runtime memory share `.xkagent/docs/`; each session's runtime memory remains in its own subdirectory.
+Session locks and some configuration files appear only when their related features are enabled. If legacy `*.db` files remain in the directory, they are kept as read-only history. When the repository root is the workdir, project documentation and runtime memory share `.xkagent/docs/`; each session's runtime memory remains in its own subdirectory.
 
-## One SQLite database per session
+## One msgz store per session
 
-Each session corresponds to `historys/<session>.db`. Session names are limited to 100 characters and may contain only letters, numbers, underscores, hyphens, and periods.
+Each session corresponds to `historys/<session>.msgz`—a single zlib-compressed JSON file that holds messages and session state (the selected Provider and model, token counts, dynamic mounts, search scopes, images, and more). Session names are limited to 100 characters and may contain only letters, numbers, underscores, hyphens, and periods.
 
-New databases use WAL mode and create all six current tables at once:
+Storage model:
 
-- `messages` stores user, assistant, tool, compaction, command, and other messages, together with extended metadata, turn numbers, and timestamps.
-- `agent_state` stores the Provider and model currently selected for the session.
-- `token_state` stores cumulative and most-recent-turn token counts, turn counts, and the last-used model.
-- `mount_state` stores dynamic mounts.
-- `search_state` stores search scopes and deny rules.
-- `image_state` stores paths to attached images.
-
-The schema version is recorded when a database is first created. When an older database is opened, tables or columns are added only if its version is behind. SQLite connections use a 10-second wait timeout.
+- **Memory-first**: messages and state live in memory; writes complete in memory and return immediately, so storage I/O failures cannot block the conversation.
+- **Periodic sync**: every 30 seconds by default, an in-memory snapshot is persisted atomically (write a temporary file, then `os.replace`), so the on-disk file is always a complete, consistent version.
+- **Single-file portability**: backups, copies, and migrations only need one `.msgz` file—there are no `-wal`/`-shm` sidecars.
+- **Legacy compatibility**: old `*.db` files are not deleted automatically and remain as read-only history; `codes/msgz_migrate.py` migrates SQLite sessions to `.msgz` in one pass.
 
 Slash commands and `!` commands are written to history with `role='command'`, with results truncated to 4,000 characters. Before insertion, XKAgent attempts to mask common token, key, secret, password, authorization, and bearer values. This is only a basic safeguard and cannot identify every credential format, so commands should still avoid unnecessary sensitive information.
 
 ## Session files and backups
 
-Session management handles not only the primary `.db` file but also its WAL sidecars:
+Session management operates on the single-file store:
 
-- Creating a session initializes the database schema and Agent state.
-- Before a fork, XKAgent runs a WAL checkpoint and then copies any existing `.db`, `.db-wal`, and `.db-shm` files.
-- Rename also checkpoints first; if the operation fails partway through, it attempts to roll back files that have already moved.
-- Delete removes the primary database and its sidecars. If the main file is missing while sidecars remain, the session is reported as corrupted.
-- Sync uses `PRAGMA wal_checkpoint(TRUNCATE)` to write as much WAL content as possible back to the main database and truncate the sidecar. If the database is still busy, WAL data that has not yet been persisted is retained.
+- Creating a session initializes an empty `.msgz` store and Agent state; the file is created on first persist.
+- Fork first flushes the source session, then copies its `.msgz` as the starting point of the new session (truncated copies are also supported).
+- Rename renames the corresponding `.msgz` file and updates the session registry.
+- Delete removes the session's `.msgz` and `.lockdir` (legacy `.db` files are kept as read-only history).
+- Sync force-flushes the latest in-memory state to disk (equivalent to the old WAL checkpoint semantics).
 
-Do not copy only the `.db` file while a session is still being written; doing so may omit content that has not yet been checkpointed from the WAL. The safest backup procedure is to stop the relevant process first. File-level session operations should likewise use the built-in sync/checkpoint flow beforehand.
+Because persistence uses "temporary file + atomic replace," the on-disk `.msgz` is always a complete and consistent version; copying it while the process runs still yields a valid snapshot (possibly slightly stale). For the freshest data, run `/session sync` first or stop the relevant process.
 
 ## mkdir lease: a cross-process single-writer lock
 
 Instead of `flock`, XKAgent competes for a session write lock by atomically creating a directory:
 
 ```text
-historys/<session>.db.lockdir/owner.json
+historys/<session>.lockdir/owner.json
 ```
 
 `owner.json` records the process-instance ID, PID, thread ID, hostname, owner, and lock acquisition time. `mkdir` is atomic on the NFS server as well, so only one of multiple competing clients can succeed.
@@ -70,11 +66,11 @@ A process can also leave behind a lock owned by a thread that has exited. Once r
 
 ## When a session is busy: observer mode
 
-If another process opens a session with the same name while it is in use, it does not crash immediately; it enters observer mode. The interface displays the busy state and any readable owner information. LLM input, database writes, and write commands are rejected so the single-writer constraint cannot be bypassed.
+If another process opens a session with the same name while it is in use, it does not crash immediately; it enters observer mode. The interface displays the busy state and any readable owner information. LLM input, store writes, and write commands are rejected so the single-writer constraint cannot be bypassed.
 
 While idle, an observer continues polling for the lock. After the original owner exits normally, or after a stopped heartbeat makes the lock eligible for takeover, the observer automatically upgrades to the owner.
 
-Do not manually delete a `.db.lockdir` whose lease is still being renewed normally, as this can break the single-writer guarantee. The 35-second interval is a crash-recovery threshold, not a session runtime limit; a healthy process renews the lease every 10 seconds.
+Do not manually delete a `.lockdir` whose lease is still being renewed normally, as this can break the single-writer guarantee. The 35-second interval is a crash-recovery threshold, not a session runtime limit; a healthy process renews the lease every 10 seconds.
 
 ## Logging and rotation
 
@@ -92,7 +88,7 @@ Run `/logfile` to view the current process's log path and its last 60 lines, whi
 
 ## Continue reading in the source
 
-`codes/history.py` defines the database schema and session-file operations; `codes/lock.py` implements the mkdir lease, heartbeat, and stale-lock takeover; `codes/_log.py` configures logging and rotation. Observer mode and automatic upgrades are implemented in `codes/agent.py`.
+`codes/history_msgz.py` implements the single-file store (memory-first, periodic sync, atomic persistence); `codes/history.py` provides session-level APIs and file operations; `codes/lock.py` implements the mkdir lease, heartbeat, and stale-lock takeover; `codes/_log.py` configures logging and rotation; and `codes/msgz_migrate.py` provides the SQLite migration. Observer mode and automatic upgrades are implemented in `codes/agent.py`.
 
 ## Related documentation
 

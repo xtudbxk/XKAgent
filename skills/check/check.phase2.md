@@ -45,13 +45,13 @@
 | **环境** | Python 版本匹配 | `python3 --version` | L2 | S |
 | **环境** | CUDA 版本匹配 | `nvcc --version` 或 `torch.version.cuda` | L2 | S |
 | **环境** | 关键依赖已安装 | `python3 -c "import torch, numpy, ..."` | L2 | S |
-| **加载** | 项目模块可导入 | `python3 -c "import JiT.models"` | L3 | S |
-| **加载** | 配置解析无报错 | `source scripts/jit.sh` | L3 | S |
+| **加载** | 项目模块可导入 | `python3 -c "import my_project.models"` | L3 | S |
+| **加载** | 配置解析无报错 | `source scripts/launch.sh` | L3 | S |
 | **加载** | 数据集 sample 可读取 | `python3 -c "dataloader test"` | L3 | M |
 | **一致性** | 同参数跨文件对齐 | `diff` / `grep` 关键参数 | L4 | S |
-| **一致性** | 与基线 diff 合理 | `diff <基线>/jit.sh <当前>/jit.sh` | L4 | S |
+| **一致性** | 与基线 diff 合理 | `diff <基线>/launch.sh <当前>/launch.sh` | L4 | S |
 | **确定性** | 随机种子已固定 | 检查 seed 配置 | L4 | S |
-| **运行** | dry-run 通过 | `exp_submit.py ... --dry-run` | L4 | S |
+| **运行** | dry-run 通过 | `submit_job.py ... --dry-run` | L4 | S |
 | **运行** | git 干净、无未提交变更 | `git status` | L4 | S |
 
 **耗时说明**：`S`(<5s), `M`(5-60s), `L`(>1min)

@@ -23,3 +23,26 @@ models/
 
 # ── 敏感配置：provider api_key 不入库 ──
 provider.config
+
+# ── session registry（代码根，不入库）──
+session_registry.json
+session_registry.lockdir/
+
+# --- 2026-09-03 追加 ---
+# 过程噪音：备份/缓存/会话数据（不入库；工作区文件不受影响，仅停止跟踪）
+__pycache__/
+*.pyc
+*.bak.*
+.trash/
+*.lockdir/
+# 会话运行数据（docs/ 是文档须保留跟踪；historys 数据不入库）
+.xkagent/historys/
+.xkagent/*.lockdir/
+.xkagent/logs/
+
+# --- 2026-09-11 追加 ---
+# 多 Agent 邮件总线与运行态数据（不入库）
+mail.jsonl
+.xkagent/state/
+# rednote 图文页素材（放行该子目录，随文档发布）
+!.xkagent/docs/rednote/

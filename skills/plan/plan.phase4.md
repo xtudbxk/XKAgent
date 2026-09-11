@@ -62,17 +62,17 @@ result = subprocess.run(["python3", "skills/plan/check_runner.py", json.dumps(ch
 #### 配置检查
 
 ```
-  超参文件格式正确             -> source scripts/jit.sh 无报错
+  超参文件格式正确             -> source scripts/launch.sh 无报错
   路径配置有效                 -> 展开后路径可达
-  与基线分支的参数 diff 合理   -> diff <基线>/jit.sh <当前>/jit.sh
+  与基线分支的参数 diff 合理   -> diff <基线>/launch.sh <当前>/launch.sh
 ```
 
 #### 运行检查
 
 ```
-  提交命令 dry-run 通过        -> exp_submit.py ... --dry-run
+  提交命令 dry-run 通过        -> submit_job.py ... --dry-run
   输出目录已清理/已准备        -> ls output_dir
-  端口/资源不冲突              -> exp_status.py 确认
+  端口/资源不冲突              -> job_status.py 确认
 ```
 
 ### 执行规则

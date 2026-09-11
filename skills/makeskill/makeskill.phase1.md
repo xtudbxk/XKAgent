@@ -47,6 +47,9 @@
 | 🟢 **build** | ✅ 可读写 | ✅ 可写 | ✅ | ✅ bash沙箱（受限） |
 | 🔥 **build-unsafe** | ✅ 可读写 | ✅ 可写 | ✅ 无限制 | ✅ pythonrt 无限制（或用户 !xxx） |
 
+> 📌 **执行统一性**：LLM 工具侧所有脚本/代码一律通过 **pythonrt** 调用执行
+> （沙箱双路径：plan/build 用 importlib 动态加载，build-unsafe 直接 import，见 rules_detail 规则 13），不依赖 bash/系统命令；bash 仅限用户 `!xxx` 或 build-unsafe 宿主侧手动使用。
+
 > ⚠️ **影响范围**：这个答案贯穿所有阶段：
 >   - **Phase 2**：模式影响 workflow / tool 的选择倾向
 >   - **Phase 3**：模式影响脚本化方案（plan 下脚本存 `/tmp/`）
@@ -63,6 +66,26 @@
 
 ---
 
+### 7. 落盘位置（新建/规范化时必填）
+
+新技能（或规范化后的技能）放到哪个技能库？
+
+| 选择 | 落盘路径 | 可见范围 | 写入方式 |
+|------|---------|---------|---------|
+| **A. 用户级** | `.xkagent/skills/<name>/` | 仅当前项目会话 | `.xkagent` 全模式只读 → 宿主 `!cmd` 复制 |
+| **B. 系统级** | `xkagent_v0902/skills/<name>/` | 全局所有会话 | 挂载 ro/rw 后 pythonrt 直接写 |
+
+> ⚠️ **禁止**默认落盘到工作目录 `skills/`（不在 `_skill_dirs`，不被技能系统索引，`searchskill` 搜不到）。
+> 记录选择为 `skill_location`，贯穿 Phase 5 落盘与 Phase 6 验证。
+
+#### 影响范围
+
+- **Phase 5**：按落盘位置分支执行（用户级 → 宿主 `!cmd` 复制；系统级 → 挂载直写）
+- **Phase 6**：落盘后用 `searchskill` 验证新技能名可检索
+
+---
+
+
 ### 输出格式
 
 ```
@@ -76,6 +99,7 @@
   目标模式:    build（单选）
   --- 或 ---
   目标模式:    plan + build（多模式兼容）
+  落盘位置:    [A 用户级 .xkagent/skills | B 系统级 xkagent_v0902/skills]
 
 以上是否正确？如有补充请说明。
 ```

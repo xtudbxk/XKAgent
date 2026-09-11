@@ -21,6 +21,7 @@ from codes.history import (
     get_mount_state, set_mount_state,
     get_search_state, set_search_state,
     _set_session_name,
+    _mark_ioerr_cooldown,   # 2026-08-23: _sync_from_db EIO 时标记冷却（防轮询风暴）
 )
 # T4: 改用 acquire_or_recover —— 同进程 crashed 残留自锁时自动接管重试
 from codes.lock import acquire_or_recover as acquire_lock
@@ -28,11 +29,13 @@ from codes.lock import release as release_lock
 from codes.lock import is_locked
 
 
-from codes.llm import complete, complete_stream
+from codes.llm import complete, complete_stream, split_reasoning_tokens
 from codes.tools import (
-    exec_pythonrt, exec_exit, exec_searchskill, exec_searchinfo, exec_agent, exec_summary,
-    TOOL_PYTHONRT_SCHEMA, TOOL_EXIT_SCHEMA, TOOL_SEARCHSKILL_SCHEMA, TOOL_SEARCHINFO_SCHEMA, TOOL_AGENT_SCHEMA, TOOL_SUMMARY_SCHEMA,
-    _sanitize, _tool_result_to_str,
+    exec_pythonrt, exec_exit, exec_searchskill, exec_searchinfo, exec_agent, exec_summary, exec_selectskill, exec_callagent,
+    exec_addinfo, exec_listinfo, exec_rminfo,
+    TOOL_PYTHONRT_SCHEMA, TOOL_EXIT_SCHEMA, TOOL_SEARCHSKILL_SCHEMA, TOOL_SEARCHINFO_SCHEMA, TOOL_AGENT_SCHEMA, TOOL_SUMMARY_SCHEMA, TOOL_SELECT_SKILL_SCHEMA, TOOL_CALLAGENT_SCHEMA,
+    TOOL_ADDINFO_SCHEMA, TOOL_LISTINFO_SCHEMA, TOOL_RMINFO_SCHEMA,
+    _sanitize, _tool_result_to_str, _truncate_tool_text, _TOOL_OUTPUT_MAX_CHARS, _TOOL_OUTPUT_TAIL_CHARS,
 )
 from typing import Generator
 from codes.skill import ToolResult, Skill, SkillLoader, getskill
@@ -42,7 +45,12 @@ from codes import config
 from codes import provider_config
 
 # ── 观察者模式下禁止执行的写类命令 (T3) ──
-_OBSERVER_WRITE_CMDS = {"clear", "compact", "drop", "set_mode", "set_model", "set_provider", "set_skill_select", "resume", "mount", "unmount", "mount_save", "mount_refresh", "info_add", "info_deny", "info_remove", "info_clear"}
+_OBSERVER_WRITE_CMDS = {"clear", "compact", "drop", "set_mode", "set_model", "set_provider", "resume", "mount", "unmount", "mount_save", "mount_refresh", "info_add", "info_deny", "info_remove", "info_clear", "set_autocompactlimit"}
+
+# ── 自动压缩默认阈值（2026-09-11 起默认开启）──
+# >0：处理用户消息前 / 工具循环内估算上下文超过阈值 → autocompact / prune；
+# -1：显式禁用；session 持久化值优先于本默认。600k 为 1M 窗口模型留 400k 余量。
+_DEFAULT_AUTOCOMPACTLIMIT = 600_000
 
 # 历史展示分隔线 (移出 f-string 表达式, 兼容 Python < 3.12)
 _SEP_LINE = "\u2500" * 50
@@ -88,6 +96,13 @@ def _build_system_prompt(lang):
         content = 'You are a code assistant agent.'
 
     # system_prompt.txt 已内置 pythonrt 工具描述（工具收敛后无占位符替换）
+    # [auto-fix] pythonrt 编写规范动态注入（pythonrt_prompt.txt，存在才注入，向后兼容）
+    _pyrt_path = os.path.join(project_root, 'pythonrt_prompt.txt')
+    if os.path.isfile(_pyrt_path):
+        with open(_pyrt_path, 'r', encoding='utf-8') as _f:
+            _pyrt = _f.read().strip()
+        if _pyrt:
+            content = content + '\n\n' + _pyrt
     return content
 
 def _build_compact_prompt() -> str:
@@ -128,6 +143,65 @@ def _estimate_cost(model, prompt_tokens, completion_tokens):
     """兼容旧调用方，统一委托 llm.py。"""
     return estimate_cost(model, prompt_tokens, completion_tokens)
 
+
+def _wrap_mail_instruction(body: str, meta: dict) -> str:
+    """包装 callagent 邮件投递指令：注入信封元信息（按 need_reply 决定是否含回信指引）。
+
+    收信 agent 由此知道：① 当前指令是一封 callagent 邮件（消息 id、来自会话）；
+    ② meta.need_reply=true（发件人显式期望回复）时才注入 callagent 回信指引
+    （to=发件会话、reply_to=本邮件 id）；缺省/通知型邮件不诱导回复。
+    meta 由 manager.send_input 的 mail_meta 透传（{"id","from","reply_to","need_reply"}）。
+    """
+    mid = str(meta.get("id") or "")
+    frm = str(meta.get("from") or "?")
+    rp = meta.get("reply_to") or None
+    nr = bool(meta.get("need_reply"))
+    rcpts = meta.get("recipients") or []
+    lines = [
+        f"📮 这是一封通过 callagent 发送的全异步邮件（消息 id: {mid}，来自会话: {frm}）。",
+    ]
+    if isinstance(rcpts, list) and len(rcpts) > 1:
+        # 广播邮件：告知收信方全体收件人（可感知同行者，自行协调分工）
+        lines.append("📡 广播邮件：本次同时发送给 " + ", ".join(str(r) for r in rcpts)
+                     + "。请知悉你的同行者，可自行协调汇报职责。")
+    if nr:
+        # 发件人显式期望回复（need_reply=true）：注入 callagent 回信指引
+        lines.append("发件人期望回复，请调用 callagent 工具回信：")
+        lines.append(f"  · to       = {frm}")
+        lines.append(f"  · reply_to = {mid}")
+        lines.append("  · message  = 你的回复内容")
+        if rp:
+            lines.append(f"  （本邮件 reply_to={rp}，属回复链；回信仍填 reply_to=本邮件 id）。")
+    else:
+        # 通知型邮件（缺省/need_reply=false）：仅告知信封信息，不诱导回复
+        lines.append("（本邮件未要求回复；若你判断确有回应必要，可自行斟酌。）")
+        if rp:
+            lines.append(f"（本邮件 reply_to={rp}，属回复链。）")
+    lines.append("──────────────── 信件正文 ────────────────")
+    lines.append(body)
+    return "\n".join(lines)
+
+
+def apply_turn_override(agent, provider, model, effort=None):
+    """邮件级 provider/model/effort 临时覆盖（callagent provider 参数，turn 级生效）。
+
+    - 返回 (old_provider, old_model, old_effort)，调用方须在 turn 结束时恢复；
+    - 指定 provider 时 model 跟随该 provider 的 default_model（除非显式给 model）；
+    - effort：可选 reasoning_effort 临时覆盖（provider 参数 'p/model:effort' 拆出），
+      写入 agent._cmd_effort（本 turn 生效）；
+    - 仅改内存属性，不写 session db（收信会话自身配置不受影响）。
+    """
+    old = (getattr(agent, "provider", None), getattr(agent, "model", None),
+           getattr(agent, "_cmd_effort", None))
+    if provider:
+        agent.provider = provider
+        agent.model = model or None
+    elif model:
+        agent.model = model
+    if effort:
+        agent._cmd_effort = effort
+    return old
+
 def _format_ratio(a, b):
     if a == 0 and b == 0:
         return "0:0"
@@ -158,7 +232,22 @@ def _format_cost(usd: float) -> str:
 # 改由逐工具校验（[参数解析失败]/[参数缺失]）回传明确错误给 LLM 自行修复。
 MAX_TOOL_ARG_RETRY = 2
 
-def _resolve_refs(text, cwd):
+_REF_MAX_BYTES = 512 * 1024
+
+
+def _indent_continuation(text, width: int = 2) -> str:
+    """多行片段续行缩进（用户消息头部块字段规范，2026-09-03）。
+
+    首行不动，后续行统一加 width 空格，防止片段内顶格行被误认为字段头。
+    """
+    lines = str(text).split("\n")
+    if len(lines) <= 1:
+        return str(text)
+    pad = " " * width
+    return ("\n" + pad).join(lines)
+
+
+def _resolve_refs(text, cwd, allowed_roots: list[str] | None = None):
     """解析用户消息中的 @路径 引用。
 
     支持三种形态：
@@ -167,17 +256,23 @@ def _resolve_refs(text, cwd):
       @'my notes.txt'     （单引号内可含空格）
     引号未闭合时给出明确报错，避免静默截断路径。
     """
+    from codes.path_guard import resolve_in_roots
+
+    if allowed_roots is None:
+        allowed_roots = [os.path.realpath(cwd)]
     pattern = re.compile(r"""@(?:"([^"]+)"|'([^']+)'|(\S+))""")
 
     def _replace(m):
-        path = m.group(1) or m.group(2) or m.group(3)
-        if path is None:
-            # 引号已开始但未闭合（正则只能匹配到引号本身的情况不会发生，
-            # 此处为防御性兜底）
-            return nl + '[引号路径未闭合]' + nl
-        full = path if os.path.isabs(path) else os.path.join(cwd, path)
         nl = chr(10)
+        path = m.group(1) or m.group(2) or m.group(3)
+        if not path:
+            return nl + '[引号路径未闭合]' + nl
+        full = resolve_in_roots(path, cwd, allowed_roots)
+        if full is None:
+            return nl + '[error reading ' + path + ': path outside allowed roots]' + nl
         try:
+            if os.path.getsize(full) > _REF_MAX_BYTES:
+                return nl + f'[error reading {path}: file too large (max {_REF_MAX_BYTES} bytes)]' + nl
             with open(full, 'r', errors='replace') as f:
                 content = f.read()
             return nl + '```' + nl + '--- ' + path + ' ---' + nl + content + nl + '--- end ' + path + ' ---' + nl + '```' + nl
@@ -199,8 +294,6 @@ def _resolve_refs(text, cwd):
         text = text.replace('@' + q, f'[引号路径未闭合: 缺少 {q}]', 1)
     return pattern.sub(_replace, text)
 
-PERMISSION_FILE = os.path.join(str(config.get_data_dir()), "permission.txt")
-
 # ── /mount 动态挂载 ──
 # 来源标记：default(workdir//tmp) / permission(permission.txt) / dynamic(/mount 命令)
 MOUNT_SOURCE_DYNAMIC = "dynamic"
@@ -210,7 +303,7 @@ MOUNT_SOURCE_DEFAULT = "default"
 # 危险路径前缀：默认拒绝挂载，除非 --force（决策 D）
 DANGEROUS_MOUNT_PREFIXES = (
     "/etc", "/usr", "/bin", "/sbin", "/lib", "/proc",
-    "/sys", "/dev", "/boot", "/var", "/home/", "/opt", "/root",
+    "/sys", "/dev", "/boot", "/var", "/home", "/opt", "/root",
 )
 
 
@@ -254,7 +347,7 @@ def _parse_permission_file(filepath=None):
         list of (abs_path: str, writable: bool)
     """
     if filepath is None:
-        filepath = PERMISSION_FILE
+        filepath = os.path.join(str(config.get_data_dir()), "permission.txt")
     if not os.path.isfile(filepath):
         return []
 
@@ -380,6 +473,7 @@ class Agent:
         output_queue: "queue.Queue | None" = None,
     ):
         self.session = session
+        self.context = config.get_session_context(session, ensure=True)
         # 状态恢复：session db(agent_state) > 显式 provider 参数 > [default] > 引导
         saved_provider, saved_model = ensure_agent_state(session)
         self.provider = provider or saved_provider
@@ -396,15 +490,15 @@ class Agent:
                 f"session '{session}' 未配置 provider：请配置 provider.config [default] "
                 f"或使用 /model @<provider> 选择。"
             )
-        self.cwd = str(config.get_workdir())
-        # 统一从 config 获取 workdir，确保：
-        #   1. 所有 Agent 实例共享同一个 workdir（由 --workdir 或 os.getcwd() 决定）
-        #   2. session 切换时不依赖外部传递，避免路径不一致
-        #   3. config 是全局单例，只需在入口处 set_workdir 一次
+        self.cwd = str(self.context.workdir)
+        self.permission_file = str(self.context.data_dir / "permission.txt")
         logger.info(f"workdir 初始化: {self.cwd}")
         self._mode = mode
         self._input_queue = input_queue
         self._output_queue = output_queue
+        self._event_seq = 0
+        self._current_turn_id = None
+        self._command_request_id = None
         self.messages = []
         self._last_sync_max_id = 0
         self._last_sync_check = 0.0
@@ -414,8 +508,8 @@ class Agent:
         # 使 get_session_stats / web 统计在重启后不丢失（原实现每次启动清零）。
         _tok = get_token_state(session)
         self.total_prompt_tokens = _tok["prompt_tokens"]
-        self.skill_select_enabled = True  # 默认启用 skill 自动选择（向后兼容）
         self.total_completion_tokens = _tok["completion_tokens"]
+        self.total_reasoning_tokens = _tok["reasoning_tokens"]
         self._turn_usage_history = []
         self._turn_count = _tok["turn_count"]
         self._tool_retry_count = 0
@@ -428,6 +522,20 @@ class Agent:
 
         # ── Mode: plan (read-only) | build (read-write) | build-unsafe (no sandbox) ──
         self.mode = 'plan'
+
+        # ── autocompactlimit：上下文自动压缩阈值（session 级，持久化 agent_state）──
+        # >0=处理用户消息前估算上下文 token 超过阈值则先自动压缩（默认 600000，
+        #    2026-09-11 起默认开启）；-1=显式禁用（/autocompactlimit -1）。
+        # 持久化值在 self.db 就绪后恢复（见下方 DB connection 之后）。
+        self._autocompactlimit = _DEFAULT_AUTOCOMPACTLIMIT
+        # ── 连续 compact 防护计数器：距上次 compact 成功以来的普通用户消息回合数 ──
+        # None=从未压缩过（允许 compact）；compact 成功收尾后置 0；
+        # 普通用户消息回合正常完成 +1。重启后从 DB 重建（单一事实源=DB）。
+        self._user_turns_since_compact = None
+        # ── 重启后上下文度量恢复：token_state 持久化的"最近一轮 prompt_tokens" ──
+        # 注：v3 双轨估算（2026-09-11）只使用内存锚点 _turn_usage_history（含 chars）；
+        # _last_known_prompt_tokens 保留作历史字段兼容，不再参与估算。
+        self._last_known_prompt_tokens = int(_tok.get("last_prompt_tokens") or 0)
 
         # ── LLM safety check cache ──
         self._llm_check_cache: dict[str, tuple[bool, str]] = {}
@@ -453,7 +561,7 @@ class Agent:
         logger.info(f"Agent 初始化: session={self.session}, mode={self.mode}, provider={self.provider}")
 
         # ── Parse extra mount paths from permission.txt（pythonrt 软边界根）──
-        perm_entries = _parse_permission_file()
+        perm_entries = _parse_permission_file(self.permission_file)
         self._perm_paths = [p for p, w in perm_entries]
         self._perm_volumes = [(p, w) for p, w in perm_entries]
 
@@ -465,7 +573,25 @@ class Agent:
         self._dyn_mounts = _load_dyn_mounts(session)
         # ── Simple DB connection ──
         _set_session_name(session)
+        self._db = None
         self.db = get_connection(session)
+
+        # ── autocompactlimit / 连续 compact 计数器恢复（依赖 self.db）──
+        try:
+            _ac_st = self.db.get_state("agent_state") or {}
+            _ac_val = _ac_st.get("autocompactlimit")
+            if isinstance(_ac_val, int) and not isinstance(_ac_val, bool) \
+                    and (_ac_val == -1 or _ac_val > 0):
+                self._autocompactlimit = _ac_val
+        except Exception as e:
+            logger.warning(f"autocompactlimit 恢复失败（保持默认 -1）: {e}")
+        try:
+            self._user_turns_since_compact = self.db.count_user_msgs_after_last_compact()
+        except Exception as e:
+            # 存储后端无此方法（如旧 sqlite 版）→ 视为从未压缩，gate 恒允许（安全降级）
+            logger.warning(f"compact 计数器恢复失败（视为从未压缩）: {e}")
+        logger.info(f"autocompactlimit={self._autocompactlimit}, "
+                    f"user_turns_since_compact={self._user_turns_since_compact}")
 
         # ── Session lock ──
         self._lock_held = False
@@ -493,6 +619,11 @@ class Agent:
             (TOOL_SEARCHINFO_SCHEMA, exec_searchinfo),
             (TOOL_AGENT_SCHEMA, exec_agent),
             (TOOL_SUMMARY_SCHEMA, exec_summary),
+            (TOOL_SELECT_SKILL_SCHEMA, exec_selectskill),
+            (TOOL_CALLAGENT_SCHEMA, exec_callagent),
+            (TOOL_ADDINFO_SCHEMA, exec_addinfo),
+            (TOOL_LISTINFO_SCHEMA, exec_listinfo),
+            (TOOL_RMINFO_SCHEMA, exec_rminfo),
         ):
             _t = copy.deepcopy(_schema)
             # 外层 lambda 用默认参数固定 _fn（防循环变量捕获），内层接收工具参数
@@ -507,15 +638,12 @@ class Agent:
 
     @staticmethod
     def _log_error(source, session, detail):
-        """记录错误到【当前进程对应的日志文件】（不再写独立的 errors.log）。
-
-        设计考虑: 用户要求所有 errors 都写入本次启动对应的 log 文件
-        （.xkagent/logs/<启动时间>.log），便于按次运行统一查看；
-        使用 codes._log.LOG_FILE 保证与运行期 logging 输出同一文件。
-        """
+        """记录错误到 session 固定 workdir 的独立错误日志。"""
         from datetime import datetime
-        from codes._log import LOG_FILE
-        log_path = str(LOG_FILE)
+        context = config.get_session_context(session, ensure=True)
+        log_dir = context.log_dir / session
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = str(log_dir / "errors.log")
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] [session={session}] [{source}] {detail}\n"
         try:
@@ -544,13 +672,44 @@ class Agent:
             return provider_config.get_model_effort(self.provider, self.model)
         return None
 
+    def _persist_assistant_turn(self, content, reasoning="", tool_calls=None):
+        """写入 assistant 回合：thinking 模式需把 reasoning_content 挂回 assistant 供 LLM 回放。"""
+        assistant_msg = {"role": "assistant", "content": content or ""}
+        extras = {}
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+            extras["tool_calls"] = tool_calls
+            # tool 回合即使无思维链文本，也需占位字段（DeepSeek thinking+tools 协议）
+            assistant_msg["reasoning_content"] = reasoning
+            extras["reasoning_content"] = reasoning
+        elif reasoning:
+            assistant_msg["reasoning_content"] = reasoning
+            extras["reasoning_content"] = reasoning
+        self.messages.append(assistant_msg)
+        if reasoning:
+            add_chat(self.db, "thinking", reasoning)
+        add_chat(self.db, "assistant", content or "", extras or None)
+        # ── LLM 回合完成：即时落盘（30s 定时之外的安全网）──
+        self._sync_db()
+
+    def _patch_reasoning_content(self):
+        """补齐内存历史中缺失的 reasoning_content（旧版只落 thinking 角色时）。"""
+        if not any(m.get("role") == "assistant" and not m.get("reasoning_content") for m in self.messages):
+            return
+        db_msgs = get_chat_messages(self.db)
+        for i, m in enumerate(self.messages):
+            if m.get("role") != "assistant" or m.get("reasoning_content"):
+                continue
+            if i >= len(db_msgs) or db_msgs[i].get("role") != "assistant":
+                continue
+            rc = db_msgs[i].get("reasoning_content")
+            if rc:
+                m["reasoning_content"] = rc
+
     def resume(self):
         self.messages = get_chat_messages(self.db)
         self._patch_orphaned_tool_calls()
-        row = self.db.execute(
-            "SELECT MAX(id) FROM messages WHERE role NOT IN ('git', 'compact', 'drop', 'command')"
-        ).fetchone()
-        self._last_sync_max_id = row[0] if row else 0
+        self._last_sync_max_id = self.db.max_visible_id()
 
 
     def _persist_token_state(self):
@@ -568,6 +727,7 @@ class Agent:
                 self.session,
                 prompt_tokens=self.total_prompt_tokens,
                 completion_tokens=self.total_completion_tokens,
+                reasoning_tokens=self.total_reasoning_tokens,
                 turn_count=self._turn_count,
                 model=self._last_model or "",
                 last_prompt_tokens=_last["prompt"] if _last else None,
@@ -604,11 +764,13 @@ class Agent:
         # 2.5 恢复新 session 的 token 累计值（先清零再恢复，消除跨 session 混累加）
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self.total_reasoning_tokens = 0
         self._turn_count = 0
         self._turn_usage_history.clear()
         _tok = get_token_state(name)
         self.total_prompt_tokens = _tok["prompt_tokens"]
         self.total_completion_tokens = _tok["completion_tokens"]
+        self.total_reasoning_tokens = _tok["reasoning_tokens"]
         self._turn_count = _tok["turn_count"]
         self._last_model = _tok["model"] or ""
 
@@ -669,8 +831,12 @@ class Agent:
         self._lock_fd = info
         self._lock_holder_info = None
         logger.info(f"观察者自动接管锁: session={self.session}")
+        try:
+            self.resume()
+        except Exception:
+            logger.warning(f"观察者接管锁后 resume 失败: session={self.session}", exc_info=True)
         if self._output_queue:
-            self._output_queue.put({
+            self._emit({
                 "type": "_lock_status",
                 "is_locked": True, "is_observing": False, "holder_info": None,
             })
@@ -707,14 +873,40 @@ class Agent:
             return f" \u23f3{name}"
         return " \u23f3\u88ab\u5360\u7528"
 
+    @property
+    def db(self):
+        """当前 session 的 msgz store（内存常驻，无 sqlite 连接/IOERR 概念）。"""
+        return self._db
+
+    @db.setter
+    def db(self, value):
+        self._db = value
+
     def close(self):
         logger.info(f"Agent 关闭: session={self.session}")
         """Release lock and close DB connection. Call on exit."""
         self._release_lock()
         try:
-            self.db.close()
+            self._db.close()
         except Exception:
             pass
+
+    def _emit(self, event: dict, turn_id: str | None = None) -> None:
+        """Emit one backward-compatible event with routing metadata."""
+        if self._output_queue is None:
+            return
+        self._event_seq += 1
+        event = dict(event)
+        event.setdefault("session", self.session)
+        event.setdefault("turn_id", self._current_turn_id if turn_id is None else turn_id)
+        event.setdefault("seq", self._event_seq)
+        self._output_queue.put(event)
+
+    def _emit_cmd_result(self, cmd: str, **payload) -> None:
+        """Central command-result emitter with request correlation."""
+        payload.update(type="_cmd_result", cmd=cmd,
+                       request_id=self._command_request_id)
+        self._emit(payload)
 
 
     def _sync_from_db(self):
@@ -728,26 +920,38 @@ class Agent:
             return
         self._last_sync_check = now
         try:
-            row = self.db.execute(
-                "SELECT MAX(id) FROM messages WHERE role NOT IN ('git', 'compact', 'drop', 'command')"
-            ).fetchone()
-            max_id = row[0] if row else 0
+            # 2026-08-25：msgz 内存主数据——其他进程写入需先检测文件变化并 reload，
+            # 否则 _sync_from_db 永远查本进程内存（跨进程消息不同步）。
+            try:
+                self.db.reload_if_changed()
+            except Exception:
+                pass
+            max_id = self.db.max_visible_id()
             if max_id > self._last_sync_max_id:
                 old_max_id = self._last_sync_max_id
                 self.messages = get_chat_messages(self.db)
                 self._patch_orphaned_tool_calls()
                 self._last_sync_max_id = max_id
-                new_rows = self.db.execute(
-                    "SELECT role, content FROM messages WHERE id > ? AND role NOT IN ('git', 'compact', 'drop', 'command') ORDER BY id",
-                    (old_max_id,)
-                ).fetchall()
+                new_rows = [{"role": m["role"], "content": m["content"]}
+                            for m in self.db.get_messages_since(old_max_id)[0]
+                            if m["role"] not in ("git", "compact", "drop", "clear", "command")]
                 if new_rows and self._output_queue:
-                    self._output_queue.put({
+                    self._emit({
                         'type': '_sync_update',
                         'messages': [{**dict(r), "content": r["content"] or ""} for r in new_rows],  # F2: 防御 content=None
                     })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"_sync_from_db 失败 session={self.session}: {e}")
+            # 2026-08-23 加固：EIO 时标记冷却（get_conn/重试链随后快速失败），
+            # 并推迟下次轮询（原 3s 轮询撞 EIO → 8s 重试链 = 风暴放大器）。
+            # exc_info=True 已移除：存储故障持续时每 15s 一条 traceback 会刷爆日志。
+            try:
+                _dbp = getattr(self.db, "path", None)   # msgz: 无 sqlite IOERR 冷却概念，保留空保护
+                if _dbp:
+                    _mark_ioerr_cooldown(_dbp)
+            except Exception:
+                pass
+            self._last_sync_check = time.time() + 15.0
 
     def run_forever(self):
         """Run in a loop: read from input_queue, process via run_stream, push to output_queue.
@@ -765,7 +969,7 @@ class Agent:
                 "run_forever() requires mode='web' with input_queue and output_queue"
             )
         # Signal ready so the manager knows initialization is complete
-        self._output_queue.put({"type": "_ready"})
+        self._emit({"type": "_ready"})
         self.phase = "idle"   # agent 就绪，进入空闲待命
         while True:
             try:
@@ -776,27 +980,105 @@ class Agent:
                 continue
             if item is None:  # sentinel: stop
                 break
+            _mail_override = None
             if isinstance(item, dict) and "_cmd" in item:
                 self._handle_command(item)
             else:
+                if isinstance(item, dict) and "_input" in item:
+                    self._current_turn_id = item.get("_turn_id")
+                    _mp = item.get("_provider") or None   # mail callagent provider 覆盖
+                    _mm = item.get("_model") or None
+                    _eff = item.get("_effort") or None    # mail reasoning_effort 覆盖
+                    _mail_meta = item.get("_mail_meta") or None   # mail 信封元信息（回信指引）
+                    if _mp is not None or _mm is not None or _eff is not None:
+                        _mail_override = (_mp, _mm, _eff)
+                    item = item["_input"]
+                    if _mail_meta:
+                        item = _wrap_mail_instruction(item, _mail_meta)
+                else:
+                    self._current_turn_id = f"{self.session}:{self._event_seq + 1}"
                 compact_requested = isinstance(item, str) and item.startswith(COMPACT_MARKER)
                 if compact_requested:
                     item = item[len(COMPACT_MARKER):].lstrip()
+                    # ── 连续 compact 防护：距上次压缩中间须有 ≥1 条用户消息 ──
+                    # 拒绝时绝不把压缩指令交给 run_stream（会被当普通消息发给 LLM）；
+                    # 必须发 _turn_end（repl/web 事件循环靠它退出，漏发会挂起）。
+                    if not self._compact_allowed():
+                        logger.warning(
+                            f"拒绝连续 compact: session={self.session} "
+                            f"user_turns_since_compact={self._user_turns_since_compact}")
+                        self._emit({"type": "info", "data":
+                                    "⚠️ 距上次压缩中间还没有新的用户消息，已拒绝连续压缩（请先正常对话一轮）"})
+                        self._current_turn_id = None
+                        continue
+                # ── mail 邮件级 provider 临时覆盖（callagent provider 参数）──
+                # 仅本次 turn 生效：turn 结束（finally）恢复会话自身配置，
+                # 不写 session db，重启/后续 turn 不受影响。
+                _saved_turn_override = None
+                if _mail_override is not None:
+                    _saved_turn_override = apply_turn_override(self, *_mail_override)
+                    logger.info("mail 邮件级 provider 覆盖生效: session=%s provider=%s model=%s",
+                                self.session, self.provider, self.model)
                 try:
                     turn_ok = True
-                    # 压缩回合走专用流程 run_stream_compact（内部不触发技能选择/
-                    # 工具调用，无需再临时切换 skill_select_enabled——保护已内聚）
-                    stream = (self.run_stream_compact() if compact_requested
+                    # ── autocompactlimit：处理用户消息前检查上下文是否超限 ──
+                    # 手动 /compact 不嵌套触发；gate 要求中间有用户消息（压缩轮
+                    # usage 可能不准，防连环压缩）；interrupted 终止回合（尊重
+                    # 中断意图），仅 error 降级按原上下文继续处理用户消息。
+                    if (not compact_requested
+                            and self._autocompactlimit > 0
+                            and self._compact_allowed()
+                            and len(self.messages) >= 4):
+                        _est = self._estimate_context_tokens()
+                        if _est > self._autocompactlimit:
+                            # ── 2026-09-11: prune 优先（对齐 DeepSeek Harness）──
+                            # 触发压缩前先本地修剪超大 tool 输出；修剪后若已回到
+                            # 阈值内则跳过 LLM 压缩调用（省一次压缩，且避免压缩
+                            # 请求自身因超限失败——5.1MB 案例的教训）。
+                            _pruned = self._prune_oversized_messages()
+                            if _pruned:
+                                _est = self._estimate_context_tokens()
+                                logger.info(
+                                    f"autocompact 前置修剪: {_pruned} 条超大 tool 消息, "
+                                    f"修剪后估算={_est} tokens")
+                        if _est > self._autocompactlimit:
+                            logger.info(
+                                f"autocompact 触发: limit={self._autocompactlimit} "
+                                f"estimated={_est} tokens messages={len(self.messages)}")
+                            self._emit({"type": "info", "data":
+                                        f"⚙️ 上下文约 {_est} tokens，超过 autocompactlimit={self._autocompactlimit}，自动压缩中…"})
+                            auto_ok = True
+                            auto_interrupted = False
+                            for _ev in self.run_stream("", compact=True):
+                                self._emit(_ev)
+                                if isinstance(_ev, dict) and _ev.get("type") == "error":
+                                    auto_ok = False
+                                elif isinstance(_ev, dict) and _ev.get("type") == "interrupted":
+                                    auto_ok = False
+                                    auto_interrupted = True
+                            if auto_ok:
+                                self._finalize_compact()  # 成功路径内部置计数器 0
+                            elif auto_interrupted:
+                                # 用户主动中断压缩 → 终止回合（消息不处理，需重发）
+                                logger.info("autocompact 被用户中断，终止本回合")
+                                continue
+                            else:
+                                logger.warning("autocompact 失败（LLM error），降级按原上下文继续处理用户消息")
+                    # 压缩回合走延续式 run_stream(compact=True)：压缩指令作为 user 消息
+                    # 追加进对话流（LLM 在完整上下文中总结），内部不触发技能选择/工具调用
+                    stream = (self.run_stream(item, compact=True) if compact_requested
                               else self.run_stream(item))
                     for event in stream:
-                        self._output_queue.put(event)
+                        self._emit(event)
                         # 回合异常（error/interrupted）→ 跳过收尾，历史保持原样
-                        if isinstance(event, dict) and event.get("type") in ("error", "interrupted"):
+                        # 2026-09-04 修复：blocked（观察者拒绝）也置 turn_ok=False，
+                        # 防止观察者进程执行 _finalize_compact 越权写库
+                        if isinstance(event, dict) and event.get("type") in ("error", "interrupted", "blocked"):
                             turn_ok = False
                     try:
-                        row = self.db.execute("SELECT MAX(id) FROM messages").fetchone()
-                        if row and row[0]:
-                            self._last_sync_max_id = row[0]
+                        _mx = self.db.last_message_id()
+                        if _mx:
+                            self._last_sync_max_id = _mx
                     except Exception:
                         pass
                     if compact_requested:
@@ -804,12 +1086,26 @@ class Agent:
                             self._finalize_compact()
                         else:
                             logger.warning("压缩回合异常，跳过收尾副作用（历史保持不变）")
+                    elif turn_ok:
+                        # 普通用户消息回合正常完成 → 连续 compact 防护计数 +1
+                        # （None=从未压缩过，保持 None 恒允许）
+                        if self._user_turns_since_compact is not None:
+                            self._user_turns_since_compact += 1
+                except Exception as e:
+                    turn_ok = False
+                    logger.exception(f"回合执行异常: session={self.session}: {e}")
+                    self._log_error("turn", self.session, f"{type(e).__name__}: {e}")
+                    self._emit({"type": "error", "data": f"{type(e).__name__}: {e}"})
                 finally:
                     # ── 回合结束：统一复位实时状态（覆盖所有退出路径）──
                     self.phase = "idle"
                     self.in_tool = False
                     self._turn_active = False   # 回合级标志：仅回合真正结束才复位
-                    self._output_queue.put({"type": "_turn_end"})
+                    self._emit({"type": "_turn_end"})
+                    self._current_turn_id = None
+                    # 恢复 mail 临时 provider/effort 覆盖（收信会话自身配置不受影响）
+                    if _saved_turn_override is not None:
+                        self.provider, self.model, self._cmd_effort = _saved_turn_override
 
     def _cmd_text(self, cmd_name: str, args: dict) -> str:
         """还原 mount 系列命令为可读文本（D3 决策），用于 history/日志展示。
@@ -847,42 +1143,47 @@ class Agent:
             logger.warning(f"记录 command 历史失败: {text!r}: {e}")
         logger.info(f"[cmd] {text} -> {'OK' if ok else 'FAIL'}: {(result or '')[:120]}")
         try:
-            row = self.db.execute("SELECT MAX(id) FROM messages").fetchone()
-            if row and row[0]:
-                self._last_sync_max_id = max(self._last_sync_max_id or 0, row[0])
+            _mx = self.db.last_message_id()
+            if _mx:
+                self._last_sync_max_id = max(self._last_sync_max_id or 0, _mx)
         except Exception:
             pass
     def _handle_command(self, cmd: dict):
-        """Handle a control command sent via the input queue."""
+        """Handle a command and guarantee one correlated failure result."""
+        previous_request_id = self._command_request_id
+        self._command_request_id = cmd.get("_request_id")
+        try:
+            self._execute_command(cmd)
+        except Exception as e:
+            logger.exception(f"控制命令异常: session={self.session} cmd={cmd.get('_cmd')}: {e}")
+            self._emit_cmd_result(cmd.get("_cmd", ""), ok=False, error=str(e))
+        finally:
+            self._command_request_id = previous_request_id
+
+    def _execute_command(self, cmd: dict):
+        """Execute a control command sent via the input queue."""
         cmd_name = cmd["_cmd"]
         args = cmd.get("_args", {})
         # ── 观察者模式 gate (T3): 写类命令拒绝执行，读类命令放行 ──
         if self._observing and cmd_name in _OBSERVER_WRITE_CMDS:
             logger.warning(f"观察者模式拒绝写命令: session={self.session} cmd={cmd_name}")
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": cmd_name,
-                "ok": False, "error": "观察者只读模式：session 已被其他进程占用",
-            })
+            self._emit_cmd_result(cmd_name, ok=False,
+                                  error="观察者只读模式：session 已被其他进程占用")
             return
 
         if cmd_name == "clear":
             self.clear()
-            self._output_queue.put({"type": "_cmd_result", "cmd": "clear", "ok": True})
+            self._emit_cmd_result("clear", ok=True)
 
         elif cmd_name == "drop":
             self.drop()
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "drop", "ok": True,
-            })
+            self._emit_cmd_result("drop", ok=True)
 
         elif cmd_name == "set_mode":
             mode = args.get("mode")
             if mode:
                 self.set_mode(mode)
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "set_mode",
-                "data": self.mode,
-            })
+            self._emit_cmd_result("set_mode", data=self.mode)
 
         elif cmd_name == "mount":
             try:
@@ -892,95 +1193,60 @@ class Agent:
                     force=bool(args.get("force", False)),
                 )
                 self._record_command("mount", args, not result.startswith("❌"), result)
-                self._output_queue.put({
-                    "type": "_cmd_result", "cmd": "mount",
-                    "ok": not result.startswith("❌"),
-                    "data": result,
-                })
+                self._emit_cmd_result("mount", ok=not result.startswith("❌"), data=result)
             except Exception as e:
                 logger.error(f"mount 命令异常: {e}", exc_info=True)
                 self._record_command("mount", args, False, f"❌ mount 异常: {e}")
-                self._output_queue.put({
-                    "type": "_cmd_result", "cmd": "mount",
-                    "ok": False, "error": str(e), "data": f"❌ mount 异常: {e}",
-                })
+                self._emit_cmd_result("mount", ok=False, error=str(e),
+                                      data=f"❌ mount 异常: {e}")
 
         elif cmd_name == "unmount":
             try:
                 result = self._cmd_unmount(args.get("path", ""))
                 self._record_command("unmount", args, not result.startswith("❌"), result)
-                self._output_queue.put({
-                    "type": "_cmd_result", "cmd": "unmount",
-                    "ok": not result.startswith("❌"),
-                    "data": result,
-                })
+                self._emit_cmd_result("unmount", ok=not result.startswith("❌"), data=result)
             except Exception as e:
                 logger.error(f"unmount 命令异常: {e}", exc_info=True)
                 self._record_command("unmount", args, False, f"❌ unmount 异常: {e}")
-                self._output_queue.put({
-                    "type": "_cmd_result", "cmd": "unmount",
-                    "ok": False, "error": str(e), "data": f"❌ unmount 异常: {e}",
-                })
+                self._emit_cmd_result("unmount", ok=False, error=str(e),
+                                      data=f"❌ unmount 异常: {e}")
 
         elif cmd_name == "mount_list":
             result = self._cmd_mount_list()
             self._record_command("mount_list", args, True, result)
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "mount_list",
-                "ok": True, "data": result,
-            })
+            self._emit_cmd_result("mount_list", ok=True, data=result)
 
         elif cmd_name == "mount_save":
             result = self._cmd_mount_save()
             self._record_command("mount_save", args, not result.startswith("❌"), result)
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "mount_save",
-                "ok": not result.startswith("❌"),
-                "data": result,
-            })
+            self._emit_cmd_result("mount_save", ok=not result.startswith("❌"), data=result)
 
         elif cmd_name == "mount_refresh":
             result = self._cmd_mount_refresh()
             self._record_command("mount_refresh", args, not result.startswith("❌"), result)
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "mount_refresh",
-                "ok": not result.startswith("❌"),
-                "data": result,
-            })
+            self._emit_cmd_result("mount_refresh", ok=not result.startswith("❌"), data=result)
 
         elif cmd_name == "info_add":
             result = self._cmd_info_add(
                 args.get("path", ""), args.get("scope", "extra"),
                 bool(args.get("global", False)))
             self._record_command("info_add", args, not result.startswith("❌"), result)
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "info_add",
-                "ok": not result.startswith("❌"), "data": result,
-            })
+            self._emit_cmd_result("info_add", ok=not result.startswith("❌"), data=result)
 
         elif cmd_name == "info_deny":
             result = self._cmd_info_deny(args.get("path", ""), bool(args.get("global", False)))
             self._record_command("info_deny", args, not result.startswith("❌"), result)
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "info_deny",
-                "ok": not result.startswith("❌"), "data": result,
-            })
+            self._emit_cmd_result("info_deny", ok=not result.startswith("❌"), data=result)
 
         elif cmd_name == "info_remove":
             result = self._cmd_info_remove(args.get("path", ""), bool(args.get("global", False)))
             self._record_command("info_remove", args, not result.startswith("❌"), result)
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "info_remove",
-                "ok": not result.startswith("❌"), "data": result,
-            })
+            self._emit_cmd_result("info_remove", ok=not result.startswith("❌"), data=result)
 
         elif cmd_name == "info_clear":
             result = self._cmd_info_clear(bool(args.get("global", False)))
             self._record_command("info_clear", args, not result.startswith("❌"), result)
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "info_clear",
-                "ok": not result.startswith("❌"), "data": result,
-            })
+            self._emit_cmd_result("info_clear", ok=not result.startswith("❌"), data=result)
 
         elif cmd_name == "set_model":
             model = args.get("model")
@@ -992,10 +1258,7 @@ class Agent:
             # 每次 set_model 都重置 _cmd_effort —— 未显式指定则回落配置值（None），
             # 防止"先 /model x:high 再 /model y" 时旧 effort 残留串台。
             self._cmd_effort = str(args.get("reasoning_effort") or "") or None
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "set_model",
-                "data": self.model,
-            })
+            self._emit_cmd_result("set_model", data=self.model)
 
         elif cmd_name == "set_provider":
             pname = args.get("provider")
@@ -1004,10 +1267,7 @@ class Agent:
                 try:
                     provider_config.get_provider(pname)
                 except ValueError as e:
-                    self._output_queue.put({
-                        "type": "_cmd_result", "cmd": "set_provider",
-                        "ok": False, "data": str(e),
-                    })
+                    self._emit_cmd_result("set_provider", ok=False, data=str(e))
                 else:
                     self.provider = pname
                     self.model = None
@@ -1015,65 +1275,60 @@ class Agent:
                     set_agent_state(self.session, provider=pname, model="")  # 持久化
                     new_default = provider_config.get_provider(pname).get("default_model", "")
                     hint = f" (旧模型已重置，默认将使用 {new_default})" if new_default else ""
-                    self._output_queue.put({
-                        "type": "_cmd_result", "cmd": "set_provider",
-                        "ok": True, "data": f"Provider switched to {pname}{hint}",
-                    })
+                    self._emit_cmd_result(
+                        "set_provider", ok=True, data=f"Provider switched to {pname}{hint}")
             else:
-                self._output_queue.put({
-                    "type": "_cmd_result", "cmd": "set_provider",
-                    "ok": False, "data": "usage: set_provider {name}",
-                })
-        elif cmd_name == "set_skill_select":
-            # FIX: skill_select 开关同步到 agent 线程（原实现只改 manager 缓存，
-            # agent 实际仍按 self.skill_select_enabled 执行，导致 UI 与行为不一致）
-            enable = args.get("enabled")
-            if isinstance(enable, bool):
-                self.skill_select_enabled = enable
-            else:
-                self.skill_select_enabled = not self.skill_select_enabled
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "set_skill_select",
-                "data": self.skill_select_enabled,
-            })
+                self._emit_cmd_result(
+                    "set_provider", ok=False, data="usage: set_provider {name}")
         elif cmd_name == "resume":
             self.resume()
-            self._output_queue.put({"type": "_cmd_result", "cmd": "resume", "ok": True})
+            self._emit_cmd_result("resume", ok=True)
 
         elif cmd_name == "load_skill":
             name = args.get("name", "")
             ok = self.load_skill(name)
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "load_skill",
-                "ok": ok, "data": name,
-            })
+            self._emit_cmd_result("load_skill", ok=ok, data=name)
+
+        elif cmd_name == "set_autocompactlimit":
+            # /autocompactlimit <N|-1>：上下文自动压缩阈值（session 级，持久化 agent_state）
+            _val = args.get("limit")
+            if isinstance(_val, bool) or not isinstance(_val, int) \
+                    or not (_val == -1 or _val > 0):
+                self._emit_cmd_result(
+                    "set_autocompactlimit", ok=False,
+                    error=f"无效值 {_val!r}：仅接受 -1（禁用）或正整数")
+            else:
+                self._autocompactlimit = _val
+                try:
+                    _st = self.db.get_state("agent_state") or {}
+                    _st["autocompactlimit"] = _val
+                    _st["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    self.db.set_state("agent_state", _st)
+                except Exception as e:
+                    # 持久化失败不阻断：内存已生效，重启后回默认 -1
+                    logger.warning(f"autocompactlimit 持久化失败（内存已生效）: {e}")
+                self._emit_cmd_result("set_autocompactlimit", ok=True, data=_val)
 
         elif cmd_name == "get_info":
             import os as _os
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "get_info",
-                "data": {
-                    "session": self.session,
-                    "mode": self.mode,
-                    "model": self.model or "",
-                    "provider": self.provider,
-                    "reasoning_effort": self._resolve_effort(),
-                    "msg_count": len(self.messages),
-                    "is_locked": self._lock_held,
-                    "is_observing": self._observing,
-                    "holder_info": self._lock_holder_info,  # T5 新增
-                    "pid": _os.getpid(),
-                    "skill_select_enabled": self.skill_select_enabled,  # FIX: 供 manager 缓存同步
-                },
+            self._emit_cmd_result("get_info", data={
+                "session": self.session,
+                "mode": self.mode,
+                "model": self.model or "",
+                "provider": self.provider,
+                "reasoning_effort": self._resolve_effort(),
+                "msg_count": len(self.messages),
+                "autocompactlimit": self._autocompactlimit,
+                "is_locked": self._lock_held,
+                "is_observing": self._observing,
+                "holder_info": self._lock_holder_info,  # T5 新增
+                "pid": _os.getpid(),
             })
 
         elif cmd_name == "get_latest_rounds":
             n = args.get("n", 3)
             text = self.get_latest_rounds(n)
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "get_latest_rounds",
-                "data": text,
-            })
+            self._emit_cmd_result("get_latest_rounds", data=text)
 
         elif cmd_name == "get_session_stats":
             """Return formatted session statistics (token usage, message count, etc.)."""
@@ -1082,16 +1337,10 @@ class Agent:
             except Exception as e:
                 text = f"⚠️ Stats unavailable: {e}"
                 logger.warning(f"get_session_stats 失败: {e}")
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": "get_session_stats",
-                "data": text,
-            })
+            self._emit_cmd_result("get_session_stats", data=text)
 
         else:
-            self._output_queue.put({
-                "type": "_cmd_result", "cmd": cmd_name,
-                "ok": False, "error": f"Unknown command: {cmd_name}",
-            })
+            self._emit_cmd_result(cmd_name, ok=False, error=f"Unknown command: {cmd_name}")
 
 
     # ── /mount 动态挂载命令实现 ──
@@ -1105,7 +1354,8 @@ class Agent:
 
         统一维护 _dyn_mounts 表（单一事实源）：目录/文件均记录路径+权限；
         pythonrt 受限模式（plan/build）按 rw/ro roots 应用；build-unsafe 忽略（软边界）。
-        plan 模式 rw 报错；危险路径拒绝；tool 执行中拒绝。
+        plan 模式允许 rw 挂载（仅登记意图），pythonrt 执行时降级为只读；
+        build 起效；危险路径拒绝；tool 执行中拒绝。
         """
         if self._in_tool_exec:
             return "❌ 工具执行中，拒绝挂载操作，请稍后重试"
@@ -1119,8 +1369,6 @@ class Agent:
             # web 提示用户显式加 --force 完成确认（对齐 repl 语义）。
             return (f"{self.CONFIRM_REQUIRED_PREFIX}危险路径 {norm} 默认拒绝"
                     f"（系统目录/主目录），确需挂载请确认")
-        if self.mode == "plan" and writable:
-            return "❌ plan 模式只读，禁止 rw 挂载（可挂载 ro）"
 
         is_file = os.path.isfile(norm)
         # 幂等：移除同路径旧动态挂载
@@ -1296,8 +1544,8 @@ class Agent:
             return "ℹ️ 当前无动态挂载可保存"
         try:
             lines = []
-            if os.path.isfile(PERMISSION_FILE):
-                with open(PERMISSION_FILE, "r", encoding="utf-8") as f:
+            if os.path.isfile(self.permission_file):
+                with open(self.permission_file, "r", encoding="utf-8") as f:
                     lines = f.read().splitlines()
             # 剔除旧动态块
             kept = []
@@ -1314,7 +1562,7 @@ class Agent:
                 kept.append(ln)
             while kept and not kept[-1].strip():
                 kept.pop()
-            with open(PERMISSION_FILE, "w", encoding="utf-8") as f:
+            with open(self.permission_file, "w", encoding="utf-8") as f:
                 for ln in kept:
                     f.write(ln + "\n")
                 f.write("\n# 动态挂载 (saved by /mount save)\n")
@@ -1329,7 +1577,7 @@ class Agent:
             return f"❌ 保存失败: {e}"
     def _cmd_mount_refresh(self) -> str:
         """/mount refresh：重新解析 permission.txt（无需重启）。"""
-        self._perm_volumes = _parse_permission_file()
+        self._perm_volumes = _parse_permission_file(self.permission_file)
         self._perm_paths = [p for p, w in self._perm_volumes]
         return f"✅ 已重新加载 permission.txt，挂载 {len(self._perm_volumes)} 项"
     def set_mode(self, mode):
@@ -1341,234 +1589,6 @@ class Agent:
         # Clear LLM check cache when entering/leaving unsafe mode
         self._llm_check_cache.clear()
         return True
-    @staticmethod
-    def _recent_rounds(messages: list, n: int = 2) -> list:
-        """从 messages 末尾倒序取最近 n 轮（按 user 消息切分，含当前轮）。
-
-        直接倒序遍历找 user 消息：找到第 n 个 user 即为其起始位置；
-        不足 n 个 user → 返回从首个 user 起（即全部有 user 的部分）。
-        无 user 消息 → 返回全量。
-        """
-        if not messages:
-            return []
-        count = 0
-        start = 0
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                count += 1
-                if count == n:
-                    start = i
-                    break
-        return messages[start:]
-
-    @staticmethod
-    def _extract_json(text: str) -> dict | None:
-        """从 LLM 回复中提取 JSON 对象（支持嵌套花括号）。
-
-        raw_decode 从首个 '{' 尝试完整解析；失败回退简单正则。
-        """
-        if not text:
-            return None
-        decoder = json.JSONDecoder()
-        i = text.find("{")
-        while i >= 0:
-            try:
-                obj, _ = decoder.raw_decode(text[i:])
-                if isinstance(obj, dict):
-                    return obj
-            except (json.JSONDecodeError, ValueError):
-                pass
-            i = text.find("{", i + 1)
-        m = re.search(r"\{[^}]*\}", text)
-        if m:
-            try:
-                obj = json.loads(m.group())
-                if isinstance(obj, dict):
-                    return obj
-            except Exception:
-                pass
-        return None
-
-    def _select_skill(self, instruction: str) -> tuple[str, str, list] | None:
-        """Phase 1: skill selection loop with temp_msgs (Plan B).
-
-        Returns (skill_name, reason, collected_info) 3-tuple.
-        失败/跳过时返回 (None, reason_with_error, []) — 错误原因随 reason 返回，供上层可见提示。
-        """
-        skill_list = SkillLoader.list_skills()
-        if not skill_list:
-            return (None, "", [])
-
-        phase1_system = (
-            "分析用户需求，从「建议技能」中选择最合适的一个，以 JSON 格式回复。\n"
-            "回复包含两个字段（每次都必须同时给出）:\n"
-            '  {"skill": "技能名" 或 null, "searchinfo": {...} 或 null, "reason": "理由"}\n'
-            "字段说明:\n"
-            '  - skill: 选中的技能名（建议技能列表内）；null = 无需技能\n'
-            '  - searchinfo: 需要进一步收集信息的目录搜索参数 {"dirs_paths": [...], "query_or_keyword": "..."}；\n'
-            "    null = 不再进一步收集信息（信息已足够，直接决策）\n"
-            "流程: 信息不足时可先通过 searchinfo 收集指定目录信息，再基于新信息重选技能；\n"
-            "      收集足够后返回 searchinfo: null + 最终 skill 选择。\n"
-            "⚠️ 仅输出 JSON，不附加任何其他文字。\n"
-            "reason 字段: 你选择该技能的自述理由（简洁一句），将注入对话历史作为自述承诺。\n"
-        )
-
-        current_instruction = instruction
-        temp_msgs: list[dict] = []
-        collected_info: list = []    # searchinfo 收集结果（需求4：自承时带上）
-        searched_keys: set = set()   # 去重记忆：同 (dirs, query) 不重复执行
-
-        for attempt in range(5):
-            # ── Ctrl+C 中断检查：每次 attempt 前（与 run_stream 循环开头对称）──
-            try:
-                self._check_interrupt()
-            except _InterruptTurn:
-                raise  # 向上传递，由 run_stream 统一收尾（不写技能记录）
-
-            if attempt == 0:
-                # 首轮加强规则：禁止 null（要么选中技能，要么 searchskill 搜索新技能）
-                phase1_system = (
-                    "分析用户需求，从「建议技能」中选择最合适的一个，以 JSON 格式回复。\n"
-                    "回复包含两个字段（每次都必须同时给出）:\n"
-                    '  {"skill": "技能名" 或 null, "searchinfo": {...} 或 null, "reason": "理由"}\n'
-                    "字段说明:\n"
-                    '  - skill: 第一轮必须从建议技能中选择一个，或返回 "searchskill" 搜索新技能；禁止返回 null\n'
-                    '  - searchinfo: 需要进一步收集信息的目录搜索参数 {"dirs_paths": [...], "query_or_keyword": "..."}；\n'
-                    "    null = 不再进一步收集信息（信息已足够，直接决策）\n"
-                    "流程: 信息不足时可先通过 searchinfo 收集指定目录信息，再基于新信息重选技能；\n"
-                    "      收集足够后返回 searchinfo: null + 最终 skill 选择。\n"
-                    "⚠️ 仅输出 JSON，不附加任何其他文字。\n"
-                    "reason 字段: 你选择该技能的自述理由（简洁一句），将注入对话历史作为自述承诺。\n"
-                )
-
-            phase1_messages = (
-                [{"role": "system", "content": phase1_system}]
-                + self.messages
-                + temp_msgs
-            )
-
-            try:
-                self.phase = "llm"   # 技能选择也是一次 LLM 调用
-                c, extras = complete(
-                    messages=phase1_messages,
-                    model=self.model,
-                    provider=self.provider,
-                    reasoning_effort=self._resolve_effort(),
-                    tools=None,
-                    interrupt_event=self._interrupt_event,
-                )
-            except Exception as e:
-                self._log_error("skill_select", self.session, f"attempt={attempt} error={e}")
-                # 工具消息格式错误（DeepSeek: "tool must be response to tool_calls"）
-                # → 修补孤立 tool call 后重试，避免静默失败
-                err_lower = str(e).lower()
-                if "tool" in err_lower and "response" in err_lower:
-                    logger.warning(f"_select_skill 遇 tool 格式错误 (attempt={attempt})，修补后重试")
-                    self._patch_orphaned_tool_calls()
-                    continue
-                logger.warning(f"_select_skill 遇非 tool 错误 (attempt={attempt})，放弃技能选择: {e}")
-                return (None, f"⚠️ 技能选择失败: {e}", [])
-
-            self.phase = "idle"   # 技能选择 LLM 调用结束，复位（异常路径由 _turn_end 兜底）
-            # ── Ctrl+C 中断检查：complete 返回后（llm break 可能已发生）──
-            if self._interrupt_event.is_set():
-                self._interrupt_event.clear()
-                raise _InterruptTurn()
-
-            usage = extras.get("usage", {})
-            self.total_prompt_tokens += usage.get("prompt_tokens", 0)
-            self.total_completion_tokens += usage.get("completion_tokens", 0)
-
-            # ── 技能选择也是 LLM 调用，同步持久化 token 累计值 ──
-            self._persist_token_state()
-
-            json_obj = self._extract_json(c)
-            if json_obj is not None:
-                skill = json_obj.get("skill")
-                si = json_obj.get("searchinfo")
-
-                # ── searchinfo 分支：先收集指定目录信息再继续选技能 ──
-                if isinstance(si, dict):
-                    dirs = si.get("dirs_paths") or []
-                    q = si.get("query_or_keyword")
-                    if dirs and q:
-                        key = (tuple(sorted(str(x) for x in dirs)), str(q))
-                        if key in searched_keys:
-                            temp_msgs.append({
-                                "role": "user",
-                                "content": "该目录/查询已收集过信息，请基于现有信息直接决策（返回 searchinfo: null + skill 选择）。",
-                            })
-                            continue
-                        searched_keys.add(key)
-                        try:
-                            from codes.search import searchinfo
-                            items = searchinfo(list(dirs), str(q), top_k=5, session=self.session)
-                        except Exception as e:
-                            logger.warning(f"searchinfo 执行失败: {e}")
-                            items = []
-                        if items:
-                            collected_info.extend(items)
-                            detail = "\n".join(
-                                f"  [{it['method']}] {it['path']} | {it['snippet']}"
-                                for it in items[:5]
-                            )
-                            temp_msgs.append({
-                                "role": "user",
-                                "content": (
-                                    f"searchinfo 在指定目录收集到 {len(items)} 条相关片段:\n{detail}\n"
-                                    "请基于这些信息从「建议技能」中选择（searchinfo: null），或继续收集。"
-                                ),
-                            })
-                        else:
-                            temp_msgs.append({
-                                "role": "user",
-                                "content": "searchinfo 未找到匹配内容。请基于现有信息直接决策（searchinfo: null + skill 选择）。",
-                            })
-                        continue
-
-                # case 1: 选到具体技能
-                if skill and skill in skill_list:
-                    logger.info(f"技能选择: {skill}")
-                    return (skill, json_obj.get("reason") or "", collected_info)
-
-                # case 2: 无需技能（首轮禁止 null：要么选中技能，要么 searchskill 搜索）
-                if skill is None:
-                    if attempt == 0:
-                        temp_msgs.append({"role": "user", "content":
-                            "第一轮不能返回 null：必须从建议技能中选择一个，或返回 searchskill 搜索新技能。"})
-                        continue
-                    return (None, None, collected_info)
-
-                # case 3: 需要搜索技能库
-                if skill == "searchskill":
-                    new_names = searchskill(current_instruction, top_k=5)
-                    if not new_names:
-                        return (None, None, collected_info)
-                    new_details = searchskill_detail(current_instruction, top_k=5)
-                    new_suggested = "\n".join(
-                        f"  [{d['method']}] {d['path']} | {d['snippet']}" for d in new_details
-                    ) if new_details else ""
-                    temp_msgs.append({"role": "assistant", "content": c})
-                    temp_msgs.append({
-                        "role": "user",
-                        "content": (
-                            "搜索到以下新技能，请从它们中选择：\n"
-                            f"建议技能: {new_suggested}\n"
-                            f"原始需求: {current_instruction}"
-                        )
-                    })
-                    continue
-
-            # JSON 解析失败
-            temp_msgs.append({"role": "assistant", "content": c})
-            temp_msgs.append({
-                "role": "user",
-                "content": "响应格式错误，请严格按照 JSON 格式回复。只输出 JSON，包含 skill 与 searchinfo 字段。"
-            })
-
-        return (None, None, collected_info)
-
-
     def _skill_full_marker(self, name: str, version: str = "") -> str:
         """构造技能全文注入标记。
 
@@ -1701,40 +1721,47 @@ class Agent:
             return
 
         try:
-            # ── Step 1: 清理历史遗留的 "tool is killed by user" ──
-            # 这些是之前被插入但可能位置不对的旧条目（旧版 bug 遗留），
-            # 先全部删除，Step 2 会重新插入到正确位置。
+            # ── Step 1: 清理"位置不对"的 killed 记录 ──
+            # 2026-08-20 修复：只删除位置不对的旧条目（找不到前置 assistant.tool_calls
+            # 声明，或 tool_call_id 不匹配），保留位置正确的 killed 记录。
+            # 原实现删除所有 killed 记录，导致 Step 2 对历史遗留孤立反复补齐
+            # （Step1 删 → Step2 补 → _sync_from_db 检测到 DB 变化 → 再调 → 死循环）。
+            # 修正后：位置正确的 killed 保留，Step 2 发现已有响应不再补，死循环打破。
             stale_ids = []
             i = 0
             while i < len(self.messages):
                 msg = self.messages[i]
                 if (msg.get("role") == "tool"
                         and msg.get("content") == "tool is killed by user"):
-                    stale_ids.append(msg.get("tool_call_id"))
-                    self.messages.pop(i)  # 从 self.messages 中删除
+                    tid = msg.get("tool_call_id")
+                    # 向前查找是否有匹配的前置 assistant.tool_calls 声明
+                    found = False
+                    if tid:
+                        for j in range(i - 1, -1, -1):
+                            prev = self.messages[j]
+                            if prev.get("role") == "assistant" and "tool_calls" in prev:
+                                for tc in prev["tool_calls"]:
+                                    if tc.get("id") == tid:
+                                        found = True
+                                        break
+                            if found:
+                                break
+                    if not found:
+                        # 位置不对（无前置声明）→ 删除
+                        stale_ids.append(tid)
+                        self.messages.pop(i)
+                    else:
+                        i += 1
                 else:
                     i += 1
 
-            # 同步从 DB 删除
+            # 同步从 DB 删除（msgz：内存删除，dirty 标记后定时落盘）
             if stale_ids:
                 for tid in stale_ids:
                     if tid:
-                        # 兼容旧记录 extras 为空或非标准 JSON：先按 id 精确删除，
-                        # 不再依赖 json_extract(NULL) 静默匹配失败。
-                        self.db.execute(
-                            "DELETE FROM messages WHERE role='tool' "
-                            "AND content='tool is killed by user' "
-                            "AND (json_extract(extras, '$.tool_call_id') = ? "
-                            "OR extras LIKE ?)",
-                            (tid, f'%' + tid + '%'),
-                        )
+                        self.db.delete_killed_tool_messages(tid)
                     else:
-                        self.db.execute(
-                            "DELETE FROM messages WHERE role='tool' "
-                            "AND content='tool is killed by user' "
-                            "AND (extras IS NULL OR extras = '')"
-                        )
-                self.db.commit()
+                        self.db.delete_killed_tool_messages(None)
                 logger.info(f"补丁 Step 1: 清理了 {len(stale_ids)} 个孤立 tool 标记")
 
             # ── Step 2: 反向扫描，补齐缺失的 tool 响应 ──
@@ -1847,10 +1874,41 @@ class Agent:
             logger.error(f"_patch_orphaned_tool_calls 异常: {e}")
             self._log_error("patch_orphaned", self.session, f"error={e}")
 
+    def _sync_db(self) -> None:
+        """即时落盘安全网：LLM 回合/工具完成/断点标记后立即 sync（30s 定时之外）。
+
+        msgz 默认 30s 定时落盘（SYNC_INTERVAL），进程崩溃可能丢失窗口内消息；
+        本方法在关键写入点（LLM 回复完成、工具结果落库、clear/drop/compact
+        marker 写入）后调用，把数据丢失窗口压缩到单次写入。
+        """
+        try:
+            self.db.sync()
+        except Exception as e:
+            logger.warning(f"sync db 失败 session={self.session}: {e}")
+
     def clear(self):
+        """清空会话（断点标记模式：物理消息保留，LLM 上下文从此截断）。
+
+        /clear 与 /compact、/drop 同构（2026-08-25 改造）：写入 role='clear'
+        marker（cutoff_max_id = 当前 MAX(id)），内存上下文重置；历史消息
+        物理保留在 msgz（web ignore_cutoff=True 仍可回溯），仅 LLM 上下文
+        （get_chat_messages）与增量读取（get_messages_since）在 marker 处截断。
+        """
+        # ── Get current max message id before inserting marker ──
+        cutoff_max_id = self.db.last_message_id()
+
+        # ── Insert clear marker (keeps DB history intact) ──
+        add_chat(self.db, "clear", "", {"cutoff_max_id": cutoff_max_id})
+
+        # ── Clear in-memory messages, insert synthetic marker ──
         self.messages.clear()
+        cleared_msg = "[对话历史已清空。之前的消息已保留在存储中（断点标记），后续消息从此处开始。]\n"
+        self.messages.append({"role": "user", "content": cleared_msg})
+
+        # ── token 累计清零（与旧 /clear 行为一致，db 与内存同步）──
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self.total_reasoning_tokens = 0
         self._turn_usage_history.clear()
         self._turn_count = 0
         self._exit_requested = False
@@ -1858,13 +1916,12 @@ class Agent:
         self._exit_note = ""
         self._tool_retry_count = 0
         self._llm_check_cache.clear()
-        clear_chats(self.db)
-        # ── /clear 清空消息时同步清零 token 累计（db 与内存一致）──
         try:
             set_token_state(
                 self.session,
                 prompt_tokens=0,
                 completion_tokens=0,
+                reasoning_tokens=0,
                 turn_count=0,
                 model="",
                 last_prompt_tokens=0,
@@ -1873,6 +1930,10 @@ class Agent:
         except Exception as e:
             logger.warning(f"token_state 清零失败: {e}")
 
+        # ── 立即落盘（clear marker 即刻生效，不依赖 30s 定时）──
+        self._sync_db()
+        return True
+
     def drop(self):
         """Drop conversation history: insert a drop marker and clear in-memory messages.
 
@@ -1880,8 +1941,7 @@ class Agent:
         current history as dropped and resets the in-memory state.
         """
         # ── Get current max message id before inserting marker ──
-        row = self.db.execute("SELECT COALESCE(MAX(id), 0) as max_id FROM messages").fetchone()
-        cutoff_max_id = row["max_id"]
+        cutoff_max_id = self.db.last_message_id()
 
         # ── Insert drop marker (keeps DB history intact) ──
         add_chat(self.db, "drop", "", {"cutoff_max_id": cutoff_max_id})
@@ -1890,6 +1950,8 @@ class Agent:
         self.messages.clear()
         dropped_msg = "[对话历史已丢弃。之前的消息已标记为丢弃，后续消息从此处开始。]\n"
         self.messages.append({"role": "user", "content": dropped_msg})
+        # ── drop marker 立即落盘 ──
+        self._sync_db()
         return True
 
     def load_skill(self, name):
@@ -1900,6 +1962,129 @@ class Agent:
         self.active_skills = [s for s in self.active_skills if s.name != name]
         self.active_skills.append(skill)
         return True
+
+    def _estimate_context_tokens(self) -> int:
+        """估算当前上下文 token 数（autocompactlimit / prune 超限判定用）。
+
+        v3（2026-09-11）双轨估算（对齐 pi / opencode / DeepSeek Harness 的
+        "真实 usage 锚点 + 尾部增量估算" 模式）：
+          1. 锚点：最近一次 LLM 调用的真实 prompt_tokens（_turn_usage_history[-1]），
+             配合该次调用前记录的 messages 字符数（chars）：
+             - 当前 chars > 锚点 chars：usage + 新增字符数 / 密度（尾部增量，
+               覆盖"工具输出本轮追加、usage 尚未包含"的盲区——5.1MB 漏检根因）
+             - 当前 chars 大幅缩小（< 锚点 50%）：上下文被压缩/替换，锚点失效，
+               改用全量字符估算（防压缩后旧 usage 误触发连环压缩）
+             - 否则（基本持平）：直接用 usage（最准）
+          2. 无锚点（重启/清空后）：全量字符数 / 密度
+        密度 = 字符/token，由 _estimate_density() 从历史样本中位数学习
+        （默认 1.3：实测 deepseek 1.21 / 方舟 glm 1.52 的偏保守取值），
+        替代旧版 chars//2（实测低估 24-39%，曾导致 autocompact 漏触发）。
+        """
+        chars = 0
+        for m in self.messages:
+            c = m.get("content")
+            if isinstance(c, str):
+                chars += len(c)
+            elif c is not None:
+                # 非字符串内容（如图像块列表）按 JSON 序列化长度近似
+                try:
+                    chars += len(json.dumps(c, ensure_ascii=False))
+                except Exception:
+                    pass
+        density = self._estimate_density()
+        if self._turn_usage_history:
+            last = self._turn_usage_history[-1]
+            pt = int(last.get("prompt") or 0)
+            anchor_chars = int(last.get("chars") or 0)
+            if pt > 0:
+                if anchor_chars > 0 and chars > anchor_chars:
+                    return pt + int((chars - anchor_chars) / density)
+                if anchor_chars > 0 and chars < anchor_chars * 0.5:
+                    return int(chars / density)
+                return pt
+        return int(chars / density)
+
+    def _estimate_density(self) -> float:
+        """字符/token 密度估计：历史样本（chars/prompt）中位数，无样本返回 1.3。
+
+        样本取自 _turn_usage_history 中同时记录 chars 的条目（最近 8 条），
+        结果夹取到 [1.0, 4.0] 防异常值。业界估算普遍用 4.0（英文代码基准），
+        本项目实测内容（中英混合 + 代码/日志）密度 1.2-1.5，默认取 1.3 偏保守。
+        """
+        samples = [e for e in self._turn_usage_history[-8:]
+                   if e.get("chars") and e.get("prompt") and e["prompt"] > 0]
+        if not samples:
+            return 1.3
+        ds = sorted(e["chars"] / e["prompt"] for e in samples)
+        mid = ds[len(ds) // 2]
+        return max(1.0, min(mid, 4.0))
+
+    def _prune_oversized_messages(self, max_chars=None) -> int:
+        """本地修剪超大的 tool 消息（头 100KB + 尾 2KB + 标记），返回修剪条数。
+
+        2026-09-11: 上下文超限恢复的 prune 优先策略（对齐 DeepSeek Harness
+        "prune 先剪再测，safe 时跳过 LLM 摘要"）——不调用 LLM，同步修剪
+        内存 self.messages 与 DB（双方按同一规则各自遍历，保持内容一致）。
+        用于三处：① autocompact 触发前的预修剪（修剪后达标则跳过压缩调用）；
+        ② LLM 400 疑似超限后的恢复；③ 工具循环内每次 LLM 调用前的防爆检查。
+        """
+        max_chars = _TOOL_OUTPUT_MAX_CHARS if max_chars is None else max_chars
+        # 触发阈值 = 目标 + 尾保留 + 标记余量：截断产物（头+标记+尾 ≈ 102KB）
+        # 不会再触发，保证幂等（避免对已修剪消息反复修剪与 sync）。
+        trigger_chars = max_chars + _TOOL_OUTPUT_TAIL_CHARS + 500
+        n = 0
+        for m in self.messages:
+            if m.get("role") != "tool":
+                continue
+            c = m.get("content")
+            if not isinstance(c, str) or len(c) <= trigger_chars:
+                continue
+            m["content"] = _truncate_tool_text(c, reason="上下文超限恢复")
+            n += 1
+        try:
+            n_db = self.db.truncate_oversized_tool_messages(
+                lambda c: _truncate_tool_text(c, reason="上下文超限恢复"),
+                max_chars=trigger_chars)
+            if n_db != n:
+                logger.warning(f"prune 内存/DB 条数不一致: mem={n} db={n_db}")
+            n = max(n, n_db)
+        except Exception as e:
+            logger.warning(f"prune DB 修剪失败（内存已修剪）: {e}")
+        if n:
+            # 修剪后立即落盘（安全网）：防崩溃后 DB 仍是巨型内容，重载再触发
+            self._sync_db()
+        return n
+
+    def _is_context_overflow_suspect(self, e: Exception) -> bool:
+        """判定 LLM 异常是否「疑似上下文超限」（overflow 恢复触发条件）。
+
+        1. 错误文本含明确关键词（各 provider/中转站表述）→ 直接判定；
+        2. 方舟泛化 InvalidParameter（param 空、不指明参数）→ 结合自身估算：
+           超过阈值（autocompactlimit，未配置时用默认 600k）才判定疑似
+           （纯参数错误通常伴随小上下文，不会误触发恢复）。
+        """
+        s = str(e).lower()
+        keys = ("context length", "context window", "longer than", "maximum context",
+                "context_length", "too many tokens", "token limit", "input is too long",
+                "exceeds the maximum", "reduce the length")
+        if any(k in s for k in keys):
+            return True
+        if "invalidparameter" in s.replace(" ", ""):
+            limit = self._autocompactlimit if self._autocompactlimit > 0 else _DEFAULT_AUTOCOMPACTLIMIT
+            try:
+                return self._estimate_context_tokens() > limit
+            except Exception:
+                return False
+        return False
+
+    def _compact_allowed(self) -> bool:
+        """连续 compact 防护 gate：距上次 compact 成功中间须有 ≥1 条已处理的
+        普通用户消息（压缩轮 usage 可能不准，且连续压缩无意义）。
+
+        None=从未压缩过（允许）。手动 /compact 与 autocompactlimit 共用本 gate。
+        """
+        return (self._user_turns_since_compact is None
+                or self._user_turns_since_compact >= 1)
 
     def _finalize_compact(self) -> bool:
         """压缩收尾副作用：写 compact marker + 重置内存上下文。
@@ -1923,8 +2108,7 @@ class Agent:
             return False
 
         # ── Get current max message id before inserting marker ──
-        row = self.db.execute("SELECT COALESCE(MAX(id), 0) as max_id FROM messages").fetchone()
-        cutoff_max_id = row["max_id"]
+        cutoff_max_id = self.db.last_message_id()
 
         # ── Insert compact marker (keeps DB history intact) ──
         add_chat(self.db, "compact", summary, {"cutoff_max_id": cutoff_max_id})
@@ -1946,7 +2130,19 @@ class Agent:
         except Exception as e:
             logger.warning(f"压缩总结落盘失败（降级，不影响压缩）: {e}")
 
+        # 2026-08-25 修复：同步游标到当前可见最大 id（marker 本身被
+        # max_visible_id 排除），避免 run_forever 空闲时 _sync_from_db 因检测到
+        # 新消息立即全量重载（get_chat_messages 现已应用 cutoff，重载结果与
+        # 内存重置一致，此处仅避免无谓重载开销）。
+        try:
+            self._last_sync_max_id = self.db.max_visible_id()
+        except Exception:
+            pass
         logger.info(f"压缩收尾完成: summary={len(summary)}字符, cutoff_max_id={cutoff_max_id}")
+        # ── 连续 compact 防护：压缩成功 → 计数器归零（下一条用户消息处理后 +1）──
+        self._user_turns_since_compact = 0
+        # ── compact marker 立即落盘 ──
+        self._sync_db()
         return True
 
 
@@ -1968,6 +2164,7 @@ class Agent:
         lines.append(f"  Token Usage")
         lines.append(f"     Prompt:     {self.total_prompt_tokens:>10,}")
         lines.append(f"     Completion: {self.total_completion_tokens:>10,}")
+        lines.append(f"     Reasoning:  {getattr(self, 'total_reasoning_tokens', 0):>10,}")
         lines.append(f"     Total:      {total:>10,}")
         lines.append(f"     Ratio:      {ratio}")
         lines.append(f"     Cost:       {_format_cost(cost)}")
@@ -2109,7 +2306,216 @@ class Agent:
             self._interrupt_event.clear()
             raise _InterruptTurn()
 
-    def run_stream(self, instruction):
+    def _exec_tool_calls_parallel(self, tool_calls: list):
+        """多工具并行执行（2026-08-27 优化：耗时 = max 而非 sum）。
+
+        校验（未注入/JSON/类型/缺参）在提交前串行完成并即时回传；
+        合法项 ThreadPoolExecutor 并行执行（独立 worker 子进程，线程安全）；
+        结果按 tool_calls 原始 index 顺序回传（协议成对，无 orphan）。
+        stop_turn 工具（summary）成功后设 self._stop_turn_parallel，由主循环统一收尾。
+        中断语义：_interrupt_event 置位时 interrupt_tool() kill 全部 worker。
+        """
+        self._stop_turn_parallel = False
+        prepared = []   # (idx, tc, tool_name, tool_args, tool_def)
+        for i, tc in enumerate(tool_calls):
+            tool_name = tc['function']['name']
+            if tool_name not in self._run_tool_names:
+                _injected = sorted(self._run_tool_names)
+                result = ToolResult(
+                    error=f"[工具未注入] '{tool_name}' 不在本次注入工具集 {_injected} 中。"
+                          f"请改用可独立调用的工具名。")
+                result_str = _tool_result_to_str(result)
+                self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
+                add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
+                self._sync_db()
+                yield _tool_result_event(tool_name, result, 0.0)
+                continue
+
+            tool_args_str = tc["function"]["arguments"]
+            try:
+                tool_args = json.loads(tool_args_str)
+            except (json.JSONDecodeError, TypeError):
+                result = ToolResult(
+                    error=(f"[参数解析失败] 工具 {tool_name} 的 arguments 不是合法 JSON："
+                           f"{tool_args_str!r}\n请重新生成，arguments 必须是合法的 JSON 对象。")
+                )
+                result_str = _tool_result_to_str(result)
+                self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
+                add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
+                self._sync_db()
+                yield _tool_result_event(tool_name, result, 0.0)
+                continue
+
+            if not isinstance(tool_args, dict):
+                result = ToolResult(
+                    error=(f"[参数类型错误] 工具 {tool_name} 的 arguments 解析结果为 "
+                           f"{type(tool_args).__name__}，必须是 JSON 对象（dict）。收到: {tool_args!r}")
+                )
+                result_str = _tool_result_to_str(result)
+                self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
+                add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
+                self._sync_db()
+                yield _tool_result_event(tool_name, result, 0.0)
+                continue
+
+            _tool_def = self._find_tool(tool_name)
+            _required = (_tool_def.parameters.get("required") or []) if _tool_def else []
+            _missing = [k for k in _required if k not in tool_args]
+            if _missing:
+                result = ToolResult(
+                    error=(f"[参数缺失] 工具 {tool_name} 缺少必需参数: {_missing}。"
+                           f"收到 arguments: {tool_args_str!r}\n请重新生成，必须包含全部必需键: {_required}")
+                )
+                result_str = _tool_result_to_str(result)
+                self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
+                add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
+                self._sync_db()
+                self._log_error("tool_args_missing", self.session,
+                                f"tool={tool_name} missing={_missing} args={tool_args_str!r}")
+                yield _tool_result_event(tool_name, result, 0.0)
+                continue
+
+            prepared.append((i, tc, tool_name, tool_args, _tool_def))
+
+        # 广播全部 tool_call 事件（前端先显示 N 个折叠框）
+        for i, tc, tool_name, tool_args, _tool_def in prepared:
+            yield {"type": "tool_call", "name": tool_name, "args": tool_args,
+                   "index": i, "total": len(tool_calls), "mode": self.mode}
+
+        if not prepared:
+            return
+
+        import concurrent.futures as _cf
+        self.phase = "idle"
+        self.in_tool = True
+        self._in_tool_exec = True   # 并行期间保持 True（worker 内部会写 False，以计数兜底）
+        self._tool_exec_count = len(prepared)   # 并发计数：interrupt_tool 依赖 _in_tool_exec 判断
+        _results = {}  # i -> (result, elapsed)
+        _stop_tool = ""
+
+        def _execute_single(idx, tool_name, tool_args, tool):
+            t_start = time.time()
+            try:
+                if tool is None:
+                    self._log_error("tool_unknown", self.session, f"tool={tool_name}")
+                    return idx, ToolResult(error=f"Unknown tool: {tool_name}"), 0.0
+                return idx, tool.execute(**tool_args), time.time() - t_start
+            except KeyboardInterrupt:
+                return idx, ToolResult(error="tool is killed by user"), time.time() - t_start
+            except Exception as e:
+                self._log_error("tool_exec", self.session,
+                                f"tool={tool_name} args={tool_args!r} error={e}")
+                return idx, ToolResult(error=str(e)), time.time() - t_start
+
+        with _cf.ThreadPoolExecutor(max_workers=min(6, len(prepared))) as _pool:
+            _futs = {}
+            for i, tc, tn, ta, td in prepared:
+                _futs[i] = _pool.submit(_execute_single, i, tn, ta, td)
+            while True:
+                self._check_pause_point()
+                try:
+                    self._check_interrupt()
+                except _InterruptTurn:
+                    self._interrupt_event.set()
+                    time.sleep(0.12)
+                    self._tool_exec_count = 0
+                    self._in_tool_exec = False
+                    self.in_tool = False
+                    for i, tc, tn, ta, td in prepared:
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": "tool is killed by user",
+                        })
+                        add_chat(self.db, "tool", "tool is killed by user", {"tool_call_id": tc["id"]})
+                    self._log_error("interrupt", self.session, "user interrupted turn")
+                    yield {"type": "interrupted"}
+                    return
+                if self._interrupt_event.is_set():
+                    self.interrupt_tool()
+                _done = 0
+                for i in _futs:
+                    if _futs[i].done():
+                        _done += 1
+                if _done == len(_futs):
+                    break
+                time.sleep(0.05)
+            for i in _futs:
+                _idx, _res, _el = _futs[i].result()
+                _results[_idx] = (_res, _el)
+        self._tool_exec_count = 0
+        self._in_tool_exec = False
+        self.in_tool = False
+
+        # 按 index 顺序回传结果（stop_turn 工具结果照常回传，收尾由主循环统一）
+        for i, tc, tool_name, tool_args, _tool_def in prepared:
+            _res, _el = _results.get(i, (ToolResult(error="parallel exec 无返回"), 0.0))
+            result_str = _tool_result_to_str(_res)
+            yield _tool_result_event(tool_name, _res, _el)
+            self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
+            add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
+            self._sync_db()
+            if getattr(_res, "stop_turn", False) and not _stop_tool:
+                _stop_tool = tool_name
+        if _stop_tool:
+            self._stop_turn_parallel = True
+            self._stop_turn_parallel_tool = _stop_tool
+    # 连续 N 个用户回合未使用 selectskill 加载技能 → status info 告警
+    _SKILL_ALARM_THRESHOLD = 3
+
+    def _skill_usage_alarm(self, threshold: int | None = None) -> str:
+        """status info 告警：O(1) 状态判定（2026-08-27 缓存化，替代每回合 O(n) 扫描）。
+
+        判定：exec_selectskill 执行时写 self._last_skill_turn（= 当时的 _turn_count）；
+        历史会话首次调用退化为 _scan_last_skill_turn() 扫描一次（向后兼容）；
+        cur_turn - last_skill >= threshold → 返回告警。
+        """
+        if threshold is None:
+            threshold = self._SKILL_ALARM_THRESHOLD
+        cur_turn = getattr(self, "_turn_count", 0)
+        last_skill = getattr(self, "_last_skill_turn", None)
+        if last_skill is None:
+            last_skill = self._scan_last_skill_turn()
+            self._last_skill_turn = last_skill
+        if last_skill is None:
+            # 从未使用过技能：仅当回合数 >= 阈值且确实有过技能内容候选时提示（低噪声）
+            return ''
+        if cur_turn - last_skill >= threshold:
+            return (f"⚠️ 系统告警: 本会话已有 {cur_turn - last_skill} 个用户回合未使用 selectskill 加载技能；"
+                    f"如任务适配技能工作流，请先 selectskill 获取技能全文。\n")
+        return ''
+
+    def _scan_last_skill_turn(self) -> int | None:
+        """倒序扫描 self.messages（限 300 条），返回最近一次 selectskill 使用时刻的用户回合计数（无→None）。
+
+        判定信号：assistant 消息 tool_calls 含 selectskill/select_skill（工具名），
+        或 tool 结果含 '已选择/已读技能'（技能加载执行证据）。
+        """
+        user_turns = 0
+        limit = 300
+        n = len(self.messages)
+        for idx in range(n - 1, max(-1, n - 1 - limit), -1):
+            m = self.messages[idx]
+            role = m.get('role', '')
+            if role == 'user':
+                user_turns += 1
+            elif role == 'assistant':
+                extras = m.get('extras')
+                try:
+                    ex = json.loads(extras) if isinstance(extras, str) else (extras or {})
+                except Exception:
+                    ex = {}
+                for tc in ex.get('tool_calls') or []:
+                    fn = tc.get('function', {})
+                    if fn.get('name') in ('selectskill', 'select_skill'):
+                        return user_turns
+            elif role == 'tool':
+                content = m.get('content', '') or ''
+                if '已选择' in content or '已读技能' in content:
+                    return user_turns
+        return None
+
+    def run_stream(self, instruction, compact=False):
         logger.info(f"run_stream() 开始: instruction={instruction!r:.80}")
         # ── 观察者模式 gate (T2): session 被其他进程占用时拒绝 LLM 交互与 DB 写入 ──
         if self._observing:
@@ -2121,138 +2527,142 @@ class Agent:
         self._exit_reason = ""
         self._tool_retry_count = 0
         self._turn_active = True   # 回合开始（含技能选择/工具间隙全程保持）
-        instruction = _resolve_refs(instruction, self.cwd)
+        from codes.path_guard import allowed_roots_for_agent
+        instruction = _resolve_refs(instruction, self.cwd, allowed_roots_for_agent(self))
         instruction = _sanitize(instruction)
-
-        # ── Build user message metadata (timestamp + mode + suggested skills) ──
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        skill_details = searchskill_detail(instruction, top_k=5)
-        skill_names = [d["name"] for d in skill_details]
-        suggested_skills = "\n".join(
-            f"  [{d['method']}] {d['path']} | {d['snippet']}" for d in skill_details
-        ) if skill_details else ""
-        mode_label = self.mode
-        req_line = ""
-        if self._pending_skill_req:
-            req_line = f"要求: 用户要求调用{self._pending_skill_req}\n"
-            self._pending_skill_req = None
-
-        # ── 推荐信息：跨范围（skills/docs/historys/logs，codes 默认关闭）检索相关片段+路径 ──
-        info_lines = ""
-        info_items = []
-        try:
-            info_items = recommend_info(instruction, top_k=5, exclude_session=self.session, session=self.session)
-        except Exception as e:
-            logger.warning(f"recommend_info 静默降级: {e}")
-        if info_items:
-            info_lines = "推荐信息:\n" + "".join(
-                f"  [{it['scope']}] {it['path']} | {it['snippet']}\n" for it in info_items
+        # ── 延续式压缩（2026-09-05）：/compact 不再新起独立对话，压缩指令作为
+        # user 消息追加进 self.messages（LLM 在完整上下文中总结，可见全部 tool_calls/
+        # reasoning_content），DB 落库仍为 compact 角色（get_chat_messages 排除，
+        # 不影响 LLM 上下文）。system_prompt_compact.txt 与 COMPACT_PROMPT 合并为单条 user 消息。
+        _compact = compact
+        if _compact:
+            instruction = _build_compact_prompt() + "\n\n" + COMPACT_PROMPT
+            # ── 历史检索提示要求（2026-09-07）：要求 LLM 在总结最末尾追加提示行，
+            # 供后续对话的 LLM 使用——详细历史已归档，需要时可调 history_parser 查 msgz ──
+            _hp_path = getattr(self.db, "path", "") or ""
+            instruction += (
+                "\n\n[附加要求]\n"
+                "压缩总结正文输出完毕后，在【最末尾】另起一行追加一条「历史检索提示」"
+                "（用 --- 分隔，供后续对话的 LLM 使用，关键信息须完整保留）：\n"
+                "📌 历史检索提示：本会话更详细的历史（原始消息/工具调用/代码细节）已归档，"
+                "如需回溯请使用 history_parser 技能检索——session=" + self.session
+                + (("，历史库=" + _hp_path) if _hp_path else "")
             )
 
-                # ── 路径访问权限摘要（按当前 mode 生成，供 pythonrt 调用前核对）──
-        _perm_parts = []
-        for _p, _w in getattr(self, "_perm_volumes", []):
-            _perm_parts.append("%s(%s)" % (_p, "ro/rw" if _w else "ro"))
-        for _m in getattr(self, "_dyn_mounts", []):
-            _perm_parts.append("%s(%s)" % (_m.get("path"), "ro/rw" if _m.get("writable") else "ro"))
-        _root_mode = "可写" if self.mode in ("build", "build-unsafe") else "只读"
-        _perm_summary = ", ".join(_perm_parts) if _perm_parts else "无"
-        perm_line = "路径访问权限: 项目根(%s)=%s; /tmp=可写(不持久化); %s/=只读; 挂载: %s\n" % (
-            self.cwd, _root_mode, config.DATA_DIR_NAME, _perm_summary)
-        sys_prefix = (
-            f"时间: {now_str}\n"
-            f"系统模式: {mode_label}\n"
-            f"{perm_line}"
-            f"建议技能: {suggested_skills}\n"
-            f"{info_lines}"
-            f"{req_line}"
-            f"正文:\n"
-        )
-        instruction = sys_prefix + instruction
+        if not _compact:
+            # ── Build user message metadata (timestamp + mode + suggested skills) ──
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            skill_details = searchskill_detail(instruction, top_k=5)
+            skill_names = [d["name"] for d in skill_details]
+            suggested_skills = "\n".join(
+                f"  [{d['method']}] {d['name']} | {(d.get('description') or '').strip()}".rstrip(' |')
+                for d in skill_details
+            ) if skill_details else ""
+            mode_label = self.mode
+            req_line = ""
+            if self._pending_skill_req:
+                req_line = f"要求: 用户要求调用{self._pending_skill_req}\n"
+                self._pending_skill_req = None
+
+            # ── 推荐信息：跨范围（skills/docs/historys/logs，codes 默认关闭）检索相关片段+路径 ──
+            info_lines = ""
+            info_items = []
+            try:
+                info_items = recommend_info(instruction, top_k=5, exclude_session=self.session, session=self.session)
+            except Exception as e:
+                logger.warning(f"recommend_info 静默降级: {e}")
+            if info_items:
+                info_lines = "推荐信息:\n" + "".join(
+                    f"  [{it['scope']}] {it['path']} | {_indent_continuation(it['snippet'])}\n"
+                    for it in info_items
+                )
+
+                    # ── 路径访问权限摘要（按当前 mode 生成，供 pythonrt 调用前核对）──
+            _perm_parts = []
+            for _p, _w in getattr(self, "_perm_volumes", []):
+                _perm_parts.append("%s(%s)" % (_p, "ro/rw" if _w else "ro"))
+            for _m in getattr(self, "_dyn_mounts", []):
+                _perm_parts.append("%s(%s)" % (_m.get("path"), "ro/rw" if _m.get("writable") else "ro"))
+            _root_mode = "可写" if self.mode in ("build", "build-unsafe") else "只读"
+            _perm_summary = ", ".join(_perm_parts) if _perm_parts else "无"
+            perm_line = "路径访问权限: 项目根(%s)=%s; /tmp=可写(不持久化); %s/=只读; 挂载: %s\n" % (
+                self.cwd, _root_mode, config.DATA_DIR_NAME, _perm_summary)
+            alarm_line = self._skill_usage_alarm()
+            # ── 状态信息：session 级 KV（addinfo/listinfo/rminfo 工具与 /addinfo 等
+            # 命令共同维护），长时间运行 session 的活状态，每回合注入头部元信息区。
+            # 与 summary 分工：KV 运行态走这里；结论/长文本/跨会话走 summary。
+            # 条目按首次写入序展示（更新不改变位置，新增排尾）。
+            sinfo_lines = ""
+            try:
+                from codes.session_info import render_field
+                sinfo_lines = render_field(self.session)
+            except Exception as e:
+                logger.warning(f"状态信息渲染失败（静默降级）: {e}")
+            # ── 用户消息头部元信息区（status info）组装 ─────────────────────────
+            # 格式规范 v2（2026-09-03）：顶格 "字段名: 值"（单行字段）或 "字段名:"
+            # （块字段，条目行缩进两空格）；"正文:" 之后全部原样作为用户正文，不再解析。
+            # 【新增字段接入四步】
+            #  1) 解析端注册：codes/history.py 的 _USER_FIELD_KNOWN 登记 "字段名": "english_key"
+            #     · 块式字段（冒号后换行、多行条目）必须注册，并加入 _USER_BLOCK_FIELDS
+            #     · 未注册的 "xxx: 值"（同行带值）字段也能被解析——自动进 extra_fields，
+            #       web 端渲染为 🏷 行——但无固定 key、不支持多行值
+            #  2) 注入端组装：在本 f-string 对应语义区段位置加一行（区段顺序：
+            #     环境标识 → 资源推荐 → 指令 → 告警约束 → 正文）；多行片段必须用
+            #     _indent_continuation() 缩进续行，防止片段内顶格行被误判为字段头
+            #  3) 解析自动生效：history.py 状态机按字段头切分，无需改解析逻辑
+            #  4) web 渲染：extra_fields 自动显示；需要专门样式/统计时才改
+            #     codes/web.py 的 _format_message_for_display
+            # 约束：字段名不得以其他字段名为前缀；用半角冒号；值内避免顶格 "xxx: " 行。
+            sys_prefix = (
+                f"时间: {now_str}\n"
+                f"系统模式: {mode_label}\n"
+                f"当前会话: {self.session}\n"
+                f"{perm_line}"
+                f"建议技能:\n{suggested_skills}\n"
+                f"{info_lines}"
+                f"{sinfo_lines}"
+                f"{req_line}"
+                f"{alarm_line}"
+                f"正文:\n"
+            )
+            instruction = sys_prefix + instruction
 
 
         self._patch_orphaned_tool_calls()
         self.messages.append({'role': 'user', 'content': instruction})
-        add_chat(self.db, 'user', instruction)
+        user_persisted = False
+        def _persist_user():
+            nonlocal user_persisted
+            if not user_persisted:
+                add_chat(self.db, 'compact' if _compact else 'user', instruction)
+                user_persisted = True
 
         lang = _detect_language(instruction)
-        system_prompt = _build_system_prompt(lang)
+        system_prompt = "" if _compact else _build_system_prompt(lang)
 
-        tools = self._all_tools()
-        tool_schemas = [t.to_openai_schema() for t in tools]
+        # 主循环仅注入执行类工具；searchinfo/searchskill 仅在技能选择阶段可用
+        # （2026-08-21: 同步搜索不可中断 → 移出主循环，避免回合卡死）
+        # 全量注入（2026-08-27 修订）：pythonrt/agent/searchskill/selectskill/searchinfo 均作为独立工具注入
+        tools = [] if _compact else [t for t in self._all_tools() if t.name != "tools"]
+        self._run_tool_names = {t.name for t in tools}
+        tool_schemas = None if _compact else [t.to_openai_schema() for t in tools]
+        logger.info(f"[toolset] 主循环注入工具: {[t.name for t in tools]}")
 
-        selected_skill = None
-        if self.skill_select_enabled:
-            # ── 方案B: 实时路径访问权限提示（供 web/repl 实时渲染）──
+        if not _compact:
+            # ── 实时路径权限/建议技能提示（2026-08-27: 技能预选开关已移除，无条件展示）──
             yield {"type": "permission", "data": perm_line.strip()}
-            # ── Show suggested skills to user ──
+            # ── Show suggested skills to user（模型自主决定是否 select_skill）──
             yield {"type": "suggested_skills", "skills": skill_names}
             if info_items:
                 yield {"type": "recommended_info", "items": info_items}
             if req_line:
                 skill_name_only = req_line.replace("要求: 用户要求调用", "").replace("\n", "")
                 yield {"type": "skill_req", "name": skill_name_only}
-            try:
-                selected = self._select_skill(instruction)
-            except _InterruptTurn:
-                # skill_select 期间 Ctrl+C：不写任何技能记录，直接中断收尾
-                self._log_error("interrupt", self.session, "user interrupted turn")
-                yield {"type": "interrupted"}
-                return
-            selected_skill, skill_reason, collected_info = (
-                selected if selected and len(selected) == 3 else (None, "", [])
-            )
-            # ── Phase 1: 技能选择 & 历史写入（自述承诺注入）──
-            if selected_skill:
-                skill_dir = SkillLoader._find_skill_dir(selected_skill)
-                if skill_dir is not None:
-                    skill_path = skill_dir / "skill.md"
-                    skill_md = skill_path.read_text(encoding="utf-8")
-                    # 判定全文是否已注入（含版本比对）→ 全文版 / 锚点版
-                    full_injected = self._skill_full_injected(selected_skill)
-                    inject_msg = self._build_skill_commitment(
-                        selected_skill, skill_reason, skill_md, full_injected
-                    )
-                    if collected_info:
-                        _info_summary = "\n".join(
-                            f"  [{it['method']}] {it['path']} | {it['snippet']}"
-                            for it in collected_info[:5]
-                        )
-                        inject_msg += f"\n\n📎 技能选择前收集的信息:\n{_info_summary}"
-                    meta = SkillLoader.load_meta(selected_skill) or {}
-                    version = meta.get("version", "")
-                    # 自述承诺作为 assistant 消息落库，extras 标注注入元数据
-                    extras = {
-                        "injected": True,
-                        "inject_type": "recall" if full_injected else "full",
-                        "skill_name": selected_skill,
-                        "skill_version": version,
-                        "reason": skill_reason,
-                        "searchinfo_items": collected_info[:5],
-                    }
-                    self.messages.append({"role": "assistant", "content": inject_msg})
-                    add_chat(self.db, "assistant", inject_msg, extras)
-                    yield {"type": "skill_selected", "name": selected_skill,
-                           "reason": skill_reason}
-                else:
-                    # skill.md 缺失：不再静默 pass，显式记录 + 通知 UI
-                    logger.warning(
-                        f"技能 {selected_skill} 已选中但 skill.md 缺失（双目录均无）")
-                    missing_msg = f"🎯 技能选择: {selected_skill}（skill.md 缺失）"
-                    self.messages.append({"role": "assistant", "content": missing_msg})
-                    add_chat(self.db, "assistant", missing_msg,
-                             {"injected": False, "skill_name": selected_skill,
-                              "missing": True})
-                    yield {"type": "skill_selected", "name": selected_skill,
-                           "reason": skill_reason, "missing": True}
-            else:
-                self.messages.append({
-                    "role": "assistant",
-                    "content": "🎯 技能选择: 无"
-                })
-                add_chat(self.db, "assistant", "🎯 技能选择: 无", {"injected": False})
-                yield {"type": "no_skill", "reason": skill_reason}
 
+        if not _compact:
+            _persist_user()
+        # ── 2026-09-11: 上下文超限恢复标志（每轮 run_stream 重置，防无限重试）──
+        _overflow_recovery_attempted = False
         while True:
 
             # 每次 LLM 流式调用前修补孤立 tool 调用
@@ -2260,6 +2670,7 @@ class Agent:
             # 导致 assistant 消息已写 DB（含 tool_calls）但 tool 结果未写入。
             # 这种「孤儿」消息会让 DeepSeek API 拒绝请求。
             self._patch_orphaned_tool_calls()
+            self._patch_reasoning_content()
             # ── exit tool 检查：真正退出循环（T8）──
             if self._exit_requested:
                 yield {"type": "turn_end_by_tool", "name": "exit",
@@ -2275,44 +2686,69 @@ class Agent:
                 self._log_error("interrupt", self.session, "user interrupted turn")
                 yield {"type": "interrupted"}
                 return
-            full_messages = [{'role': 'system', 'content': system_prompt}] + self.messages
+            full_messages = (self.messages if _compact
+                             else [{'role': 'system', 'content': system_prompt}] + self.messages)
 
-            # ── 多模态图像注入（/image add 附加的图片，随最新 user 消息发送）──
-            # 默认一次性：注入后自动清空附件（/image clear 等价效果），
-            # 避免多轮对话持续携带图像导致计费膨胀。
-            # 仅 run_stream 主循环注入（run_stream_compact 压缩回合不注入）；
-            # 注入只发生在 full_messages 临时副本，不回写 self.messages/DB。
-            try:
-                from codes.history import get_images, clear_images
-                imgs = get_images(self.session)
-                if imgs:
-                    injected = False
-                    for idx in range(len(full_messages) - 1, -1, -1):
-                        if full_messages[idx].get("role") == "user":
-                            msg = full_messages[idx]
-                            text = msg.get("content")
-                            if isinstance(text, str) and text.strip():
-                                blocks = [{"type": "text", "text": text}]
-                                for ip in imgs:
-                                    blk = _make_image_url_block(ip)
-                                    if blk is not None:
-                                        blocks.append(blk)
-                                        injected = True
-                                full_messages[idx] = {**msg, "content": blocks}
-                            break
-                    # 一次性语义：图已编码进本轮消息（full_messages 副本），
-                    # 注入后立即清空附件，下次对话不再携带。
-                    if injected:
-                        try:
-                            clear_images(self.session)
-                        except Exception:
-                            pass
-            except Exception as e:
-                logger.warning(f"图像注入失败: {e}")
+            if not _compact:
+                # ── 多模态图像注入（/image add 附加的图片，随最新 user 消息发送）──
+                # 默认一次性：注入后自动清空附件（/image clear 等价效果），
+                # 避免多轮对话持续携带图像导致计费膨胀。
+                # 仅普通模式注入（compact 压缩回合不注入）；
+                # 注入只发生在 full_messages 临时副本，不回写 self.messages/DB。
+                try:
+                    from codes.history import get_images, clear_images
+                    imgs = get_images(self.session)
+                    logger.info(f"图像注入观测: session={self.session} imgs={len(imgs)} -> {imgs}")
+                    if imgs:
+                        injected = False
+                        for idx in range(len(full_messages) - 1, -1, -1):
+                            if full_messages[idx].get("role") == "user":
+                                msg = full_messages[idx]
+                                text = msg.get("content")
+                                if isinstance(text, str) and text.strip():
+                                    blocks = [{"type": "text", "text": text}]
+                                    for ip in imgs:
+                                        blk = _make_image_url_block(ip)
+                                        if blk is not None:
+                                            blocks.append(blk)
+                                            injected = True
+                                    full_messages[idx] = {**msg, "content": blocks}
+                                    logger.info(f"图像注入成功: 已注入 {len(blocks)-1} 张图片块")
+                                break
+                        # 一次性语义：图已编码进本轮消息（full_messages 副本），
+                        # 注入后立即清空附件，下次对话不再携带。
+                        if injected:
+                            try:
+                                clear_images(self.session)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning(f"图像注入失败: {e}")
 
             yield {"type": "_lock_status", "is_locked": self._lock_held, "is_observing": self._observing, "holder_info": self._lock_holder_info}
             self.phase = "llm"   # 进入 LLM 回复流（含流式 chunk）
             yield {"type": "thinking"}
+
+            # ── 2026-09-11: 工具循环内上下文防爆检查（prune 优先）──
+            # 对齐业界"每步完成 / 下请求前检查"时机（opencode step-finish /
+            # DeepSeek pre-step）：单轮内 tool 输出爆炸时，下一次 LLM 调用前
+            # 先把超大输出本地修剪，避免直接 400（5.1MB 案例的教训）。
+            try:
+                if self._autocompactlimit > 0:
+                    _est_now = self._estimate_context_tokens()
+                    if _est_now > self._autocompactlimit:
+                        _pruned = self._prune_oversized_messages()
+                        if _pruned:
+                            _est_after = self._estimate_context_tokens()
+                            logger.warning(
+                                f"工具循环内 prune: {_est_now} -> {_est_after} tokens, "
+                                f"已修剪 {_pruned} 条超大 tool 消息")
+                            yield {"type": "info", "data":
+                                   f"⚙️ 上下文约 {_est_now} tokens 超阈值，已本地修剪 {_pruned} 条超大工具输出（现约 {_est_after} tokens）"}
+            except Exception as _ck_err:
+                logger.warning(f"工具循环内 prune 检查失败（忽略）: {_ck_err}")
+            # 记录本次调用前的上下文字符数（供 v3 双轨估算的锚点增量计算）
+            _ctx_chars_before = sum(len(m.get("content") or "") for m in self.messages)
 
             try:
                 stream_gen = complete_stream(
@@ -2358,8 +2794,7 @@ class Agent:
                 except StopIteration as e:
                     full_content, extras = e.value
                     # thinking 内容（llm 层已聚合到 extras.reasoning_content）：
-                    # 仅用于落库 thinking 角色供 web 展示，绝不写入 self.messages，
-                    # 保证 get_chat_messages 给 LLM 的历史不含 thinking。
+                    # 落库 thinking 角色供 web 展示，同时写入 assistant.reasoning_content 供 LLM 回放。
                     accumulated_reasoning = (extras.get("reasoning_content") or "").strip()
                     # ── B1 核心修复：llm.py break 后 Event 残留 → 检测并中断收尾 ──
                     if self._interrupt_event.is_set() or extras.get("interrupted"):
@@ -2393,14 +2828,37 @@ class Agent:
 
 
             except Exception as e:
+                # ── 2026-09-11: 上下文超限恢复（prune 优先 → 重试一次）──
+                # 对齐业界 overflow 恢复路径（pi reason=overflow / opencode
+                # ContextOverflowError / DeepSeek CONTEXT_WINDOW_EXCEEDED）：
+                # 判定为疑似超限（明确关键词，或方舟泛化 InvalidParameter +
+                # 估算超阈值）时先本地修剪超大 tool 输出再重试一次；
+                # 无可修剪内容 / 已重试过 → 保持原错误（防死循环）。
+                # 仅当本段流未产出任何内容时重试（防重复输出）；
+                if (not _overflow_recovery_attempted and not accumulated_content
+                        and self._is_context_overflow_suspect(e)):
+                    _overflow_recovery_attempted = True
+                    _pruned = self._prune_oversized_messages()
+                    if _pruned > 0:
+                        logger.warning(
+                            f"LLM 调用疑似上下文超限，已修剪 {_pruned} 条超大 tool 消息，重试一次")
+                        yield {"type": "info", "data":
+                               f"⚙️ 疑似上下文超限，已本地修剪 {_pruned} 条超大工具输出，重试中…"}
+                        continue
                 self._log_error("llm_stream", self.session, f"error={e}")
                 yield {"type": "error", "data": f"LLM call failed: {e}"}
                 return
             usage = extras.get('usage', {})
-            pt = usage.get('prompt_tokens', 0)
-            ct = usage.get('completion_tokens', 0)
+            pt = int(usage.get('prompt_tokens', 0) or 0)
+            ct = int(usage.get('completion_tokens', 0) or 0)
+            rt, _content_ct = split_reasoning_tokens(
+                usage,
+                reasoning_len=extras.get('reasoning_len', 0),
+                content_len=extras.get('content_len', 0),
+            )
             self.total_prompt_tokens += pt
             self.total_completion_tokens += ct
+            self.total_reasoning_tokens += rt
             self._last_model = extras.get('model', self.model or '')
 
             self._turn_count += 1
@@ -2408,9 +2866,11 @@ class Agent:
             self._turn_usage_history.append({
                 'prompt': pt,
                 'completion': ct,
+                'reasoning': rt,
                 'turn': self._turn_count,
                 'model': self._last_model,
                 'tool_calls': turn_tc_count,
+                'chars': _ctx_chars_before,   # v3 双轨估算锚点（本次调用前的上下文字符数）
             })
 
             # ── 显式持久化 token 累计值到 session db ──
@@ -2421,153 +2881,171 @@ class Agent:
 
             if not tool_calls:
                 final_answer = _sanitize(accumulated_content)
-                # thinking 先落库（顺序：thinking → assistant），与实时流一致；
-                # 仅写 db 供 web 展示，不写 self.messages（LLM 上下文不含 thinking）。
-                if accumulated_reasoning:
-                    add_chat(self.db, "thinking", accumulated_reasoning)
-                self.messages.append({'role': 'assistant', 'content': final_answer})
-                add_chat(self.db, 'assistant', final_answer)
+                self._persist_assistant_turn(final_answer, accumulated_reasoning)
                 total = pt + ct
                 ratio = _format_ratio(pt, ct)
                 cost = _estimate_cost(self._last_model, pt, ct)
                 up = chr(8593)
                 down = chr(8595)
-                yield {"type": "stats", "prompt_tokens": pt, "completion_tokens": ct, "model": self._last_model}
+                yield {"type": "stats", "prompt_tokens": pt, "completion_tokens": ct, "reasoning_tokens": rt, "model": self._last_model}
                 return
-            # thinking 先落库（顺序：thinking → assistant(tool_call) → tool）
-            if accumulated_reasoning:
-                add_chat(self.db, "thinking", accumulated_reasoning)
-            assistant_msg = {'role': 'assistant', 'content': accumulated_content or ''}
-            if tool_calls:
-                assistant_msg['tool_calls'] = tool_calls
-            self.messages.append(assistant_msg)
-            add_chat(self.db, 'assistant', accumulated_content or '', {'tool_calls': tool_calls})
-            killed = False
+            self._persist_assistant_turn(accumulated_content or "", accumulated_reasoning, tool_calls)
             stop_turn = False
             stop_turn_tool = ""
 
-            for i, tc in enumerate(tool_calls):
-                if killed:
-                    self.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": "tool is killed by user",
-                    })
-                    add_chat(self.db, "tool", "tool is killed by user", {"tool_call_id": tc["id"]})
-                    continue
-                # ── ESC pause check before each tool call ──
-                self._check_pause_point()
-                # ── Ctrl+C interrupt check before each tool call ──
-                try:
-                    self._check_interrupt()
-                except _InterruptTurn:
-                    # 中断：当前及剩余 tool_calls 标记 killed，正常返回
-                    for tc_rest in tool_calls[i:]:
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc_rest["id"],
-                            "content": "tool is killed by user",
-                        })
-                        add_chat(self.db, "tool", "tool is killed by user", {"tool_call_id": tc_rest["id"]})
-                    self._log_error("interrupt", self.session, "user interrupted turn")
-                    yield {"type": "interrupted"}
-                    return
-
-                tool_name = tc['function']['name']
-                tool_args_str = tc["function"]["arguments"]
-                try:
-                    tool_args = json.loads(tool_args_str)
-                except json.JSONDecodeError:
-                    # 修复:不再静默降级为 {}，而是把真实根因回传 LLM
-                    # 之前 LLM 只会看到 "missing 1 required positional argument"
-                    # 而不知道是自己的 arguments 输出非法，导致反复错误调用。
-                    result = ToolResult(
-                        error=(f"[参数解析失败] 工具 {tool_name} 的 arguments 不是合法 JSON："
-                               f"{tool_args_str!r}\n"
-                               f"请重新生成，arguments 必须是合法的 JSON 对象，"
-                               f"如 {{\"key\": \"value\"}}")
-                    )
-                    result_str = _tool_result_to_str(result)
-                    self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
-                    add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
-                    yield _tool_result_event(tool_name, result, 0.0)
-                    continue  # 跳过本次执行，直接处理下一个 tool_call
-
-                # 修复:类型校验，防止 LLM 输出字符串/列表等非对象参数
-                # （如 arguments='" &&"' 解析成 str，**str 会抛 TypeError）
-                if not isinstance(tool_args, dict):
-                    result = ToolResult(
-                        error=(f"[参数类型错误] 工具 {tool_name} 的 arguments 解析结果为 "
-                               f"{type(tool_args).__name__}，必须是 JSON 对象（dict）。"
-                               f"收到: {tool_args!r}")
-                    )
-                    result_str = _tool_result_to_str(result)
-                    self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
-                    add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
-                    yield _tool_result_event(tool_name, result, 0.0)
-                    continue
-
-                # ── 修复:必需键校验（P0 方案 B）──
-                # 类型校验只保证是 dict，但 arguments 可能是 {} 或缺关键字段
-                # （如 {"cmd": "..."} 少了 command），** 解包仍会报
-                # "missing positional argument"。按工具 schema 的 required
-                # 字段精确校验，给 LLM 明确的缺失清单。
-                _tool_def = self._find_tool(tool_name)
-                _required = (_tool_def.parameters.get("required") or []) if _tool_def else []
-                _missing = [k for k in _required if k not in tool_args]
-                if _missing:
-                    result = ToolResult(
-                        error=(f"[参数缺失] 工具 {tool_name} 缺少必需参数: {_missing}。"
-                               f"收到 arguments: {tool_args_str!r}\n"
-                               f"请重新生成，必须包含全部必需键: {_required}")
-                    )
-                    result_str = _tool_result_to_str(result)
-                    self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
-                    add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
-                    self._log_error("tool_args_missing", self.session,
-                                    f"tool={tool_name} missing={_missing} args={tool_args_str!r}")
-                    yield _tool_result_event(tool_name, result, 0.0)
-                    continue
-
-                yield {"type": "tool_call", "name": tool_name, "args": tool_args, "index": i, "total": len(tool_calls), "mode": self.mode}
-                tool = self._find_tool(tool_name)
-                t_elapsed = 0.0   # unknown tool 分支无执行耗时
-                if not tool:
-                    result = ToolResult(error=f'Unknown tool: {tool_name}')
-                    self._log_error("tool_unknown", self.session, f"tool={tool_name}")
-                else:
-                    t_start = time.time()
-                    self.phase = "idle"   # tool 执行期间不视为 LLM 处理（tool 并入 idle）
-                    self.in_tool = True    # 标记有 tool 正在执行
-                    self._in_tool_exec = True
+            if len(tool_calls) > 1:
+                # 多工具并行执行（2026-08-27 优化：耗时 = max 而非 sum）
+                for _ev in self._exec_tool_calls_parallel(tool_calls):
+                    yield _ev
+                if getattr(self, "_stop_turn_parallel", False):
+                    stop_turn = True
+                    stop_turn_tool = getattr(self, "_stop_turn_parallel_tool", "")
+                    self._stop_turn_parallel = False
+            else:
+                for i, tc in enumerate(tool_calls):
+                    # ── ESC pause check before each tool call ──
+                    self._check_pause_point()
+                    # ── Ctrl+C interrupt check before each tool call ──
                     try:
-                        # ── 方案2: 工具执行线程化 + 进度事件实时 yield ──
-                        # execute 移入后台线程（exec_pythonrt/exec_agent 内部读线程把
-                        # worker stdout 逐行 put 进 _tool_progress_q）；主循环轮询队列
-                        # yield tool_progress，使 web.py 前端实时看到工具执行进度。
-                        # 中断语义（与旧 KeyboardInterrupt 分支等价）：Ctrl+C →
-                        # _check_esc 置 _interrupt_event → tools.py 轮询 kill worker →
-                        # execute 返回 exit_code=130 的 ToolResult → 本循环正常收尾。
-                        import queue as _queue
-                        self._tool_progress_q = _queue.Queue()
-                        _holder: dict = {}
+                        self._check_interrupt()
+                    except _InterruptTurn:
+                        # 中断：当前及剩余 tool_calls 标记 killed，正常返回
+                        for tc_rest in tool_calls[i:]:
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc_rest["id"],
+                                "content": "tool is killed by user",
+                            })
+                            add_chat(self.db, "tool", "tool is killed by user", {"tool_call_id": tc_rest["id"]})
+                        self._log_error("interrupt", self.session, "user interrupted turn")
+                        yield {"type": "interrupted"}
+                        return
 
-                        def _exec_tool():
-                            try:
-                                logger.debug(f"[流式] 工具执行: {tool_name}")
-                                _holder["result"] = tool.execute(**tool_args)
-                            except KeyboardInterrupt:
-                                _holder["result"] = ToolResult(error="tool is killed by user")
-                            except Exception as e:
-                                self._log_error("tool_exec", self.session,
-                                                f"tool={tool_name} args={tool_args!r} error={e}")
-                                _holder["result"] = ToolResult(error=str(e))
+                    tool_name = tc['function']['name']
+                    # ── 工具注入白名单（2026-08-27）：拦截未注入工具的直接调用 ──
+                    if tool_name not in self._run_tool_names:
+                        _injected = sorted(self._run_tool_names)
+                        result = ToolResult(
+                            error=f"[工具未注入] '{tool_name}' 不在本次注入工具集 {_injected} 中。"
+                                  f"请改用 tools 工具的对应数组调用（如 pythonrt: [...]）。")
+                        result_str = _tool_result_to_str(result)
+                        self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
+                        add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
+                        self._sync_db()
+                        yield _tool_result_event(tool_name, result, 0.0)
+                        continue
+                    tool_args_str = tc["function"]["arguments"]
+                    try:
+                        tool_args = json.loads(tool_args_str)
+                    except json.JSONDecodeError:
+                        # 修复:不再静默降级为 {}，而是把真实根因回传 LLM
+                        # 之前 LLM 只会看到 "missing 1 required positional argument"
+                        # 而不知道是自己的 arguments 输出非法，导致反复错误调用。
+                        result = ToolResult(
+                            error=(f"[参数解析失败] 工具 {tool_name} 的 arguments 不是合法 JSON："
+                                   f"{tool_args_str!r}\n"
+                                   f"请重新生成，arguments 必须是合法的 JSON 对象，"
+                                   f"如 {{\"key\": \"value\"}}")
+                        )
+                        result_str = _tool_result_to_str(result)
+                        self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
+                        add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
+                        # ── 工具执行完成：即时落盘 ──
+                        self._sync_db()
+                        yield _tool_result_event(tool_name, result, 0.0)
+                        continue  # 跳过本次执行，直接处理下一个 tool_call
 
-                        _exec_thread = threading.Thread(target=_exec_tool, daemon=True)
-                        _exec_thread.start()
-                        _prog_idx = 0
-                        while _exec_thread.is_alive():
-                            self._check_esc()   # Ctrl+C → 置中断事件（tools.py kill worker）
+                    # 修复:类型校验，防止 LLM 输出字符串/列表等非对象参数
+                    # （如 arguments='" &&"' 解析成 str，**str 会抛 TypeError）
+                    if not isinstance(tool_args, dict):
+                        result = ToolResult(
+                            error=(f"[参数类型错误] 工具 {tool_name} 的 arguments 解析结果为 "
+                                   f"{type(tool_args).__name__}，必须是 JSON 对象（dict）。"
+                                   f"收到: {tool_args!r}")
+                        )
+                        result_str = _tool_result_to_str(result)
+                        self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
+                        add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
+                        # ── 工具执行完成：即时落盘 ──
+                        self._sync_db()
+                        yield _tool_result_event(tool_name, result, 0.0)
+                        continue
+
+                    # ── 修复:必需键校验（P0 方案 B）──
+                    # 类型校验只保证是 dict，但 arguments 可能是 {} 或缺关键字段
+                    # （如 {"cmd": "..."} 少了 command），** 解包仍会报
+                    # "missing positional argument"。按工具 schema 的 required
+                    # 字段精确校验，给 LLM 明确的缺失清单。
+                    _tool_def = self._find_tool(tool_name)
+                    _required = (_tool_def.parameters.get("required") or []) if _tool_def else []
+                    _missing = [k for k in _required if k not in tool_args]
+                    if _missing:
+                        result = ToolResult(
+                            error=(f"[参数缺失] 工具 {tool_name} 缺少必需参数: {_missing}。"
+                                   f"收到 arguments: {tool_args_str!r}\n"
+                                   f"请重新生成，必须包含全部必需键: {_required}")
+                        )
+                        result_str = _tool_result_to_str(result)
+                        self.messages.append({'role': 'tool', 'tool_call_id': tc['id'], 'content': result_str})
+                        add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
+                        # ── 工具执行完成：即时落盘 ──
+                        self._sync_db()
+                        self._log_error("tool_args_missing", self.session,
+                                        f"tool={tool_name} missing={_missing} args={tool_args_str!r}")
+                        yield _tool_result_event(tool_name, result, 0.0)
+                        continue
+
+                    yield {"type": "tool_call", "name": tool_name, "args": tool_args, "index": i, "total": len(tool_calls), "mode": self.mode}
+                    tool = self._find_tool(tool_name)
+                    t_elapsed = 0.0   # unknown tool 分支无执行耗时
+                    if not tool:
+                        result = ToolResult(error=f'Unknown tool: {tool_name}')
+                        self._log_error("tool_unknown", self.session, f"tool={tool_name}")
+                    else:
+                        t_start = time.time()
+                        self.phase = "idle"   # tool 执行期间不视为 LLM 处理（tool 并入 idle）
+                        self.in_tool = True    # 标记有 tool 正在执行
+                        self._in_tool_exec = True
+                        try:
+                            # ── 方案2: 工具执行线程化 + 进度事件实时 yield ──
+                            # execute 移入后台线程（exec_pythonrt/exec_agent 内部读线程把
+                            # worker stdout 逐行 put 进 _tool_progress_q）；主循环轮询队列
+                            # yield tool_progress，使 web.py 前端实时看到工具执行进度。
+                            # 中断语义（与旧 KeyboardInterrupt 分支等价）：Ctrl+C →
+                            # _check_esc 置 _interrupt_event → tools.py 轮询 kill worker →
+                            # execute 返回 exit_code=130 的 ToolResult → 本循环正常收尾。
+                            import queue as _queue
+                            self._tool_progress_q = _queue.Queue()
+                            _holder: dict = {}
+
+                            def _exec_tool():
+                                try:
+                                    logger.debug(f"[流式] 工具执行: {tool_name}")
+                                    _holder["result"] = tool.execute(**tool_args)
+                                except KeyboardInterrupt:
+                                    _holder["result"] = ToolResult(error="tool is killed by user")
+                                except Exception as e:
+                                    self._log_error("tool_exec", self.session,
+                                                    f"tool={tool_name} args={tool_args!r} error={e}")
+                                    _holder["result"] = ToolResult(error=str(e))
+
+                            _exec_thread = threading.Thread(target=_exec_tool, daemon=True)
+                            _exec_thread.start()
+                            _prog_idx = 0
+                            while _exec_thread.is_alive():
+                                self._check_esc()   # Ctrl+C → 置中断事件（tools.py kill worker）
+                                if self._interrupt_event.is_set():
+                                    self.interrupt_tool()
+                                try:
+                                    while True:
+                                        _s, _l = self._tool_progress_q.get_nowait()
+                                        _prog_idx += 1
+                                        yield {"type": "tool_progress", "name": tool_name,
+                                               "line": _l, "idx": _prog_idx, "stream": _s}
+                                except _queue.Empty:
+                                    pass
+                                time.sleep(0.05)
+                            # 收尾 drain 残留进度行（线程结束后队列可能还有积压）
                             try:
                                 while True:
                                     _s, _l = self._tool_progress_q.get_nowait()
@@ -2576,47 +3054,53 @@ class Agent:
                                            "line": _l, "idx": _prog_idx, "stream": _s}
                             except _queue.Empty:
                                 pass
-                            time.sleep(0.05)
-                        # 收尾 drain 残留进度行（线程结束后队列可能还有积压）
-                        try:
-                            while True:
-                                _s, _l = self._tool_progress_q.get_nowait()
-                                _prog_idx += 1
-                                yield {"type": "tool_progress", "name": tool_name,
-                                       "line": _l, "idx": _prog_idx, "stream": _s}
-                        except _queue.Empty:
-                            pass
-                        result = _holder.get("result", ToolResult(error="tool execute 无返回"))
-                    finally:
-                        self._tool_progress_q = None   # 清理：tools.py getattr 后不再回调
-                        self._in_tool_exec = False
-                        self.in_tool = False   # tool 执行结束
-                    t_elapsed = time.time() - t_start
+                            result = _holder.get("result", ToolResult(error="tool execute 无返回"))
+                        finally:
+                            self._tool_progress_q = None   # 清理：tools.py getattr 后不再回调
+                            self._in_tool_exec = False
+                            self.in_tool = False   # tool 执行结束
+                        t_elapsed = time.time() - t_start
 
-                result_str = _tool_result_to_str(result)
-                yield _tool_result_event(tool_name, result, t_elapsed)
+                    result_str = _tool_result_to_str(result)
+                    yield _tool_result_event(tool_name, result, t_elapsed)
 
-                self.messages.append({
-                    'role': 'tool',
-                    'tool_call_id': tc['id'],
-                    'content': result_str,
-                })
-                add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
-                # ── summary 工具成功 → 终止本轮（stop_turn 通用收尾标记）──
-                if getattr(result, "stop_turn", False):
-                    stop_turn = True
-                    stop_turn_tool = tool_name
-                    # 剩余 tool_calls 未执行 → 补 tool 响应（协议成对，与 interrupt 分支同构；
-                    # 避免 assistant 声明 N 个 tool_calls 却只有部分 tool 响应 → API 400）
-                    for tc_rest in tool_calls[i + 1:]:
-                        _skip_note = "tool is skipped (summary ended turn)"
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc_rest["id"],
-                            "content": _skip_note,
-                        })
-                        add_chat(self.db, "tool", _skip_note, {"tool_call_id": tc_rest["id"]})
-                    break
+                    self.messages.append({
+                        'role': 'tool',
+                        'tool_call_id': tc['id'],
+                        'content': result_str,
+                    })
+                    add_chat(self.db, 'tool', result_str, {'tool_call_id': tc['id']})
+                    # ── 工具执行完成：即时落盘 ──
+                    self._sync_db()
+                    try:
+                        self._check_interrupt()
+                    except _InterruptTurn:
+                        for tc_rest in tool_calls[i + 1:]:
+                            _skip_note = "tool is skipped (interrupted)"
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc_rest["id"],
+                                "content": _skip_note,
+                            })
+                            add_chat(self.db, "tool", _skip_note, {"tool_call_id": tc_rest["id"]})
+                        self._log_error("interrupt", self.session, f"user interrupted after tool={tool_name}")
+                        yield {"type": "interrupted"}
+                        return
+                    # ── summary 工具成功 → 终止本轮（stop_turn 通用收尾标记）──
+                    if getattr(result, "stop_turn", False):
+                        stop_turn = True
+                        stop_turn_tool = tool_name
+                        # 剩余 tool_calls 未执行 → 补 tool 响应（协议成对，与 interrupt 分支同构；
+                        # 避免 assistant 声明 N 个 tool_calls 却只有部分 tool 响应 → API 400）
+                        for tc_rest in tool_calls[i + 1:]:
+                            _skip_note = "tool is skipped (summary ended turn)"
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc_rest["id"],
+                                "content": _skip_note,
+                            })
+                            add_chat(self.db, "tool", _skip_note, {"tool_call_id": tc_rest["id"]})
+                        break
 
             
             if stop_turn:
@@ -2624,122 +3108,3 @@ class Agent:
                        "key": getattr(self, "_exit_note", "")}
                 return
 
-    def run_stream_compact(self):
-        """压缩专用流程：独立于 run_stream 的压缩回合执行。
-
-        为什么独立（而非给 run_stream 加参数）：
-          1. 压缩不需要技能选择/工具调用/建议技能元信息——注入只会污染总结
-          2. 需要专用 system prompt（system_prompt_compact.txt）约束结构化输出
-          3. 历史以单条打包消息传入，压缩指令本身不写入 self.messages
-        事件协议与 run_stream 一致（text/stats/error/interrupted），
-        正常完成后由 run_forever 调用 _finalize_compact() 写 marker 收尾。
-        """
-        logger.info(f"run_stream_compact() 开始: messages={len(self.messages)}")
-        # ── 观察者模式 gate: 与 run_stream 一致 ──
-        if self._observing:
-            logger.warning(f"观察者模式拒绝输入: session={self.session} 被其他进程占用")
-            yield {"type": "blocked", "reason": "session 已被其他进程占用（观察者只读模式）"}
-            return
-        # ── 压缩回合中断检查（进入流式前）──
-        try:
-            self._check_interrupt()
-        except _InterruptTurn:
-            self._log_error("interrupt", self.session, "user interrupted turn")
-            yield {"type": "interrupted"}
-            return
-
-        # ── 构建压缩专用 system prompt + 历史单条打包 ──
-        compact_prompt = _build_compact_prompt()
-        history_json = json.dumps(
-            [{"role": m["role"], "content": m.get("content", "")}
-             for m in self.messages],
-            ensure_ascii=False, indent=2,
-        )
-        full_messages = [
-            {"role": "system", "content": compact_prompt},
-            {"role": "user", "content": (
-                COMPACT_PROMPT + "\n\n--- Conversation History ---\n" + history_json
-            )},
-        ]
-
-        # ── 流式压缩（无 tools，不触发技能选择）──
-        self.phase = "llm"
-        yield {"type": "thinking"}
-        accumulated_content = ""
-        first_token = True
-        try:
-            stream_gen = complete_stream(
-                messages=full_messages,
-                model=self.model,
-                provider=self.provider,
-                reasoning_effort=self._resolve_effort(),
-                tools=None,
-                interrupt_event=self._interrupt_event,
-            )
-            while True:
-                chunk = next(stream_gen)
-                if chunk["type"] == "text":
-                    if first_token:
-                        yield {"type": "clear_thinking"}
-                        first_token = False
-                    accumulated_content += chunk["delta"]
-                    yield {"type": "text", "data": chunk["delta"]}
-                    self._check_pause_point()
-                    self._check_interrupt()
-                elif chunk["type"] == "reasoning":
-                    yield {"type": "thinking_content", "data": chunk["delta"]}
-        except _InterruptTurn:
-            try:
-                stream_gen.close()
-            except Exception:
-                pass
-            self._log_error("interrupt", self.session, "user interrupted turn")
-            yield {"type": "interrupted"}
-            return
-        except StopIteration as e:
-            full_content, extras = e.value
-            accumulated_reasoning = (extras.get("reasoning_content") or "").strip()
-            # ── 中断标记检测（与 run_stream B1 修复一致）──
-            if self._interrupt_event.is_set() or extras.get("interrupted"):
-                self._interrupt_event.clear()
-                self._log_error("interrupt", self.session, "user interrupted turn")
-                yield {"type": "interrupted"}
-                return
-            if not accumulated_content and full_content:
-                accumulated_content = full_content
-        except Exception as e:
-            self._log_error("llm_stream", self.session, f"error={e}")
-            yield {"type": "error", "data": f"LLM call failed: {e}"}
-            return
-
-        summary = _sanitize(accumulated_content).strip()
-        if not summary:
-            logger.warning("压缩回合未产生总结内容")
-            yield {"type": "error", "data": "压缩失败：LLM 未生成总结内容"}
-            return
-
-        # ── 与 run_stream 一致：总结作为 assistant 消息写入历史 + DB ──
-        # 供 run_forever 在 turn_ok 时调用 _finalize_compact() 取用收尾
-        if accumulated_reasoning:
-            add_chat(self.db, "thinking", accumulated_reasoning)
-        self.messages.append({"role": "assistant", "content": summary})
-        add_chat(self.db, "assistant", summary)
-
-        # ── usage 统计（对齐 run_stream）──
-        usage = extras.get("usage", {})
-        pt = usage.get("prompt_tokens", 0)
-        ct = usage.get("completion_tokens", 0)
-        self.total_prompt_tokens += pt
-        self.total_completion_tokens += ct
-        self._last_model = extras.get("model", self.model or "")
-        self._turn_count += 1
-        self._turn_usage_history.append({
-            "prompt": pt, "completion": ct,
-            "turn": self._turn_count, "model": self._last_model,
-            "tool_calls": 0,
-        })
-
-        # ── 压缩轮也是 LLM 调用，同步持久化 token 累计值 ──
-        self._persist_token_state()
-        yield {"type": "stats", "prompt_tokens": pt, "completion_tokens": ct, "model": self._last_model}
-        return

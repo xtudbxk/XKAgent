@@ -16,12 +16,15 @@ _log.py — 标准库 logging 全局日志配置（由 loguru 迁移）
     禁用 logging.handlers —— 其顶层 import pickle，被 pythonrt 受限沙箱拦截。
   - rotation="100 MB" / retention="7 days" 由轻量 _SizeRotatingFileHandler
     近似实现（maxBytes=100MB, backupCount=7），不依赖第三方库。
-  - enqueue(异步) 降级为同步写（logging 自带线程锁，线程安全）；
+  - 2026-08-22 起恢复异步写：_AsyncLogHandler（队列 + 后台写线程）
+    实现 enqueue 语义——磁盘 IO 卡顿时不再阻塞调用方（含事件循环）；
     backtrace/diagnose 由 logger.exception 的 traceback 近似；
     colorize 降级为纯文本。
 """
 
 import sys
+import queue
+import threading
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -71,6 +74,86 @@ class _SizeRotatingFileHandler(logging.FileHandler):
         self.stream = self._open()
 
 
+class _SessionFileRouter(logging.Handler):
+    """将已绑定 Agent 线程的日志复制到其固定 workdir。"""
+
+    def __init__(self, formatter, start_time: str):
+        super().__init__(logging.DEBUG)
+        self._formatter = formatter
+        self._start_time = start_time
+        self._handlers = {}
+
+    def emit(self, record):
+        # 异步化（2026-08-22）：后台写线程调用，无法读取原线程的 session context
+        # （thread-local），必须使用入队时快照到 record._xk_ctx 的元组；无快照时
+        # 回退到当前线程 context（兼容直接调用场景）。
+        ctx = getattr(record, "_xk_ctx", None)
+        if ctx is None:
+            context = _config.get_active_session_context()
+            if context is None:
+                return
+            name, workdir, log_dir = context.name, str(context.workdir), str(context.log_dir)
+        else:
+            name, workdir, log_dir = ctx
+        key = (name, workdir)
+        handler = self._handlers.get(key)
+        if handler is None:
+            log_dir = Path(log_dir) / name
+            log_dir.mkdir(parents=True, exist_ok=True)
+            handler = _SizeRotatingFileHandler(str(log_dir / f"{self._start_time}.log"))
+            handler.setLevel(logging.DEBUG)
+            handler.setFormatter(self._formatter)
+            self._handlers[key] = handler
+        handler.emit(record)
+
+
+class _AsyncLogHandler(logging.Handler):
+    """异步日志 handler：emit 仅入队（微秒级），后台线程统一写盘。
+
+    2026-08-22 修复（xk_fix 切换卡顿根因）：日志同步写盘在磁盘 IO 卡顿时，
+    写线程持 logging handler 锁阻塞在 write —— 事件循环中所有要打日志的
+    协程（每个请求）全部等锁，局部磁盘慢被放大为全服务冻结。
+    改为队列 + 后台 daemon 写线程：磁盘卡只阻塞写线程，不阻塞调用方。
+    队列满（maxsize=20000）时丢弃新日志并计数（丢日志优于阻塞/内存爆炸）。
+    """
+
+    def __init__(self, file_handler, router, maxsize: int = 20000):
+        super().__init__(logging.DEBUG)
+        self._file_handler = file_handler
+        self._router = router
+        self._queue = queue.Queue(maxsize=maxsize)
+        self._dropped = 0
+        self._thread = threading.Thread(target=self._worker, name="log-writer", daemon=True)
+        self._thread.start()
+
+    def emit(self, record):
+        # 快照 session context（thread-local，后台写线程取不到原线程值）
+        try:
+            context = _config.get_active_session_context()
+            if context is not None:
+                record._xk_ctx = (context.name, str(context.workdir), str(context.log_dir))
+        except Exception:
+            pass
+        try:
+            self._queue.put_nowait(record)
+        except queue.Full:
+            self._dropped += 1
+
+    def _worker(self):
+        while True:
+            try:
+                record = self._queue.get()
+            except Exception:
+                return
+            if record is None:
+                return
+            try:
+                self._file_handler.emit(record)
+                self._router.emit(record)
+            except Exception:
+                pass  # 写盘失败不致命；此处禁止打日志（递归入队）
+
+
 # ── 全局 logger（名称 "codes"，防重复配置） ──
 logger = logging.getLogger("codes")
 logger.setLevel(logging.DEBUG)
@@ -92,10 +175,13 @@ if not logger.handlers:  # 幂等：重复导入/多线程不重复挂 handler
     _formatter = logging.Formatter(LOG_FORMAT, datefmt=_DATE_FMT)
 
     # ── 文件 Handler（DEBUG+，大小轮转近似 rotation/retention） ──
+    # 2026-08-22 异步化：文件 handler 与 session router 由 _AsyncLogHandler
+    # 后台写线程统一消费，磁盘 IO 卡顿不再阻塞调用方（含事件循环协程）。
     _file_handler = _SizeRotatingFileHandler(str(LOG_FILE))
     _file_handler.setLevel(logging.DEBUG)
     _file_handler.setFormatter(_formatter)
-    logger.addHandler(_file_handler)
+    _async_handler = _AsyncLogHandler(_file_handler, _SessionFileRouter(_formatter, _start_time_str))
+    logger.addHandler(_async_handler)
 
     # ── 控制台 Handler（INFO+，终端实时可见） ──
     STDERR_HANDLER_ID = logging.StreamHandler(sys.stderr)
@@ -112,16 +198,24 @@ def set_stderr_level(level: str | int) -> None:
         STDERR_HANDLER_ID.setLevel(level)
 
 
-def get_log_file() -> str:
-    """返回当前进程对应的日志文件绝对路径（/logfile 命令用）。
+def get_log_file(session: str | None = None) -> str:
+    """返回 session 日志；未指定或尚无 session 日志时返回进程日志。
 
     设计考虑: LOG_FILE 在模块导入时按启动时间生成，与本次进程一一对应；
     /logfile 直接引用它，保证"查看的就是本次运行写入的那个文件"。
     """
+    if session:
+        try:
+            context = _config.get_session_context(session)
+            files = sorted((context.log_dir / session).glob("????-??-??_??-??-??.log"), reverse=True)
+            if files:
+                return str(files[0])
+        except Exception:
+            pass
     return str(LOG_FILE)
 
 
-def tail_log_file(n: int = 60) -> str:
+def tail_log_file(n: int = 60, session: str | None = None) -> str:
     """读取当前日志文件尾部 n 行，供 /logfile 命令展示（避免整读大文件）。
 
     参数:
@@ -130,7 +224,7 @@ def tail_log_file(n: int = 60) -> str:
         字符串（行间用换行连接）；读取失败返回错误提示而非抛异常。
     """
     try:
-        lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = Path(get_log_file(session)).read_text(encoding="utf-8", errors="replace").splitlines()
         return "\n".join(lines[-n:])
     except Exception as e:
         return f"<读取日志失败: {e}>"

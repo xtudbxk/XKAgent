@@ -9,7 +9,7 @@ The Agent engine turns a user message into a complete turn: it adds the current 
 ```text
 User input
   → Parse @paths and remove invalid characters
-  → Inject the turn's status and write it to the session SQLite database
+  → Inject the turn's status and write it to the session msgz store
   → Optionally select a Skill and inject its instructions
   → Receive LLM reasoning, text, tool calls, and usage
   → Validate and execute tools in sequence, then write results back to history
@@ -25,9 +25,11 @@ The model may return multiple tool calls in one response, which the engine execu
 
 XKAgent does not rely only on a fixed system prompt. Every user message is accompanied by the current local time, runtime mode, workdir and mount permissions, suggested Skills, recommended information, and any one-time request for a Skill explicitly named by the user. This prefix is persisted with the message, allowing a restored session to reconstruct the state the model saw at the time. The frontend removes the prefix for display and shows only the original message body.
 
+The prefix also carries a **session-level writable Status Info board**: the Agent maintains small key-value entries (progress, preferences, agreements, lessons) with the `addinfo` / `listinfo` / `rminfo` tools, and users can do the same through the `/addinfo` command family. When non-empty, it is attached to the prefix as a Status Info block and remains effective after `/compact`. The division of labor with `summary`: short runtime state lives on the board (visible every turn), while long-form conclusions go to `summary` documents.
+
 Status only tells the model where it is and what it can do; it does not enforce permissions. Actual path, import, and process restrictions are enforced by the `pythonrt` runtime. The long-running task orchestration and full long-term Memory described in [README](../../README.md) remain on the Roadmap. What exists today is status injection, retrieval-based recommendations, document persistence through `summary`, and session history persistence. These must not be treated as a complete Memory system.
 
-When automatic Skill selection is enabled, the engine makes an additional LLM call to choose a Skill. On first use, the complete `skill.md` is injected; subsequent turns may inject only a semantic anchor if the version has not changed. When selection is disabled, the engine still builds the basic status but does not make this extra selection call.
+Skill candidates are matched locally by the engine (body text plus frontmatter description/triggers) and injected with Status—no extra model call is made. To follow a Skill workflow, the Agent loads its full text with the `selectskill` tool: the first load injects the complete `skill.md`, and later turns for the same version switch to a semantic anchor to save tokens.
 
 ## Modes and Interruption
 
@@ -39,11 +41,13 @@ Ctrl+C propagates through a thread-safe Event. The LLM stream checks it approxim
 
 ## Multi-Session Isolation
 
-Each session has its own SQLite database, input and output Queues, and Agent thread. `AgentManager` can retain multiple threads concurrently, but input and UI reads target only the currently focused session. Changing focus does not stop other sessions that are still working.
+Each session has its own msgz store, input and output Queues, and Agent thread. `AgentManager` can retain multiple threads concurrently, but input and UI reads target only the currently focused session. Changing focus does not stop other sessions that are still working.
 
 Provider, model, token statistics, dynamic mounts, search ranges, and other state are stored per session. Later input or control commands can restart a thread after an unexpected exit, and the manager may reclaim idle threads that are not currently focused.
 
 When different processes open the same session, a lease lock protects session writes. An instance that cannot acquire the lock enters observer mode: it can synchronize and read external changes but rejects new LLM input and write commands. It can attempt takeover after the lock expires. This mechanism preserves session consistency; it is not a workspace file lock or sandbox.
+
+Sessions can also collaborate with each other: the `callagent` tool writes an asynchronous mail into the global `mail.jsonl` bus, and `MailPostman` delivers it to the target session round by round (supporting delayed/absolute wake-ups, priority, reply chains, and broadcasts). See [11 · Multi-Agent Communication](11-multi-agent-communication.md).
 
 ## Sub-Agents
 
@@ -55,15 +59,15 @@ The worker implements a multi-step tool loop, an overall timeout, interruption, 
 
 ## Compact, Drop, and Restart
 
-`/compact` uses a dedicated system prompt to start an independent LLM turn without tools or Skill selection, compressing the current history into a summary. Only after the streamed summary completes successfully does it write a compact marker, replace the in-memory context, and attempt to save the summary under `.xkagent/docs/<session>/`. Old messages are not deleted from SQLite, and a failure or interruption leaves the original context unchanged.
+`/compact` uses a dedicated system prompt to start an independent LLM turn without tools or Skill selection, compressing the current history into a summary. Only after the streamed summary completes successfully does it write a compact marker, replace the in-memory context, and attempt to save the summary under `.xkagent/docs/<session>/`. Old messages are not deleted from the msgz store, and a failure or interruption leaves the original context unchanged.
 
-`/drop` does not call the LLM. It writes a drop marker and replaces the in-memory context with a synthetic message stating that the history was discarded. Old records remain in the database but are no longer included in later model context, so this is not secure deletion.
+`/drop` does not call the LLM. It writes a drop marker and replaces the in-memory context with a synthetic message stating that the history was discarded. Old records remain in the session store but are no longer included in later model context, so this is not secure deletion.
 
 `/restart` restarts the process and reloads code and session state. It does not compact or clear context, nor does it undo file changes. It first attempts to replace the process with `os.execv`; where that is unsupported, it starts a new process and exits the old one.
 
 ## Current Capabilities and Roadmap
 
-The current implementation includes single-turn tool loops, streamed events, status injection, SQLite-backed sessions, multi-session thread management, observer mode, interruption, sub-Agents, and compact/drop/restart.
+The current implementation includes single-turn tool loops, streamed events, status injection, msgz-backed sessions, multi-session thread management, observer mode, interruption, sub-Agents, and compact/drop/restart.
 
 Full long-running task scheduling, long-term Memory, global tree-based sub-Agent orchestration, transactional file rollback, and secure deletion of sensitive history have not been implemented. Compact and drop only alter the context view used in subsequent turns, while `/restart` handles only the process lifecycle. These features do not replace the corresponding Roadmap capabilities.
 
@@ -74,3 +78,4 @@ Full long-running task scheduling, long-term Memory, global tree-based sub-Agent
 - [07 · Skills](07-skills.md): Skill selection, full-text injection, and anchors
 - [08 · Search and Memory](08-search-and-memory.md): recommended information, summary, and compact documents
 - [09 · Command System](09-commands.md): session, compact, drop, and restart commands
+- [11 · Multi-Agent Communication](11-multi-agent-communication.md): callagent mail and cross-session collaboration

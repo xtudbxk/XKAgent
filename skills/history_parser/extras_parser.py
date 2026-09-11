@@ -1,3 +1,4 @@
+# deps: stdlib only
 """history_parser — extras 字段解析工具
 
 解析 messages 表中 extras (JSON) 字段的结构化信息，包括:

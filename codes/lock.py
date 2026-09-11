@@ -1,11 +1,11 @@
-"""XKAgent — mkdir-lease based cross-container lock manager for SQLite sessions.
+"""XKAgent — mkdir-lease based cross-container lock manager for agent sessions.
 
 跨容器文件锁：用目录原子创建（os.mkdir）实现跨客户端互斥，
 替代 flock（flock 在 NFS 上不跨容器互斥，导致多容器同时持有同一 session 锁）。
 
 锁模型
 -------
-锁 = ``{session}.db.lockdir/`` 目录的存在与否（NFS 服务器端原子，多容器并发
+锁 = ``{session}.lockdir/`` 目录的存在与否（NFS 服务器端原子，多容器并发
 mkdir 仅一个成功，其余收到 FileExistsError）。
 
 - ``owner.json``: 持有者 metadata（instance_id/pid/thread_id/hostname/locked_at）
@@ -29,6 +29,7 @@ import threading
 import time
 import uuid
 from codes import config as _config
+from codes import session_registry as _registry
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -76,9 +77,12 @@ _heartbeats: dict[str, dict] = {}
 
 # ── 路径 ────────────────────────────────────────────────────────────
 
-def _lockdir(session: str) -> str:
-    """锁目录路径：{session}.db.lockdir/ 存在即持锁。"""
-    return str(_config.get_historys_dir() / f"{session}.db.lockdir")
+def _lockdir(session: str, ensure: bool = False) -> str:
+    """锁目录路径：{session}.lockdir/ 存在即持锁。"""
+    context = _registry.resolve(session, _config.get_default_workdir())
+    if ensure:
+        context.ensure()
+    return str(context.history_dir / f"{session}.lockdir")
 
 
 # ── owner.json 读写 ─────────────────────────────────────────────────
@@ -249,7 +253,7 @@ def acquire(session: str, holder_pid: int, holder_name: str,
         (True, lock_ctx) 成功；lock_ctx = {"session", "lockdir", "instance_id"}
         (False, error_message) 失败（他人持有）
     """
-    lockdir = _lockdir(session)
+    lockdir = _lockdir(session, ensure=True)
     meta = {
         "pid": holder_pid,
         "thread_id": thread_id,
@@ -280,6 +284,18 @@ def acquire(session: str, holder_pid: int, holder_name: str,
             f.write(json.dumps(meta, ensure_ascii=False))
     except (FileExistsError, FileNotFoundError):
         return False, "Lock busy"
+    except OSError as e:
+        # mkdir 已由本次 acquire 创建；owner 写失败时立即回滚，避免留下需等待
+        # STALE_TIMEOUT 才能恢复的孤儿 lockdir。
+        try:
+            os.unlink(owner)
+        except OSError:
+            pass
+        try:
+            os.rmdir(lockdir)
+        except OSError:
+            pass
+        return False, f"Cannot write lock owner: {e}"
     try:
         os.utime(owner)
     except OSError:
@@ -407,15 +423,12 @@ def cleanup_all() -> int:
     int
         实际清理的 lockdir 数量（幂等：不存在的自动跳过）。
     """
-    hist_dir = _config.get_historys_dir()
-    if not os.path.isdir(hist_dir):
-        return 0
     n = 0
-    for name in sorted(os.listdir(hist_dir)):
-        if name.endswith(".db.lockdir"):
-            session = name[: -len(".db.lockdir")]
+    for context in _registry.list_contexts():
+        lockdir = context.history_dir / f"{context.name}.lockdir"
+        if lockdir.is_dir():
             try:
-                ok, _ = cleanup(session)
+                ok, _ = cleanup(context.name)
                 if ok:
                     n += 1
             except Exception:

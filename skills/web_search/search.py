@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# deps: stdlib only
 """
 统一搜索脚本 — 多源搜索（使用 stdlib，兼容 WASM 沙箱 + Host Callbacks）
 
@@ -10,8 +11,19 @@
     # 方式2: 用户 !xxx 或宿主直接执行
     python3 skills/web_search/search.py -s baidu "搜索词"
 
-依赖:
-    pip install requests  # 可选，仅宿主机调用时需要（HTML 解析用 stdlib html.parser，无需 bs4）
+Usage(沙箱双路径):
+    # 🔵🟢 plan/build 沙箱：importlib 动态加载（沙箱禁 import 项目内模块）
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location("search", "skills/web_search/search.py")
+    m = importlib.util.module_from_spec(spec); sys.modules["search"] = m
+    spec.loader.exec_module(m)
+    results = m.search_auto("示例搜索词")    # 智能路由（推荐）
+    results = m.search_baidu("示例搜索词")   # 单源搜索
+    # 🔥 build-unsafe：from skills.web_search import search; search.search_baidu("搜索词")
+    # 或宿主 CLI：python3 skills/web_search/search.py -s baidu "搜索词"
+
+Deps:
+    stdlib only  # requests 可选，仅宿主机/CLI 需要（HTML 解析用 stdlib html.parser，无需 bs4）
 """
 
 
@@ -47,13 +59,24 @@ DEFAULT_DELAY = 1.0
 # 国内直连源（百度/搜狗微信/必应 cn）不受影响，即使配置了代理也保持直连。
 PROXY_CONFIG = {}  # {"http": url, "https": url}，None/空 = 直连
 
+__all__ = ["set_proxy", "set_http_request_callback", "search_baidu", "search_bing",
+           "search_google", "search_duckduckgo", "search_github", "search_arxiv",
+           "search_semantic_scholar", "search_wikipedia", "search_weixin_sogou",
+           "search_openalex", "search_crossref", "search_dblp", "search_sogou",
+           "search_so360", "search_bilibili", "search_csdn", "search_sourcegraph",
+           "search_auto", "format_output", "main"]
+
+
 def set_proxy(http: str | None = None, https: str | None = None):
     """显式设置代理。
 
-    用法:
-        search.set_proxy("http://127.0.0.1:7890")          # http/https 同代理
-        search.set_proxy("http://127.0.0.1:7890", "http://127.0.0.1:7890")
-        search.set_proxy(None)                               # 清除代理（恢复直连）
+    Args:
+        http (str | None): 代理地址 http（None=清除）
+        https (str | None): 代理地址 https（None=清除）
+    Returns:
+        None: 设置全局代理（无返回）
+    Example:
+        m.set_proxy("http://127.0.0.1:7890")
     """
     global PROXY_CONFIG
     if http is None and https is None:
@@ -83,12 +106,13 @@ _HTTP_REQUEST_CALLBACK = None
 
 def set_http_request_callback(cb):
     """设置 http_request 回调（供 WASM 沙箱内用户手动调用）
-    
-    注意：回调是 async 函数，需在 async 上下文中使用 await 调用。
-    此函数仅存储引用，不自动执行。
-    用法：
-        search.set_http_request_callback(http_request)
-        # 在 async 函数中:  r = await http_request(GET, url)
+
+    Args:
+        cb (str): http_request 异步回调函数（async）
+    Returns:
+        None: 存储回调引用（无返回）
+    Example:
+        m.set_http_request_callback(cb)
     """
     global _HTTP_REQUEST_CALLBACK
     _HTTP_REQUEST_CALLBACK = cb
@@ -336,7 +360,17 @@ def _safe_text(text, maxlen=200):
 # ── 各源搜索函数 ──────────────────────────────────────
 
 def search_baidu(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """百度搜索"""
+    """百度搜索
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_baidu("示例搜索词", max_results=5)
+    """
     params = {"wd": query, "rn": min(max_results, 50), "ie": "utf-8"}
     html = _fetch("http://www.baidu.com/s", params=params, timeout=timeout, source="baidu")
     if not html:
@@ -363,7 +397,17 @@ def search_baidu(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEO
 
 
 def search_bing(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """必应搜索"""
+    """必应搜索
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_bing("示例搜索词", max_results=5)
+    """
     params = {"q": query, "count": min(max_results, 50)}
     html = _fetch("https://www.bing.com/search", params=params, timeout=timeout, source="bing")
     if not html:
@@ -388,7 +432,17 @@ def search_bing(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOU
 
 
 def search_google(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """Google 搜索（失败自动 fallback 到 bing）"""
+    """Google 搜索（失败自动 fallback 到 bing）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_google("示例搜索词", max_results=5)
+    """
     params = {"q": query, "num": min(max_results, 50)}
     html = _fetch("https://www.google.com/search", params=params, timeout=timeout, source="google")
     if not html:
@@ -411,7 +465,17 @@ def search_google(query: str, max_results: int = 10, timeout: int = DEFAULT_TIME
 
 
 def search_duckduckgo(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """DuckDuckGo 搜索（失败自动 fallback 到 bing）"""
+    """DuckDuckGo 搜索（失败自动 fallback 到 bing）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_duckduckgo("示例搜索词", max_results=5)
+    """
     html = _fetch("https://html.duckduckgo.com/html/", params={"q": query}, timeout=timeout, source="duckduckgo")
     if not html:
         return search_bing(query, max_results, timeout)
@@ -435,7 +499,17 @@ def search_duckduckgo(query: str, max_results: int = 10, timeout: int = DEFAULT_
 
 
 def search_github(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """GitHub 仓库搜索（REST API）"""
+    """GitHub 仓库搜索（REST API）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_github("示例搜索词", max_results=5)
+    """
     params = {"q": query, "per_page": min(max_results, 50), "sort": "stars"}
     h = {**DEFAULT_HEADERS, "Accept": "application/vnd.github.v3+json"}
     html = _fetch("https://api.github.com/search/repositories", params=params, headers=h, timeout=timeout, source="github")
@@ -458,7 +532,17 @@ def search_github(query: str, max_results: int = 10, timeout: int = DEFAULT_TIME
 
 
 def search_arxiv(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """arXiv 学术论文搜索（Atom XML API）"""
+    """arXiv 学术论文搜索（Atom XML API）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_arxiv("示例搜索词", max_results=5)
+    """
     params = {"search_query": f"all:{query}", "max_results": min(max_results, 50),
               "sortBy": "relevance", "sortOrder": "descending"}
     xml_text = _fetch("https://export.arxiv.org/api/query", params=params, timeout=timeout, source="arxiv")
@@ -483,7 +567,17 @@ def search_arxiv(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEO
 
 
 def search_semantic_scholar(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """Semantic Scholar 学术搜索（REST API）"""
+    """Semantic Scholar 学术搜索（REST API）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_semantic_scholar("示例搜索词", max_results=5)
+    """
     params = {"query": query, "limit": min(max_results, 50),
               "fields": "title,url,publicationDate,abstract,citationCount"}
     h = {**DEFAULT_HEADERS, "Accept": "application/json"}
@@ -510,7 +604,17 @@ def search_semantic_scholar(query: str, max_results: int = 10, timeout: int = DE
 
 
 def search_wikipedia(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """Wikipedia 百科搜索（REST API）"""
+    """Wikipedia 百科搜索（REST API）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_wikipedia("示例搜索词", max_results=5)
+    """
     is_zh = _is_chinese(query)
     base = "https://zh.wikipedia.org/w/api.php" if is_zh else "https://en.wikipedia.org/w/api.php"
     params = {"action": "query", "list": "search", "srsearch": query,
@@ -533,7 +637,17 @@ def search_wikipedia(query: str, max_results: int = 10, timeout: int = DEFAULT_T
 
 
 def search_weixin_sogou(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """搜狗微信搜索"""
+    """搜狗微信搜索
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_weixin_sogou("示例搜索词", max_results=5)
+    """
     params = {"type": 2, "query": query, "ie": "utf8", "s_from": "input", "_sug_": "n"}
     html = _fetch("https://weixin.sogou.com/weixin", params=params, timeout=timeout, source="weixin_sogou")
     if not html:
@@ -565,7 +679,17 @@ def search_weixin_sogou(query: str, max_results: int = 10, timeout: int = DEFAUL
 # ── 新增学术 API 源（2026-08-07）──────────────────────
 
 def search_openalex(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """OpenAlex 开放学术图谱搜索（免费 REST API，无需 key）"""
+    """OpenAlex 开放学术图谱搜索（免费 REST API，无需 key）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_openalex("示例搜索词", max_results=5)
+    """
     params = {"search": query, "per-page": min(max_results, 50)}
     h = {**DEFAULT_HEADERS, "Accept": "application/json"}
     text = _fetch("https://api.openalex.org/works", params=params, headers=h,
@@ -607,7 +731,17 @@ def search_openalex(query: str, max_results: int = 10, timeout: int = DEFAULT_TI
 
 
 def search_crossref(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """Crossref 学术文献元数据搜索（免费 API，DOI 查询）"""
+    """Crossref 学术文献元数据搜索（免费 API，DOI 查询）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_crossref("示例搜索词", max_results=5)
+    """
     params = {"query": query, "rows": min(max_results, 50)}
     h = {**DEFAULT_HEADERS, "Accept": "application/json"}
     text = _fetch("https://api.crossref.org/works", params=params, headers=h,
@@ -641,7 +775,17 @@ def search_crossref(query: str, max_results: int = 10, timeout: int = DEFAULT_TI
 
 
 def search_dblp(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """DBLP 计算机科学论文搜索（免费 JSON API）"""
+    """DBLP 计算机科学论文搜索（免费 JSON API）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_dblp("示例搜索词", max_results=5)
+    """
     params = {"q": query, "format": "json", "h": min(max_results, 50)}
     h = {**DEFAULT_HEADERS, "Accept": "application/json"}
     text = _fetch("https://dblp.org/search/publ/api", params=params, headers=h,
@@ -683,7 +827,17 @@ def search_dblp(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOU
 # ── 国内 + 代码源（2026-08-07 第二批集成）────────────────
 
 def search_sogou(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """搜狗搜索（国内直连；反爬不稳定，可能返回 0）"""
+    """搜狗搜索（国内直连；反爬不稳定，可能返回 0）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_sogou("示例搜索词", max_results=5)
+    """
     params = {"query": query, "ie": "utf8"}
     html = _fetch("https://www.sogou.com/web", params=params, timeout=timeout, source="sogou")
     if not html:
@@ -709,7 +863,17 @@ def search_sogou(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEO
 
 
 def search_so360(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """360 搜索（国内直连）"""
+    """360 搜索（国内直连）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_so360("示例搜索词", max_results=5)
+    """
     params = {"q": query}
     html = _fetch("https://www.so.com/s", params=params, timeout=timeout, source="so360")
     if not html:
@@ -737,7 +901,17 @@ def search_so360(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEO
 
 
 def search_bilibili(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """B站 视频/专栏搜索（国内直连；JS 渲染不稳定）"""
+    """B站 视频/专栏搜索（国内直连；JS 渲染不稳定）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_bilibili("示例搜索词", max_results=5)
+    """
     params = {"keyword": query}
     html = _fetch("https://search.bilibili.com/all", params=params, timeout=timeout, source="bilibili")
     if not html:
@@ -767,7 +941,17 @@ def search_bilibili(query: str, max_results: int = 10, timeout: int = DEFAULT_TI
 
 
 def search_csdn(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """CSDN 技术博客搜索（JSON API，国内直连）"""
+    """CSDN 技术博客搜索（JSON API，国内直连）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_csdn("示例搜索词", max_results=5)
+    """
     params = {"q": query, "t": "all", "p": 1, "s": 0, "tm": 0, "lv": -1, "ft": 0, "l": query}
     h = {**DEFAULT_HEADERS, "Accept": "application/json"}
     text = _fetch("https://so.csdn.net/api/v3/search", params=params, headers=h,
@@ -794,7 +978,17 @@ def search_csdn(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOU
 
 
 def search_sourcegraph(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """Sourcegraph 代码搜索（GraphQL API，需代理）"""
+    """Sourcegraph 代码搜索（GraphQL API，需代理）
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        str: JSON 结果
+    Example:
+        m.search_sourcegraph("示例搜索词", max_results=5)
+    """
     q_safe = query.replace(chr(34), chr(92) + chr(34))
     gql = "query { search(query: \"" + q_safe + "\", version: V3) { results { matchCount results { __typename ... on FileMatch { file { path url repository { name } } } ... on Repository { name url } } } } }"
     body = json.dumps({"query": gql})
@@ -865,7 +1059,17 @@ def _try_search(source_name, func, query, max_results, timeout):
 
 
 def search_auto(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOUT) -> list[dict]:
-    """智能路由：按内容类型选择最优搜索源"""
+    """智能路由：按内容类型选择最优搜索源
+
+    Args:
+        query (str): 搜索关键词
+        max_results (int): 最大结果数（默认 10）
+        timeout (int): 超时秒数（默认 20）
+    Returns:
+        list[dict]: 多源合并去重后的搜索结果
+    Example:
+        m.search_auto("示例搜索词")
+    """
     is_zh = _is_chinese(query)
     has_code = bool(re.search(r'github|repo|pip|npm|install|api|sdk|module|library|package',
                                query, re.IGNORECASE))
@@ -898,16 +1102,26 @@ def search_auto(query: str, max_results: int = 10, timeout: int = DEFAULT_TIMEOU
         if len(all_results) >= max_results:
             break
     return all_results[:max_results]
-    return all_results[:max_results]
 
 
 # ── 格式化输出 ─────────────────────────────────────────
 
 def format_output(source: str, query: str, results: list[dict]) -> str:
+    """格式化搜索结果输出
+
+    Args:
+        source (str): 搜索源名（baidu/bing/...）
+        query (str): 搜索关键词
+        results (list[dict]): 搜索结果列表（list[dict]）
+    Returns:
+        str: 格式化文本（标题/摘要/链接分行）
+    Example:
+        m.format_output("baidu", "示例", results)
+    """
     lines = [f"━ [{source}] 查询: {query} ━"]
     if not results:
         lines.append("  未找到相关结果")
-        return "n".join(lines)
+        return "\n".join(lines)
     for i, r in enumerate(results, 1):
         lines.append(f"─── 结果 {i} ───")
         lines.append(f"  标题: {r.get('title', '')}")
@@ -916,12 +1130,21 @@ def format_output(source: str, query: str, results: list[dict]) -> str:
         if r.get('url'):
             lines.append(f"  链接: {r['url']}")
         lines.append("")
-    return "n".join(lines)
+    return "\n".join(lines)
 
 
 # ── CLI 入口 ───────────────────────────────────────────
 
 def main():
+    """CLI 入口（argparse 解析参数并执行搜索）
+
+    Args:
+        (无参数)
+    Returns:
+        None: CLI 入口（打印结果或退出码）
+    Example:
+        # CLI: python3 skills/web_search/search.py -s baidu "搜索词"
+    """
     parser = argparse.ArgumentParser(description="web_search — 多源搜索工具")
     parser.add_argument("-s", "--source", choices=SOURCE_NAMES + ["auto"],
                         default="auto", help="搜索源 (默认: auto)")

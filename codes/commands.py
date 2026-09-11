@@ -61,7 +61,7 @@ def cmd(*names: str, help_text: str = "", ui: tuple = ("repl", "web")):
     """命令注册装饰器。
 
     参数:
-        names: 命令名（第一个为主名，其余为别名，如 turnonskill/skillson）
+        names: 命令名（第一个为主名，其余为别名，如 skills/showskills）
         help_text: 帮助文本（/help 生成时使用）
         ui: 该命令可用的 UI 端（默认两端都可用）
     """
@@ -116,40 +116,20 @@ def run_cmd(mgr, cmd_name: str, args: dict | None = None, timeout: float = 5.0) 
     设计考虑: AgentManager.send_command 只保证入队成功（bool），执行结果
     必须靠轮询 _cmd_result 获取；ok=False 表示观察者只读模式拒绝执行（T3）。
     """
-    if not mgr.send_command(cmd_name, args):
-        return {"ok": False, "error": "无聚焦 agent 或 agent 未运行"}
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        event = mgr.read_output(timeout=1.0)
-        if event is None:
-            continue
-        if (isinstance(event, dict) and event.get("type") == "_cmd_result"
-                and event.get("cmd") == cmd_name):
-            return event
-    return None
+    result = mgr.send_command_wait(cmd_name, args, timeout=timeout)
+    return result or {"ok": False, "error": f"命令超时或 agent 未运行: {cmd_name}"}
 
 
 def _set_mode(mgr, new_mode: str) -> str:
-    """切换模式：send_command + 失败回读真实 mode（P0 修复语义）。
-
-    设计考虑: 命令未送达时回读 get_info 防止 UI 缓存与 agent 实际状态脱节
-    （web.py 原 33 处 _focus_mode 读写均遵循此模式）。
-    """
-    _ok = mgr.send_command("set_mode", {"mode": new_mode})
-    if _ok:
-        mgr._focus_mode = new_mode
+    """切换模式：等待 agent 真实结果后再更新缓存。"""
+    result = mgr.send_command_wait("set_mode", {"mode": new_mode}, timeout=2.0)
+    if result and result.get("ok", True) is not False:
+        mgr._focus_mode = result.get("data") or new_mode
         return ""
     info = mgr.get_focus_info(timeout=2.0)
     if info:
         mgr._focus_mode = info.get("mode", mgr._focus_mode)
     return f"⚠️ 模式切换失败：当前仍为 [{getattr(mgr, '_focus_mode', 'plan')}] mode"
-
-
-def _set_skill_select(mgr, enabled: bool) -> str:
-    """切换技能自动选择：同步 agent 线程 + 本地缓存。"""
-    mgr.send_command("set_skill_select", {"enabled": enabled})
-    mgr._focus_skill_select = enabled
-    return f"✅ Skill auto-select: {'ON' if enabled else 'OFF'}"
 
 
 def _cur_session(mgr, ctx: CommandContext | None) -> str | None:
@@ -160,11 +140,22 @@ def _cur_session(mgr, ctx: CommandContext | None) -> str | None:
 
 
 def _switch_session(mgr, name: str, ctx: CommandContext | None) -> None:
-    """后台启动 + 切换焦点 + UI 同步（统一 repl/web 的 session 切换）。"""
-    mgr.start_agent(name, wait_ready=False)
-    mgr.switch_focus(name)
+    """聚焦 + resume + 同步缓存（对齐侧边栏 switch / focus_session）。"""
+    mgr.focus_session(name)
     if ctx and ctx.switch_session_hook:
         ctx.switch_session_hook(name)
+
+
+def _foreign_lock_blocks(session: str) -> str | None:
+    """若 session 被他进程持锁则返回错误文案（变异操作 gate）。"""
+    if not session:
+        return None
+    from codes.lock import is_locked, is_same_process
+    locked, meta = is_locked(session)
+    if locked and isinstance(meta, dict) and not is_same_process(meta):
+        holder = meta.get("holder") or meta.get("holder_name") or "unknown"
+        return f"⚠️ session '{session}' 被其他进程占用 ({holder})，只读模式不可修改"
+    return None
 
 
 # ────────────────────────────────────────────────────────────────
@@ -173,37 +164,19 @@ def _switch_session(mgr, name: str, ctx: CommandContext | None) -> None:
 
 @cmd("help", help_text="/help — 帮助")
 def cmd_help(mgr, arg: str, ctx: CommandContext | None) -> str:
-    """生成统一帮助文本（注册表元数据 + 特殊命令 + UI 补充）。"""
-    lines = [
-        "/help — 帮助",
-        "/clear — 清空会话",
-        "/drop — 丢弃历史（清内存，保留DB记录）",
-        "/compact — 压缩会话历史",
-        "/session — 会话信息 + token 统计",
-        "/session <name> — 切换会话",
-        "/session add <name> — 新建会话",
-        "/session fork <name> — 复制当前会话",
-        "/session rename <name> — 重命名当前会话",
-        "/session remove <name> — 删除会话",
-        "/session sync [name] — 同步会话（WAL checkpoint）",
-        "/sessions — 列出所有会话",
-        "/model [name] — 显示/切换模型 | /model test — 全量测速 | /model test <name> — 测试指定模型",
-        "/skills /showskills — 列出技能",
-        "/updateskillembedding — 更新技能向量索引",
-        "/validate [names] — 校验技能",
-        "/skill <name> — 加载技能",
-        "/plan /build /build-unsafe — 切换模式",
-        "/mode — 循环切换 mode",
-        "/logfile — 查看本次运行的日志文件尾部",
-        "/mount <path> [ro|rw|ro/rw] [--force] — 挂载路径到 pythonrt（软边界）",
-        "/mount list|save|refresh — 查看/持久化/重载动态挂载",
-        "/unmount <path> — 卸载动态挂载",
-        "/turnonskill /turnoffskill — 技能自动选择开关",
-        "/session stop <name> — 停止会话 agent",
-        "/restart [overrides] — 重启进程",
-        "/exit — 退出",
-        "!<command> — 执行 bash",
-    ]
+    """从 COMMANDS 注册表生成帮助，避免与实现漂移。"""
+    seen: set[int] = set()
+    lines: list[str] = []
+    for entry in COMMANDS.values():
+        key = id(entry)
+        if key in seen:
+            continue
+        seen.add(key)
+        text = (entry.get("help") or "").strip()
+        if text:
+            lines.append(text)
+    lines.append("/compact — 压缩会话历史（走消息通路，不经命令表）")
+    lines.append("!<command> — 执行 bash")
     if ctx and ctx.help_extra:
         lines.append("")
         lines.append(ctx.help_extra)
@@ -214,8 +187,9 @@ def cmd_help(mgr, arg: str, ctx: CommandContext | None) -> str:
 def cmd_logfile(mgr, arg: str, ctx: CommandContext | None) -> str:
     """查看本次进程对应的日志文件（尾部 60 行）。"""
     from codes._log import get_log_file, tail_log_file
-    log_path = get_log_file()
-    tail = tail_log_file(60)
+    session = _cur_session(mgr, ctx)
+    log_path = get_log_file(session)
+    tail = tail_log_file(60, session)
     return f"📄 日志文件: {log_path}\n\n{tail}"
 
 
@@ -235,6 +209,10 @@ def cmd_cmds(mgr, arg: str, ctx: CommandContext | None) -> str:
                 cmd_text = tag + cmd_text
             ec = f" (exit={rec['exit_code']})" if rec.get("exit_code") is not None else ""
             lines.append(f"#{rec['id']} [{rec['created_at']}] {cmd_text}{ec}")
+            res = rec.get("result")
+            if res:
+                preview = str(res).replace("\n", " ")[:300]
+                lines.append(f"    → {preview}{'…' if len(str(res)) > 300 else ''}")
         return "\n".join(lines) or "(no command history yet)"
     except Exception as e:
         return f"❌ /cmds error: {e}"
@@ -246,7 +224,7 @@ def cmd_clear(mgr, arg: str, ctx: CommandContext | None) -> str:
     result = run_cmd(mgr, "clear", timeout=5.0)
     if result and result.get("ok") is False:
         return f"⚠️ {result.get('error', '观察者只读模式：session 已被其他进程占用')}"
-    return "✅ Session cleared."
+    return "✅ Session cleared.（断点标记：历史消息已保留在存储中，LLM 上下文已重置）"
 
 
 @cmd("drop", help_text="/drop — 丢弃历史（清内存，保留DB记录）")
@@ -258,28 +236,125 @@ def cmd_drop(mgr, arg: str, ctx: CommandContext | None) -> str:
     return "✅ History dropped."
 
 
-@cmd("session", help_text="/session — 会话信息与子命令（add/fork/remove/stop/rename/sync/切换）")
+@cmd("autocompactlimit",
+     help_text="/autocompactlimit [-1|N] — 查看/设置自动压缩阈值（-1=禁用；默认 600000（2026-09-11 起默认开启）；N=上下文超过 N tokens 时先自动修剪/压缩）")
+def cmd_autocompactlimit(mgr, arg: str, ctx: CommandContext | None) -> str:
+    """查看/设置 autocompactlimit（统一 repl/web；经 agent 执行并持久化 agent_state）。"""
+    arg = (arg or "").strip()
+    if not arg:
+        # 无参：显示当前值（经 get_info 读取 agent 真实状态）
+        result = run_cmd(mgr, "get_info", timeout=2.0)
+        info = (result or {}).get("data") if isinstance(result, dict) else None
+        cur = info.get("autocompactlimit") if isinstance(info, dict) else None
+        if cur is None:
+            return "⚠️ 无法读取当前值（agent 未运行或版本过旧）"
+        if cur == -1:
+            return "autocompactlimit = -1（禁用自动压缩）"
+        return (f"autocompactlimit = {cur}\n"
+                f"  处理用户消息前，上下文估算 > {cur} tokens 时先自动压缩再处理")
+    try:
+        val = int(arg, 10)
+    except ValueError:
+        return f"⚠️ 无效值 {arg!r}：仅接受 -1（禁用）或正整数"
+    if val != -1 and val <= 0:
+        return f"⚠️ 无效值 {val}：仅接受 -1（禁用）或正整数"
+    warn = "（⚠️ 阈值偏小：压缩总结本身约 2-3k tokens，可能频繁压缩）" if val < 4000 else ""
+    result = run_cmd(mgr, "set_autocompactlimit", {"limit": val}, timeout=5.0)
+    if isinstance(result, dict) and result.get("ok") is False:
+        return f"⚠️ {result.get('error', '设置失败')}"
+    return ("✅ autocompactlimit = %d %s" % (val, warn)).rstrip()
+
+
+@cmd("session", help_text="/session — 会话信息与子命令（add/fork/remove/stop/rename/sync/title/切换）")
 def cmd_session(mgr, arg: str, ctx: CommandContext | None) -> str:
     """会话管理子命令（统一 repl/web；交互确认与多选通过 ctx 注入）。"""
     if not arg:
         # 裸 /session：会话信息 + token 统计
-        result = run_cmd(mgr, "get_session_stats", timeout=3.0)
-        if result and result.get("data"):
-            return result["data"]
-        return f"Session: {_cur_session(mgr, ctx) or '?'} (stats unavailable)"
+        # B4 修复（2026-08-22）：直接读 session db（对齐 web _fetch_token_stats），
+        # 避免 agent 忙碌时命令排队 3s 超时导致 "stats unavailable"。
+        name = _cur_session(mgr, ctx) or (mgr.focus or "")
+        if not name:
+            return "No active session."
+        try:
+            from codes.history import get_token_state, get_conn
+            _ts = get_token_state(name)
+            _p = _ts.get("prompt_tokens", 0) or 0
+            _c = _ts.get("completion_tokens", 0) or 0
+            _r = _ts.get("reasoning_tokens", 0) or 0
+            _t = _ts.get("turn_count", 0) or 0
+            _m = _ts.get("model") or ""
+            try:
+                _conn = get_conn(name)
+                _msgc = _conn.count_visible()
+                _conn.close()
+            except Exception:
+                _msgc = 0
+            from codes.session_registry import title_of as _title_of
+            _title = _title_of(name)
+            _lines = [
+                f"  Session: {name}",
+                f"  Title:   {_title or '(未设置 → 显示 name)'}",
+                f"  Model:   {_m or '(default)'}",
+                f"  Messages: {_msgc}",
+                f"  Turns:    {_t}",
+                "",
+                f"  Token Usage",
+                f"     Prompt:     {_p:>10,}",
+                f"     Completion: {_c:>10,}",
+                f"     Reasoning:  {_r:>10,}",
+                f"     Total:      {_p + _c:>10,}",
+            ]
+            return "\n".join(_lines)
+        except Exception as e:
+            return f"Session: {name} (stats unavailable: {e})"
 
-    sub_parts = arg.split()
+    try:
+        sub_parts = shlex.split(arg)
+    except ValueError as e:
+        return f"⚠️ Invalid arguments: {e}"
     sub_cmd = sub_parts[0]
     sub_args = sub_parts[1:]
     current_focus = mgr.focus or ""
 
     if sub_cmd == "add":
         no_switch = "--no-switch" in sub_args
-        name_args = [a for a in sub_args if not a.startswith("--")]
-        if not name_args:
-            return "⚠️ Usage: /session add <name> [--no-switch]"
-        name = name_args[0]
-        ok, msg = add_session(name)
+        workdir = None
+        title = None          # 可选展示标题（支持中文），见 --title
+        positional = []
+        i = 0
+        while i < len(sub_args):
+            token = sub_args[i]
+            if token == "--no-switch":
+                i += 1
+                continue
+            if token == "--workdir":
+                if i + 1 >= len(sub_args):
+                    return "⚠️ --workdir requires a path"
+                workdir = sub_args[i + 1]
+                i += 2
+                continue
+            if token.startswith("--workdir="):
+                workdir = token.split("=", 1)[1]
+                i += 1
+                continue
+            if token == "--title":
+                if i + 1 >= len(sub_args):
+                    return "⚠️ --title requires a value"
+                title = sub_args[i + 1]
+                i += 2
+                continue
+            if token.startswith("--title="):
+                title = token.split("=", 1)[1]
+                i += 1
+                continue
+            if token.startswith("--"):
+                return f"⚠️ Unknown option: {token}"
+            positional.append(token)
+            i += 1
+        if len(positional) != 1:
+            return "⚠️ Usage: /session add <name> [--workdir <path>] [--no-switch] [--title <text>]"
+        name = positional[0]
+        ok, msg = add_session(name, workdir=workdir, title=title)
         if not ok:
             return f"❌ {msg}"
         if no_switch:
@@ -292,21 +367,39 @@ def cmd_session(mgr, arg: str, ctx: CommandContext | None) -> str:
         if not sub_args:
             return "⚠️ Usage: /session fork <name>"
         src = current_focus
+        if not src:
+            return "⚠️ No active session to fork from. Switch to a session first."
         dst = sub_args[0]
+        block = _foreign_lock_blocks(src)
+        if block:
+            return block
         ok, msg = fork_session(src, dst)
+        if ok:
+            # fork 继承状态板（含软删除存档）；失败静默降级不影响 fork 本身
+            try:
+                from codes.session_info import copy_state
+                copy_state(src, dst)
+            except Exception:
+                logger.warning(f"fork 状态板复制失败（静默降级）: {src} -> {dst}", exc_info=True)
         return f"{'✅' if ok else '❌'} {msg}"
 
     elif sub_cmd == "remove":
         if not sub_args:
-            return "⚠️ Usage: /session remove <name>"
-        name = sub_args[0]
+            return "⚠️ Usage: /session remove <name> [--force]"
+        force = "--force" in sub_args
+        name = next(a for a in sub_args if not a.startswith("--"))
         if not session_exists(name):
             return f"❌ Session '{name}' does not exist."
         if name == current_focus:
             return "⚠️ Cannot remove the currently active session."
-        if ctx and ctx.confirm_handler and not ctx.confirm_handler(
+        block = _foreign_lock_blocks(name)
+        if block:
+            return block
+        if not force and ctx and ctx.confirm_handler and not ctx.confirm_handler(
                 f"Are you sure you want to remove '{name}'? (y/N): "):
             return "ℹ️ Cancelled."
+        if not force and ctx and ctx.confirm_handler is None:
+            return f"⚠️ 请确认删除: /session remove {name} --force"
         mgr.stop_agent(name)
         time.sleep(0.5)
         ok, msg = delete_session(name)
@@ -321,14 +414,62 @@ def cmd_session(mgr, arg: str, ctx: CommandContext | None) -> str:
         mgr.stop_agent(name)
         return f"✅ Stopped agent for session: {name}"
 
+    elif sub_cmd == "title":
+        # /session title [--session <name>] <text...>   清除用 --clear
+        # title 仅展示（支持中文/空格/emoji），不改变 session name 与磁盘路径
+        target = current_focus
+        clear = False
+        text_parts = []
+        i = 0
+        while i < len(sub_args):
+            tok = sub_args[i]
+            if tok in ("--session", "-s"):
+                if i + 1 >= len(sub_args):
+                    return "⚠️ --session requires a name"
+                target = sub_args[i + 1]
+                i += 2
+                continue
+            if tok.startswith("--session="):
+                target = tok.split("=", 1)[1]
+                i += 1
+                continue
+            if tok == "--clear":
+                clear = True
+                i += 1
+                continue
+            if tok.startswith("--"):
+                return f"⚠️ Unknown option: {tok}"
+            text_parts.append(tok)
+            i += 1
+        if not target:
+            return "⚠️ No active session. Usage: /session title [--session <name>] <text>"
+        from codes.session_registry import get as _reg_get
+        from codes.session_registry import set_title as _reg_set_title
+        if _reg_get(target) is None:
+            return f"❌ Session '{target}' not found"
+        text = "" if clear else " ".join(text_parts).strip()
+        if not clear and not text:
+            return ("⚠️ Usage: /session title [--session <name>] <text>；"
+                    "清除标题用 /session title --clear [--session <name>]")
+        try:
+            _ctx_title = _reg_set_title(target, text)
+        except (ValueError, KeyError) as e:
+            return f"❌ {e}"
+        if _ctx_title.title:
+            return f"✅ Title set for '{target}': {_ctx_title.title}"
+        return f"✅ Title cleared for '{target}'（展示回退 name: {target}）"
+
     elif sub_cmd == "rename":
         if not sub_args:
-            return "⚠️ Usage: /session rename <name>"
+            return "⚠️ Usage: /session rename <name> [--force]"
+        force = "--force" in sub_args
+        new = next(a for a in sub_args if not a.startswith("--"))
         old = current_focus
-        new = sub_args[0]
-        if ctx and ctx.confirm_handler and not ctx.confirm_handler(
+        if not force and ctx and ctx.confirm_handler and not ctx.confirm_handler(
                 f"Rename current session -> '{new}'? (y/N): "):
             return "ℹ️ Cancelled."
+        if not force and ctx and ctx.confirm_handler is None:
+            return f"⚠️ 请确认重命名: /session rename {new} --force"
         ok, msg = rename_session(old, new)
         if ok:
             if old == current_focus:
@@ -439,7 +580,10 @@ def cmd_model(mgr, arg: str, ctx: CommandContext | None) -> str:
     if arg.startswith("@"):
         # 切换 provider（@name 语法）
         pname = arg[1:]
-        mgr.send_command("set_provider", {"provider": pname})
+        result = mgr.send_command_wait("set_provider", {"provider": pname}, timeout=2.0)
+        if not result or result.get("ok") is False:
+            err = (result or {}).get("error", "命令超时或 agent 未运行")
+            return f"⚠️ Provider 切换失败: {err}"
         return f"✅ Provider switched to: {pname}"
 
     # 模型解析：返回 (provider, model)，联动 set_provider + set_model
@@ -452,11 +596,17 @@ def cmd_model(mgr, arg: str, ctx: CommandContext | None) -> str:
     except ValueError as e:
         return f"⚠️ {e}"
     if prov and prov != cur_prov:
-        mgr.send_command("set_provider", {"provider": prov})
+        result = mgr.send_command_wait("set_provider", {"provider": prov}, timeout=2.0)
+        if not result or result.get("ok") is False:
+            err = (result or {}).get("error", "命令超时或 agent 未运行")
+            return f"⚠️ Provider 切换失败: {err}"
     send_kwargs = {"model": resolved}
     if effort_arg:
         send_kwargs["reasoning_effort"] = effort_arg
-    mgr.send_command("set_model", send_kwargs)
+    result = mgr.send_command_wait("set_model", send_kwargs, timeout=2.0)
+    if not result or result.get("ok") is False:
+        err = (result or {}).get("error", "命令超时或 agent 未运行")
+        return f"⚠️ Model 切换失败: {err}"
     msg = f"✅ Model set to: {resolved}"
     if effort_arg:
         msg += f" (reasoning_effort={effort_arg} 临时覆盖)"
@@ -475,9 +625,10 @@ def cmd_skills(mgr, arg: str, ctx: CommandContext | None) -> str:
 
 @cmd("updateembedding", "updateskillembedding", help_text="/updateembedding — 重建向量索引（skills/docs/historys/logs，codes 默认关闭）")
 def cmd_updateembedding(mgr, arg: str, ctx: CommandContext | None) -> str:
-    """重建全部范围向量索引（FAISS）。"""
+    """重建当前 session workdir 的全部或指定范围向量索引。"""
     from codes.search import update_embeddings
-    res = update_embeddings(verbose=True)
+    scope = (arg or "").strip() or None
+    res = update_embeddings(verbose=True, session=_cur_session(mgr, ctx), scopes=scope)
     total = sum(res.values())
     msg = f"💡 Updated embeddings: {total} keys across {len(res)} scopes."
     if total > 0:
@@ -583,7 +734,18 @@ def cmd_image(mgr, arg: str, ctx: CommandContext | None) -> str:
     if sub == "add":
         if not rest:
             return "⚠️ Usage: /image add <path>"
-        path = os.path.abspath(os.path.expanduser(rest))
+        path = os.path.expanduser(rest)
+        if not os.path.isabs(path):
+            # 相对路径基于 session workdir 解析（对齐 web._resolve_workdir 语义），
+            # 避免进程 cwd 与 session workdir 不一致时附件落错位置
+            try:
+                from codes.session_registry import get as _get_ctx
+                _ctx = _get_ctx(session)
+                _base = str(_ctx.workdir) if _ctx is not None else os.getcwd()
+            except Exception:
+                _base = os.getcwd()
+            path = os.path.join(_base, path)
+        path = os.path.abspath(path)
         if not os.path.isfile(path):
             return f"❌ 文件不存在或不可读: {rest}"
         size = os.path.getsize(path)
@@ -652,16 +814,6 @@ def cmd_mount(mgr, arg: str, ctx: CommandContext | None) -> str:
 def cmd_unmount(mgr, arg: str, ctx: CommandContext | None) -> str:
     """卸载动态挂载。"""
     return _mount_impl(mgr, arg, unmount=True, ctx=ctx)
-
-
-@cmd("turnonskill", "skillson", help_text="/turnonskill — 技能自动选择开关 ON")
-def cmd_turnonskill(mgr, arg: str, ctx: CommandContext | None) -> str:
-    return _set_skill_select(mgr, True)
-
-
-@cmd("turnoffskill", "skillsoff", help_text="/turnoffskill — 技能自动选择开关 OFF")
-def cmd_turnoffskill(mgr, arg: str, ctx: CommandContext | None) -> str:
-    return _set_skill_select(mgr, False)
 
 
 @cmd("restart", help_text="/restart [overrides] — 重启进程（同参数或覆盖参数）")
@@ -759,30 +911,23 @@ def _mount_impl(mgr, arg: str, *, unmount: bool, ctx: CommandContext | None) -> 
 def _mount_wait(mgr, cmd_name: str, args: dict, *, ctx: CommandContext | None, timeout: float = 5.0) -> str:
     """发送 mount 系列命令并等待 _cmd_result（超时返回提示）。"""
     logger.info(f"[cmd] send {cmd_name} args={args!r}")
-    if not mgr.send_command(cmd_name, args):
-        return "❌ No active agent."
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        event = mgr.read_output(timeout=1.0)
-        if event is None:
-            continue
-        if (isinstance(event, dict) and event.get("type") == "_cmd_result"
-                and event.get("cmd") == cmd_name):
-            data = event.get("data", "")
-            if event.get("ok") is False:
-                logger.info(f"[cmd] {cmd_name} FAIL {data!r}")
-                return f"⚠️ {data or event.get('error', '执行失败')}"
-            if isinstance(data, str) and data.startswith("CONFIRM_REQUIRED:"):
-                prompt = data[len("CONFIRM_REQUIRED:"):]
-                if ctx and ctx.confirm_handler:
-                    if ctx.confirm_handler(prompt):
-                        args = dict(args or {})
-                        args["force"] = True
-                        return _mount_wait(mgr, cmd_name, args, ctx=ctx, timeout=timeout)
-                    return "ℹ️ 已取消挂载。"
-                return f"⚠️ 需要确认：{prompt}\n   请重新发送 /mount ... --force 确认"
-            return f"{data}"
-    return "⏳ No response from agent (timeout)."
+    event = mgr.send_command_wait(cmd_name, args, timeout=timeout)
+    if event is None:
+        return "⏳ No response from agent (timeout)."
+    data = event.get("data", "")
+    if event.get("ok") is False:
+        logger.info(f"[cmd] {cmd_name} FAIL {data!r}")
+        return f"⚠️ {data or event.get('error', '执行失败')}"
+    if isinstance(data, str) and data.startswith("CONFIRM_REQUIRED:"):
+        prompt = data[len("CONFIRM_REQUIRED:"):]
+        if ctx and ctx.confirm_handler:
+            if ctx.confirm_handler(prompt):
+                args = dict(args or {})
+                args["force"] = True
+                return _mount_wait(mgr, cmd_name, args, ctx=ctx, timeout=timeout)
+            return "ℹ️ 已取消挂载。"
+        return f"⚠️ 需要确认：{prompt}\n   请重新发送 /mount ... --force 确认"
+    return f"{data}"
 
 
 # ────────────────────────────────────────────────────────────────
@@ -909,6 +1054,404 @@ def _current_cmd_name() -> str:
 _DISPATCH_STACK: list[str] = []
 
 
+# ── 状态信息命令（session 级 KV，与 LLM 的 addinfo/listinfo/rminfo 工具同源）──
+
+@cmd("addinfo", help_text="写入/更新本 session 状态信息: /addinfo <key> <value>", ui=("repl", "web"))
+def cmd_addinfo(mgr, arg: str, ctx: CommandContext | None) -> str:
+    from codes.session_info import add_info
+    sess = (ctx.get_session() if (ctx and ctx.get_session) else None) or getattr(mgr, "focus", None)
+    if not sess:
+        return "⚠️ 无法确定当前 session"
+    toks = (arg or "").strip().split(None, 1)
+    if len(toks) < 2:
+        return "⚠️ Usage: /addinfo <key> <value>"
+    return add_info(sess, toks[0], toks[1], by="user")
+
+
+@cmd("listinfo", help_text="列出本 session 全部状态信息", ui=("repl", "web"))
+def cmd_listinfo(mgr, arg: str, ctx: CommandContext | None) -> str:
+    from codes.session_info import list_info
+    sess = (ctx.get_session() if (ctx and ctx.get_session) else None) or getattr(mgr, "focus", None)
+    if not sess:
+        return "⚠️ 无法确定当前 session"
+    return list_info(sess)
+
+
+@cmd("rminfo", help_text="删除本 session 状态信息: /rminfo <key>", ui=("repl", "web"))
+def cmd_rminfo(mgr, arg: str, ctx: CommandContext | None) -> str:
+    from codes.session_info import remove_info
+    sess = (ctx.get_session() if (ctx and ctx.get_session) else None) or getattr(mgr, "focus", None)
+    if not sess:
+        return "⚠️ 无法确定当前 session"
+    key = (arg or "").strip()
+    if not key:
+        return "⚠️ Usage: /rminfo <key>"
+    return remove_info(sess, key)
+
+
+# ────────────────────────────────────────────────────────────────
+#  /mail：callagent 邮件总线管理（list/get/pending/cancel/send）
+#  零状态机改动：cancel 仅允许 send/failed → rejected（受 _VALID_NEXT 约束）；
+#  delivered（在途）/done/dead/rejected（终态）不可取消。
+#  写入用 mb.append（自抢锁）+ _apply_line，与 postman 轮线程并发安全；
+#  add_status 的无锁 _write_line 仅限 postman 轮内持锁/单测，命令层不得使用。
+# ────────────────────────────────────────────────────────────────
+
+
+@cmd("mail", help_text="/mail — callagent 邮件总线管理: list/get/pending/cancel/send")
+def cmd_mail(mgr, arg: str, ctx: CommandContext | None) -> str:
+    """callagent mail.jsonl 管理命令（REPL/Web 共用）。
+
+    子命令:
+      /mail list [n] [--state s]   最近 n 封邮件（默认10；--state 按整体态过滤）
+      /mail get <mid>              单封详情（send 字段 + 收件人状态链）
+      /mail pending                待投递/定时未到/重投中 候选
+      /mail cancel <mid>           取消未投递或重投中的信（写 rejected 终态；在途不可取消）
+      /mail send <to[,to2]> <msg>  手动构建一封邮件（postman ≤1s 自动投递）
+    """
+    try:
+        toks = shlex.split(arg or "")
+    except ValueError as e:
+        return f"⚠️ Invalid arguments: {e}"
+    if not toks:
+        return _mail_usage()
+    sub = toks[0]
+    if sub == "list":
+        return _mail_list(toks[1:])
+    if sub == "get":
+        return _mail_get(toks[1:])
+    if sub == "pending":
+        return _mail_pending()
+    if sub == "cancel":
+        return _mail_cancel(toks[1:])
+    if sub == "send":
+        return _mail_send(mgr, ctx, toks[1:])
+    return _mail_usage() + f"\n⚠️ 未知子命令: {sub}"
+
+
+def _mail_mb():
+    """惰性 Mailbox 实例：构造即全量扫描当前总线（XKAGENT_MAIL 可覆盖路径）。"""
+    from codes.mailbox import Mailbox
+    return Mailbox()
+
+
+def _mail_usage() -> str:
+    return ("用法:\n"
+            "  /mail list [n] [--state s]     最近 n 封邮件（默认10）\n"
+            "  /mail get <mid>                单封详情\n"
+            "  /mail pending                  待投递/定时未到/重投中 候选\n"
+            "  /mail cancel <mid>             取消未投递或重投中的信\n"
+            "  /mail send <to[,to2]> <msg> [--reply-to X] [--delay 秒] [--at 时间戳]\n"
+            "                                [--priority N] [--provider P] [--need-reply] [--from 名]\n"
+            "  状态: send/delivered/failed/done/dead/rejected（delivered=在途不可取消）")
+
+
+def _mail_fmt_ts(ts) -> str:
+    if not ts:
+        return "-"
+    try:
+        return time.strftime("%m-%d %H:%M:%S", time.localtime(float(ts)))
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _mail_disp_state(st) -> str:
+    """展示用状态：per_to 全部 rejected 时显示 rejected。
+
+    背景：_aggregate_state 把 rejected 与 dead 归并为"终态失败"（单收件人
+    rejected 聚合为 dead），状态机内部语义正确，但用户视角"取消"显示成
+    "dead" 易误解，这里仅展示层还原。
+    """
+    per = st.get("per_to") or {}
+    if per and all((p.get("state") == "rejected") for p in per.values()):
+        return "rejected"
+    return st.get("state") or "?"
+
+
+def _mail_list(toks):
+    """/mail list [n] [--state s]：最近 n 封邮件（created_at 降序）。"""
+    n, state = 10, None
+    i = 0
+    while i < len(toks):
+        tk = toks[i]
+        if tk == "--state":
+            if i + 1 >= len(toks):
+                return "⚠️ --state requires a value"
+            state = toks[i + 1]
+            i += 2
+            continue
+        if tk.startswith("--state="):
+            state = tk.split("=", 1)[1]
+            i += 1
+            continue
+        if tk.isdigit():
+            n = int(tk)
+            i += 1
+            continue
+        return f"⚠️ 未知参数: {tk}"
+    mb = _mail_mb()
+    items = sorted(mb.status.items(),
+                   key=lambda kv: (kv[1]["send"].get("created_at") or 0), reverse=True)
+    out = []
+    for mid, st in items:
+        disp = _mail_disp_state(st)
+        if state and disp != state:
+            continue
+        send = st["send"]
+        to_val = send.get("to")
+        to_s = ",".join(to_val) if isinstance(to_val, list) else str(to_val)
+        body1 = (send.get("body") or "").replace("\n", " ")[:40]
+        out.append(f"{mid} {_mail_fmt_ts(send.get('created_at'))} "
+                   f"[{_mail_disp_state(st):9s}] {send.get('from')} \u2192 {to_s}  {body1}")
+        if len(out) >= n:
+            break
+    if not out:
+        return "（无匹配邮件）"
+    return f"最近 {len(out)} 封邮件（{mb.path}）:\n" + "\n".join(out)
+
+
+def _mail_get(toks):
+    """/mail get <mid>：单封详情（send 字段 + 收件人状态链 + 正文）。"""
+    if not toks:
+        return "⚠️ Usage: /mail get <mid>"
+    mid = toks[0]
+    st = _mail_mb().get(mid)
+    if st is None:
+        return f"未找到邮件 {mid}（可能已被 compact 压实归档）"
+    send = st["send"]
+    to_val = send.get("to")
+    to_s = ",".join(to_val) if isinstance(to_val, list) else str(to_val)
+    lines = [
+        f"id:         {mid}",
+        f"from:       {send.get('from')}",
+        f"to:         {to_s}",
+        f"state:      {_mail_disp_state(st)}",
+        f"created:    {_mail_fmt_ts(send.get('created_at'))}",
+        f"deliver_at: {_mail_fmt_ts(send.get('deliver_at'))}",
+        f"reply_to:   {send.get('reply_to') or '-'}",
+        f"need_reply: {send.get('need_reply') or False}",
+        f"priority:   {send.get('priority') or 0}",
+        f"provider:   {send.get('provider') or '-'}",
+    ]
+    per_to = st.get("per_to") or {}
+    if per_to:
+        lines.append("收件人状态:")
+        for rcpt, pt in per_to.items():
+            last = pt.get("last") or {}
+            lines.append(f"  {rcpt}: {pt.get('state')} retry={pt.get('max_retry') or 0} "
+                         f"last={_mail_fmt_ts(last.get('at'))}:{last.get('type')}")
+    last = st.get("last") or {}
+    lines.append(f"last:       {last.get('type')} @ {_mail_fmt_ts(last.get('at'))}")
+    body = send.get("body") or ""
+    if len(body) > 500:
+        body = body[:500] + "…（截断，全文见 mail.jsonl）"
+    lines.append("body:")
+    lines.append(body)
+    return "\n".join(lines)
+
+
+def _mail_pending():
+    """/mail pending：待投递（send 态）+ 重投中（failed 态）候选。"""
+    mb = _mail_mb()
+    now = time.time()
+    items = sorted(mb.status.items(),
+                   key=lambda kv: (kv[1]["send"].get("created_at") or 0), reverse=True)
+    rows = []
+    for mid, st in items:
+        state = st["state"]
+        send = st["send"]
+        to_val = send.get("to")
+        to_s = ",".join(to_val) if isinstance(to_val, list) else str(to_val)
+        body1 = (send.get("body") or "").replace("\n", " ")[:40]
+        if state == "send":
+            da = send.get("deliver_at") or 0
+            tag = "待投递" if da <= now else f"定时 {_mail_fmt_ts(da)}"
+            rows.append(f"{mid} [{tag}] {send.get('from')} \u2192 {to_s}  {body1}")
+        elif state == "failed":
+            rows.append(f"{mid} [重投中 retry={st.get('max_retry') or 0}] "
+                        f"{send.get('from')} \u2192 {to_s}  {body1}")
+    if not rows:
+        return "（无待投递/重投中邮件）"
+    return "\n".join(rows)
+
+
+def _mail_write_status(mb, line):
+    """带锁写状态行 + 本地聚合同步（命令线程与 postman 轮线程并发安全）。"""
+    if not mb.append(line):
+        return False
+    mb._apply_line(line)
+    return True
+
+
+def _mail_cancel(toks):
+    """/mail cancel <mid>：send/failed → rejected（终态）；delivered/终态不可取消。"""
+    if not toks:
+        return "⚠️ Usage: /mail cancel <mid>"
+    mid = toks[0]
+    mb = _mail_mb()
+    st = mb.get(mid)
+    if st is None:
+        return f"未找到邮件 {mid}"
+    send = st["send"]
+    to_val = send.get("to")
+    if isinstance(to_val, list):
+        # 广播：逐收件人独立取消（send/failed → rejected；其余跳过并说明）
+        done, in_flight, final = [], [], []
+        for rcpt in to_val:
+            pt = (st.get("per_to") or {}).get(rcpt) or {}
+            # 无 per_to 记录 = 该收件人从未投递（send 态）；回退聚合态
+            # 会被其他收件人的 delivered 误导 → 不能回退
+            s = pt.get("state") or "send"
+            if s in ("send", "failed"):
+                ok = _mail_write_status(mb, {"type": "rejected", "id": mid,
+                                             "at": time.time(), "to": rcpt})
+                st2 = mb.get(mid)
+                pt2 = ((st2 or {}).get("per_to") or {}).get(rcpt) or {}
+                if ok and pt2.get("state") == "rejected":
+                    done.append(rcpt)
+                else:
+                    final.append(rcpt)
+            elif s == "delivered":
+                in_flight.append(rcpt)
+            else:
+                final.append(rcpt)
+        msg = f"mid={mid} 取消: {','.join(done) if done else '无'}"
+        if in_flight:
+            msg += f"；在途不可取消: {','.join(in_flight)}"
+        if final:
+            msg += f"；未生效/已终态跳过: {','.join(final)}"
+        return msg
+    state = st["state"]
+    if state in ("send", "failed"):
+        # 带 to 写状态行（per-收件人迁移）：不带 to 走整体迁移会漏改 per_to，
+        # 已建立 per_to 的信（曾 failed）仍会被 claimable 重投 → 取消无效。
+        ok = _mail_write_status(mb, {"type": "rejected", "id": mid,
+                                     "at": time.time(), "to": send["to"]})
+        st2 = mb.get(mid)
+        pt2 = ((st2 or {}).get("per_to") or {}).get(send["to"]) or {}
+        if ok and pt2.get("state") == "rejected":
+            return f"✅ 已取消 {mid}（rejected）"
+        if ok:
+            cur = st2.get("state") if st2 else "?"
+            return (f"⛔ 取消未生效：{mid} 状态已变化（{cur}），可能正在投递；"
+                    f"请 /mail get {mid} 确认后续动态")
+        return "⛔ 总线忙（锁竞争），请重试"
+    if state == "delivered":
+        return f"⚠️ {mid} 已投递在途，不可取消（等待 done/dead）"
+    return f"⚠️ {mid} 已是终态（{state}），不可取消"
+
+
+_MAIL_SEND_OPTS = {
+    "--reply-to": "reply_to",
+    "--delay": "delay",
+    "--at": "at",
+    "--priority": "priority",
+    "--provider": "provider",
+    "--from": "from_",
+}
+
+
+def _mail_send(mgr, ctx, toks):
+    """/mail send <to[,to2]> <msg>：手动构建一封邮件（校验链路对齐 exec_callagent）。"""
+    opts = {"reply_to": None, "delay": 0.0, "at": None,
+            "priority": 0, "provider": None, "need_reply": False, "from_": None}
+    positional = []
+    i = 0
+    while i < len(toks):
+        tk = toks[i]
+        key, val = None, None
+        if tk in _MAIL_SEND_OPTS:
+            key, val = _MAIL_SEND_OPTS[tk], None
+        elif tk in ("--need-reply", "--needreply"):
+            opts["need_reply"] = True
+            i += 1
+            continue
+        elif tk.startswith("--"):
+            eq = tk.split("=", 1)
+            if eq[0] in _MAIL_SEND_OPTS and len(eq) == 2:
+                key, val = _MAIL_SEND_OPTS[eq[0]], eq[1]
+            else:
+                return f"⚠️ 未知选项: {tk}"
+        else:
+            positional.append(tk)
+            i += 1
+            continue
+        if val is None:
+            if i + 1 >= len(toks):
+                return f"⚠️ {tk} requires a value"
+            val = toks[i + 1]
+            i += 2
+        else:
+            i += 1
+        opts[key] = val
+    # 位置参数：to（逗号分隔多收件人=广播）+ 消息正文（可含空格，shlex 已拆）
+    if not positional:
+        return "⚠️ Usage: /mail send <to[,to2]> <message>"
+    to_list = [t.strip() for t in positional[0].split(",") if t.strip()]
+    if not to_list:
+        return "⚠️ to 为空"
+    from codes.session_registry import validate_session_name
+    for t in to_list:
+        err = validate_session_name(t)
+        if err:
+            return f"⚠️ to '{t}' 非法: {err}"
+    message = " ".join(positional[1:]).strip()
+    if not message:
+        return "⚠️ message 为空"
+    # provider 校验（对齐 exec_callagent）
+    if opts["provider"]:
+        from codes.mailbox import split_mail_provider
+        pname, _m = split_mail_provider(opts["provider"])
+        if not pname:
+            return f"⚠️ provider 格式非法: {opts['provider']!r}"
+        try:
+            from codes import provider_config
+            provider_config.get_provider(pname)
+        except ValueError as e:
+            return f"⚠️ provider 不存在: {e}"
+    # 数值参数解析
+    try:
+        delay = float(opts["delay"] or 0)
+    except (TypeError, ValueError):
+        return f"⚠️ --delay 非法: {opts['delay']!r}"
+    at = None
+    if opts["at"]:
+        try:
+            at = float(opts["at"])
+        except (TypeError, ValueError):
+            return f"⚠️ --at 非法: {opts['at']!r}"
+    try:
+        priority = int(opts["priority"] or 0)
+    except (TypeError, ValueError):
+        return f"⚠️ --priority 非法: {opts['priority']!r}"
+    if len(to_list) > 1 and opts["need_reply"]:
+        return "⚠️ 广播邮件不支持 --need-reply（广播=通知型）"
+    mail_env = os.environ.get("XKAGENT_MAIL", "").strip().lower()
+    if mail_env in ("off", "0", "false", "none"):
+        return "⛔ XKAGENT_MAIL=off，邮件功能已禁用（写信不会有人投递）"
+    from_ = opts["from_"] or (
+        (ctx.get_session() if (ctx and ctx.get_session) else None)
+        or getattr(mgr, "focus", None))
+    if not from_:
+        return "⚠️ 无法确定当前会话（--from <name> 可显式指定）"
+    mb = _mail_mb()
+    to_val = to_list if len(to_list) > 1 else to_list[0]
+    ok, info = mb.add_send(from_=from_, to=to_val, body=message,
+                           reply_to=opts["reply_to"] or None,
+                           delay_seconds=delay, deliver_at=at,
+                           priority=priority, provider=opts["provider"] or None,
+                           need_reply=bool(opts["need_reply"]))
+    if not ok:
+        return f"⛔ 发送失败: {info}"
+    if at:
+        ts = _mail_fmt_ts(at)
+    elif delay > 0:
+        ts = _mail_fmt_ts(time.time() + delay)
+    else:
+        ts = "立即（≤1s 投递）"
+    return (f"✅ 已发送 {info}（from={from_}, to={'、'.join(to_list)}）投递: {ts}")
+
+
 def dispatch(mgr, cmd_str: str, ctx: CommandContext | None = None) -> str:
     """统一命令调度：解析 → 查注册表 → 执行 handler → 返回展示文本。
 
@@ -925,10 +1468,17 @@ def dispatch(mgr, cmd_str: str, ctx: CommandContext | None = None) -> str:
     if not entry:
         return f"❌ Unknown command: /{name}. Try /help."
     _DISPATCH_STACK.append(name)
+    session_token = None
     try:
+        session = _cur_session(mgr, ctx)
+        if session:
+            from codes import config as _session_config
+            _context, session_token = _session_config.activate_session(session, ensure=False)
         return entry["handler"](mgr, arg, ctx)
     except Exception as e:
         logger.exception(f"Command /{name} error: {e}")
         return f"❌ Command /{name} error: {e}"
     finally:
+        if session_token is not None:
+            _session_config.reset_session(session_token)
         _DISPATCH_STACK.pop()

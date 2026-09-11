@@ -9,8 +9,8 @@ XKAgent already provides local search, session history, per-turn Status injectio
 ## Four Concepts and Their Roles
 
 - **Search** finds short excerpts relevant to the current question within specified directories. It may or may not find a match.
-- **Session history** is stored in the current session's SQLite database and can continue serving as conversation context when that session is restored.
-- **Status** is a temporary state prefix generated before every normal message, showing the model the current time, mode, path permissions, candidate Skills, and recommended information.
+- **Session history** is stored in the current session's msgz store (a single zlib-compressed file) and can continue serving as conversation context when that session is restored.
+- **Status** is a temporary state prefix generated before every normal message, showing the model the current time, mode, path permissions, candidate Skills, and recommended information. Its **Status Info** layer is a session-level, writable key-value board (`addinfo` / `listinfo` / `rminfo`) that is injected every turn and preserved across compaction.
 - **Long-term Memory** remains on the Roadmap. There is currently no factual entity store, conflict resolution, forgetting policy, or user-profile management.
 
 Status is therefore not a standalone memory store, and search results do not guarantee reliable recall. More precisely, the current features provide a state and retrieval foundation that a future Memory system can use.
@@ -25,12 +25,15 @@ System mode (plan / build / build-unsafe)
 Permission summary for the project root, /tmp, .xkagent, and mounted paths
 Suggested Skills
 Recommended information
+Status Info (session-level KV, injected when non-empty)
 Message body
 ```
 
 This prefix is written to the current session history and sent to the model together with the message body. The CLI and Web UI display the status separately, preserving only the readable body when showing past user messages.
 
-Recommended information searches documents, other session histories, and logs by default. Results from `skills` are handled separately by the Skill recommendation channel, and the current session's history is excluded because it is already present in the active context. Thinking, tool results, and helper messages used for Skill injection are filtered out. At most two excerpts are retained from each file, and only a small number of paths and short excerpts are ultimately injected. Retrieval failures degrade silently and do not block the conversation.
+The Status Info field is the one part of the prefix a session can write itself: the Agent and users maintain small key-value entries (progress, preferences, agreements, lessons) through `addinfo` / `listinfo` / `rminfo` (or `/addinfo` and friends). It is persisted with the prefix and remains effective after `/compact`. Use `summary` for long-form notes and conclusions—together they form a “short runtime memory / searchable long-form documents” division of labor.
+
+Recommended information searches documents and other session histories by default (logs and `skills` are excluded). Results from `skills` are handled separately by the Skill recommendation channel, and the current session's history is excluded because it is already present in the active context. Thinking, tool results, and helper messages used for Skill injection are filtered out. At most two excerpts are retained from each file, and only a small number of paths and short excerpts are ultimately injected. Retrieval failures degrade silently and do not block the conversation.
 
 ## Default Search Scopes
 
@@ -43,7 +46,7 @@ historys → <workdir>/.xkagent/historys
 logs     → <workdir>/.xkagent/logs
 ```
 
-`codes` is excluded from search by default but can be added when needed. `historys` is the fixed spelling used by the current code. Another potentially confusing detail is that the Skill loader reads `<workdir>/.xkagent/skills` and the built-in `skills` directory, while the search system's default `skills` scope points to `<workdir>/skills`. Project Skills can still be recommended from their frontmatter, but their bodies are not guaranteed to be included in this search scope.
+`codes` is excluded from search by default but can be added when needed. `historys` is the fixed spelling used by the current code. The Skill loader and the search system's `skills` scope share the same directories (user-level `<workdir>/.xkagent/skills` first, built-in `skills` as fallback), so Skills stay consistent between loading and retrieval.
 
 ### Adjusting Scopes
 
@@ -81,15 +84,15 @@ XKAGENT_EMBEDDING=1
 
 Use `/updateembedding` to fully rebuild `.xkagent/search_index/<scope>.db`; `/updateskillembedding` is an alias. This command performs vector encoding even when embeddings are not enabled. The index is not currently updated incrementally as files change.
 
-> If the local model is incomplete, the first vector encoding attempt downloads a model package from the external SharePoint location configured by the project 【非官方】. In an internal network environment, confirm the software source and network policy first. Keep embeddings disabled, as they are by default, if vector retrieval is unnecessary.
+> If the local model is incomplete, the first vector encoding attempt tries to download a model package 【非官方】. The download endpoint is empty by default (set `_ONNX_MODEL_DOWNLOAD_URL` to enable); when unset, prepare the model directory manually. In an internal network environment, confirm the software source and network policy first. Keep embeddings disabled, as they are by default, if vector retrieval is unnecessary.
 
 ## Session History, Compact, and Summary
 
-Messages for each session are stored in `.xkagent/historys/<session>.db`. A normal restore reloads the effective history. This differs from cross-session retrieval: the former is the current conversation context, while the latter only searches other databases for relevant excerpts.
+Messages for each session are stored in `.xkagent/historys/<session>.msgz` (a single file). A normal restore reloads the effective history. This differs from cross-session retrieval: the former is the current conversation context, while the latter only searches other sessions' stores for relevant excerpts.
 
 When the context grows too long, run `/compact`. The system generates a summary in a dedicated model turn. On success, it:
 
-- Writes a `compact` marker to the database while retaining old messages.
+- Writes a `compact` marker to the session store while retaining old messages.
 - Replaces the in-memory context sent to the model in subsequent turns with the summary.
 - Writes `.xkagent/docs/<session>/<时间戳>_compact.md`.
 
@@ -105,7 +108,7 @@ A successful call ends the current turn immediately. Summary and Compact documen
 
 ## Related Documentation
 
-- [03 · Infrastructure](03-infrastructure.md): session databases and `.xkagent` data
+- [03 · Infrastructure](03-infrastructure.md): session storage and `.xkagent` data
 - [06 · Agent Engine](06-agent-engine.md): how Status, Skills, and retrieval enter a turn
-- [07 · Skills](07-skills.md): Skill directories and automatic selection
+- [07 · Skills](07-skills.md): Skill directories, loading, and retrieval
 - [09 · Command System](09-commands.md): `/info`, `/updateembedding`, and `/compact`

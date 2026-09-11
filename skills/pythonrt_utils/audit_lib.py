@@ -1,3 +1,4 @@
+# deps: stdlib only
 """audit_lib.py — pythonrt 库安全审计（判定库是否影响硬盘 IO 防控）。
 
 功能：扫描目标库源码目录，输出危险特征报告 + 判定建议（JSON）。

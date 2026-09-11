@@ -38,28 +38,46 @@ author: system
 步骤④: 循环分析             → pythonrt 读取 web_search.step4.md
 ```
 
-## 快速使用
+## 📦 API 速查
+
+**加载**（沙箱双路径；🔥 build-unsafe 可 `from skills.web_search import search`）：
 
 ```python
-# 方式1: pythonrt 内（推荐）
-from skills.web_search import search
+# 🔵🟢 plan/build 沙箱：importlib 动态加载（沙箱禁 import 项目内模块）
+# 路径 = 相对技能库根基准（规则 18）；挂载/其他环境映射为 ../../xkagent_v0902/skills/web_search/search.py
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("search", "skills/web_search/search.py")
+m = importlib.util.module_from_spec(spec); sys.modules["search"] = m
+spec.loader.exec_module(m)
 
-# 按源搜索
-results = search.search_baidu("搜索词")          # 百度
-results = search.search_github("fastapi")        # GitHub
-results = search.search_arxiv("multi-agent")     # 学术论文
-results = search.search_auto("混合内容")          # 智能路由
-results = search.search_openalex("vision transformer")  # OpenAlex 学术
-results = search.search_crossref("deep learning")       # Crossref 文献
-results = search.search_dblp("transformer")             # DBLP 论文
-results = search.search_sogou("中文资讯")              # 搜狗
-results = search.search_so360("Python 教程")           # 360
-results = search.search_csdn("python")                 # CSDN
-results = search.search_sourcegraph("lang:go http")    # 代码搜索
+# 智能路由（推荐入口，按查询词自动选源）
+results = m.search_auto("混合内容")
+print(m.format_output("auto", "混合内容", results))   # 格式化输出
+
+# 按源搜索（17 源，各源函数直接调用）
+results = m.search_baidu("搜索词")
+results = m.search_bing("搜索词")
+results = m.search_google("搜索词")
+results = m.search_duckduckgo("搜索词")
+results = m.search_github("搜索词")
+results = m.search_arxiv("搜索词")
+results = m.search_semantic_scholar("搜索词")
+results = m.search_wikipedia("搜索词")
+results = m.search_weixin_sogou("搜索词")
+results = m.search_openalex("搜索词")
+results = m.search_crossref("搜索词")
+results = m.search_dblp("搜索词")
+results = m.search_sogou("搜索词")
+results = m.search_so360("搜索词")
+results = m.search_bilibili("搜索词")
+results = m.search_csdn("搜索词")
+results = m.search_sourcegraph("搜索词")
 
 # 覆盖 HTTP 回调（WASM 沙箱内网络加速）
-search.set_http_request_callback(http_request)   # 传入宿主回调
-results = search.search_baidu("搜索词")           # 自动走回调
+m.set_http_request_callback(http_request)        # 传入宿主回调
+results = m.search_baidu("搜索词")                # 自动走回调
+
+# main() 为 CLI 入口（含 sys.exit，沙箱内勿直接调用）
 ```
 
 ```bash
@@ -67,22 +85,21 @@ results = search.search_baidu("搜索词")           # 自动走回调
 !python3 skills/web_search/search.py -s baidu "搜索词"
 !python3 skills/web_search/search.py -s auto "查询" -n 5
 !python3 skills/web_search/search.py --list-sources
+```
 
 ## 🔌 代理配置（部分源需要）
 
 部分搜索源（**Google / DuckDuckGo / GitHub API / arXiv / Semantic Scholar**）在受限网络下需要代理。
 
 ```python
-from skills.web_search import search
-
 # 方式 A: 显式设置（http/https 同代理）
-search.set_proxy("http://127.0.0.1:7890")
+m.set_proxy("http://127.0.0.1:7890")
 
 # 方式 B: 环境变量自动读取（HTTP_PROXY / HTTPS_PROXY）
 # 设置环境变量后无需代码，首次请求自动生效
 
 # 方式 C: 清除代理（恢复直连）
-search.set_proxy(None)
+m.set_proxy(None)
 ```
 
 > 💡 **国内直连源**（百度/搜狗微信/必应 cn）**不受代理影响**，即使配置代理也保持直连——避免国内源走代理反而失败。
@@ -100,7 +117,6 @@ search.set_proxy(None)
 | **混合/不确定** | auto 智能路由 | — | — | 按 query 关键词自动选 |
 
 **代理不可达时的降级链**：`google → duckduckgo → bing`（bing 为最终兜底，国内可达）
-```
 
 ## 文件引用
 
@@ -110,13 +126,25 @@ search.set_proxy(None)
 | [step2](web_search.step2.md) | 生成搜索词方法 | 执行步骤②前 |
 | [step3](web_search.step3.md) | 执行搜索命令 + 示例 | 执行步骤③前 |
 | [step4](web_search.step4.md) | 循环分析 + 源切换 + 终止条件 | 执行步骤④前 |
+| [search.py](search.py) | 主搜索脚本（17 源 + auto 路由） | 加载后按 📦 API 速查调用 |
+| [test_connectivity.py](test_connectivity.py) | 连通性测试脚本 | 见「连通性测试」 |
 
 
 
 ## 🧪 连通性测试
 
+```python
+# 🔵🟢 沙箱内单源连通性测试（test_source；main 为 CLI 入口，见上）
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("tc", "skills/web_search/test_connectivity.py")
+tcm = importlib.util.module_from_spec(spec); sys.modules["tc"] = tcm
+spec.loader.exec_module(tcm)
+report = tcm.test_source("baidu")   # 单源连通性测试
+# tcm.main() 为 CLI 入口（含 sys.exit，沙箱内勿调用）
+```
+
 ```bash
-# 运行全源连通性测试（需联网环境）
+# 运行全源连通性测试（需联网环境；main = CLI 入口）
 python3 skills/web_search/test_connectivity.py                 # 默认查 "python"
 python3 skills/web_search/test_connectivity.py "transformer"   # 指定查询词
 python3 skills/web_search/test_connectivity.py --timeout 5     # 指定超时

@@ -47,7 +47,11 @@ A Skill organizes domain knowledge, workflows, references, and scripts in a self
 
 ### 🧭 Status · A state foundation for long-running tasks and Memory
 
-An Agent should see more than the user's latest message. On every request, XKAgent injects the current time, runtime mode, path permissions, suggested skills, and retrieved information, so the model knows its current state, available actions, and relevant long-term memories, project documentation, or external knowledge. Status injection is implemented. Full long-running task orchestration and long-term Memory are not yet implemented; both are planned on top of this stable state interface.
+An Agent should see more than the user's latest message. On every request, XKAgent injects the current time, runtime mode, path permissions, suggested skills, and retrieved information, so the model knows its current state, available actions, and relevant long-term memories, project documentation, or external knowledge. Beyond the read-only system fields, a session can maintain a writable **Status Info** board via `addinfo` / `listinfo` / `rminfo` (or the `/addinfo` commands)—short, durable, injected every turn, and preserved across compaction. Status injection is implemented. Full long-running task orchestration and long-term Memory are not yet implemented; both are planned on top of this stable state interface.
+
+### 📮 Multi-Agent Communication · Asynchronous collaboration across sessions
+
+Sessions can collaborate by mail: `callagent` writes an asynchronous message into the global `mail.jsonl` bus, and the per-round carrier delivers it to any session—supporting delayed/absolute wake-ups, priority, reply chains, broadcasts, and per-recipient provider overrides. Scheduled wake-ups, information exchange, and long-task hosting are all built on this primitive. See [11 · Multi-Agent Communication](.xkagent/docs/11-multi-agent-communication.md).
 
 ### 🛡️ Sandbox · Progressive trust, not absolute security
 
@@ -207,7 +211,7 @@ Review the diff after each step, and commit or back up the workspace before ente
 | [🚀 Installation and Startup](.xkagent/docs/01-entry-and-startup.md) | [✨ LLM Calls](.xkagent/docs/04-llm-layer.md) | [🧩 Skill Extensions](.xkagent/docs/07-skills.md) |
 | [⚙️ Provider and Configuration](.xkagent/docs/02-configuration.md) | [🛡️ pythonrt and Sandbox](.xkagent/docs/05-sandbox-and-tools.md) | [🧠 Search and Memory](.xkagent/docs/08-search-and-memory.md) |
 | [💾 Storage and Logging](.xkagent/docs/03-infrastructure.md) | [🤖 Agent Engine](.xkagent/docs/06-agent-engine.md) | [⌨️ Command Reference](.xkagent/docs/09-commands.md) |
-| [🏗️ Architecture Overview](.xkagent/docs/architecture-overview.md) |  | [💻 CLI and Web](.xkagent/docs/10-frontends.md) |
+| [🏗️ Architecture Overview](.xkagent/docs/architecture-overview.md) | [📮 Multi-Agent Communication](.xkagent/docs/11-multi-agent-communication.md) | [💻 CLI and Web](.xkagent/docs/10-frontends.md) |
 
 ### 💬 Do Not Want to Read the Docs? Ask XKAgent
 
@@ -226,6 +230,20 @@ What problems do pythonrt, Skills, and Status solve, and how do they work togeth
 ```
 
 This lets you learn about XKAgent through specific questions without reading all the documentation first. For implementation details, treat the current source code as authoritative.
+
+---
+
+## 📝 What's New · 0.2.0
+
+This release focuses on multi-agent collaboration and a simpler storage layer:
+
+- **📮 Multi-Agent Communication**: a global `mail.jsonl` bus, the MailPostman carrier, and the `callagent` tool for asynchronous cross-session messaging — delayed/absolute delivery, priority, reply chains, broadcast, and per-recipient provider override.
+- **💾 Storage: SQLite → msgz**: sessions now live in a single zlib-compressed `.msgz` file (memory-first with atomic persistence); legacy `*.db` files stay readable and can be migrated with `codes/msgz_migrate.py`.
+- **🧭 Status Info board**: a session-level key-value store (`addinfo` / `listinfo` / `rminfo`) injected every turn and preserved across compaction.
+- **🧩 More built-in skills**: `paper_collect`, `paper_discuss`, `pdfreader`, `playwright_web`, `callagent_workflows`, and more.
+- **⚙️ Other improvements**: web session titles/pins and an online file preview page; auto-compaction and tool-output truncation for long contexts.
+
+See [0.2.0 Release Notes](docs/release_notes_0.2.0.md) for details.
 
 ---
 

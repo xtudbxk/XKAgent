@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# deps: stdlib only
 """web_search 连通性测试脚本 — 遍历全部搜索源，测试连通性与解析可用性。
 
 用法:
@@ -10,7 +11,17 @@
     connectivity_report.json   — 结构化结果（LLM/程序消费）
     connectivity_report.md     — 人类可读报告
 
-依赖: 仅 stdlib；需在可联网环境运行（build-unsafe 或宿主）
+Deps:
+    stdlib only   # 需在可联网环境运行（build-unsafe 或宿主）
+
+Usage(沙箱双路径):
+    # 🔵🟢 plan/build 沙箱：importlib 动态加载
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location("test_connectivity", "skills/web_search/test_connectivity.py")
+    m = importlib.util.module_from_spec(spec); sys.modules["test_connectivity"] = m
+    spec.loader.exec_module(m)
+    report = m.test_source("baidu")   # 单源连通性测试
+    # 宿主 CLI：python3 test_connectivity.py [query] [--timeout N]
 """
 import argparse
 import json
@@ -34,7 +45,17 @@ PROXY_SOURCES = {"google", "duckduckgo", "github", "arxiv", "semantic_scholar",
 
 
 def test_source(name, query, timeout):
-    """测试单个源，返回结果状态。"""
+    """测试单个源，返回结果状态。
+
+    Args:
+        name (str): 见上方说明
+        query (str): 见上方说明
+        timeout (str): 见上方说明
+    Returns:
+        dict: 连通性报告（ok/error/耗时等）
+    Example:
+        m.test_source("baidu")
+    """
     func = ws_mod.SOURCE_FUNCS.get(name)
     if not func:
         return {"source": name, "status": "SKIP", "reason": "无实现函数", "count": 0}
@@ -64,6 +85,15 @@ def test_source(name, query, timeout):
 
 
 def main():
+    """CLI 入口（argparse 解析参数，遍历全源测试）
+
+    Args:
+        (无参数)
+    Returns:
+        None: 退出码
+    Example:
+        # CLI: python3 test_connectivity.py "python"
+    """
     parser = argparse.ArgumentParser(description="web_search 连通性测试")
     parser.add_argument("query", nargs="?", default="python", help="测试查询词")
     parser.add_argument("--timeout", type=int, default=8, help="每源超时秒数")

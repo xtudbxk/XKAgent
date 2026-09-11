@@ -12,12 +12,14 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import html
 import json
 import os
 import re
 import secrets
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from typing import Optional
@@ -36,13 +38,15 @@ except ImportError:
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from codes.agent import Agent, MODE_CYCLE, COMPACT_MARKER, COMPACT_PROMPT, _parse_permission_file
 from codes.history import (list_sessions, session_exists, add_session,
-                       fork_session, rename_session,
+                       fork_session, prepare_rerun, rename_session,
                        sync_session, get_conn, get_chat_messages, parse_user_prefix,
-                       get_messages_since, get_agent_state, get_token_state,
+                       get_messages_since, get_messages_before, get_agent_state, get_token_state,
                        get_mount_state)
 from codes.manager import AgentManager
 from codes.commands import dispatch, CommandContext
 from codes.llm import friendly_error_hint
+from codes.path_guard import root_contains
+from codes.web_static import load_page
 from codes import config as _config  # 与 repl.py 同源: 共享 .xkagent/history.txt
 
 app = FastAPI(title="XKAgent Web")
@@ -86,7 +90,11 @@ def _format_message_for_display(m: dict) -> dict:
         return {"role": role, "displayType": role, "content": ""}
     
     if role == "user":
-        parsed = parse_user_prefix(content)
+        try:
+            parsed = parse_user_prefix(content)
+        except Exception:
+            # 防御：content 非 str（如多模态 list）时解析抛异常 → 按无前缀处理，避免历史加载 500
+            parsed = None
         if parsed:
             b = parsed["body"]
             msg = {
@@ -99,6 +107,9 @@ def _format_message_for_display(m: dict) -> dict:
             # 2026-08-07: 历史渲染按实时方案补系统信息（建议技能/推荐信息/要求），
             # 文本与实时 _send({"type":"system",...}) 完全一致，前端按 .msg.system 渲染。
             sys_lines = []
+            ag = (parsed.get("agent_name") or "").strip()
+            if ag:
+                sys_lines.append(f"🤖 当前会话: {ag}")
             perm = (parsed.get("permission") or "").strip()
             if perm:
                 sys_lines.append(_format_permission_text(perm))
@@ -114,6 +125,10 @@ def _format_message_for_display(m: dict) -> dict:
             if rec:
                 items = [ln.strip() for ln in rec.split("\n") if ln.strip()]
                 sys_lines.append(f"🧠 推荐信息: {len(items)} 条\n" + "\n".join(items))
+            sinfo = (parsed.get("status_info") or "").strip()
+            if sinfo:
+                # 2026-09-04: 状态信息（session 级 KV）逐行渲染为系统行
+                sys_lines.append("📌 状态信息:\n" + "\n".join("    " + ln for ln in sinfo.split("\n") if ln.strip()))
             req = (parsed.get("requirement") or "").strip()
             if req:
                 # 对齐实时 skill_req 渲染：要求"用户要求调用X" → 💡 Skill loaded: X
@@ -121,6 +136,25 @@ def _format_message_for_display(m: dict) -> dict:
                     sys_lines.append(f"💡 Skill loaded: {req[len('用户要求调用'):]}")
                 else:
                     sys_lines.append(f"要求: {req}")
+            alarm = (parsed.get("system_alarm") or "").strip()
+            if alarm:
+                sys_lines.append(f"⚠️ 系统告警: {alarm}")
+            tcon = (parsed.get("tool_constraint") or "").strip()
+            if tcon:
+                sys_lines.append(f"⚠️ 工具约束: {tcon}")
+            ctx = parsed.get("skill_context") or ""
+            if ctx:
+                # 旧格式 [skill context: X] 消息 → 历史兼容渲染（实时 skill_selected 事件已移除）
+                sys_lines.append(f"🎯 技能选择: {ctx}")
+            for _fname, _fval in (parsed.get("extra_fields") or {}).items():
+                # v2 通用字段（2026-09-03）：未知头部字段通用渲染，新字段零改动可见
+                if not _fval:
+                    continue
+                _fv_lines = str(_fval).split("\n")
+                if len(_fv_lines) == 1:
+                    sys_lines.append(f"🏷 {_fname}: {_fv_lines[0]}")
+                else:
+                    sys_lines.append(f"🏷 {_fname}:\n" + "\n".join("    " + ln for ln in _fv_lines))
             if sys_lines:
                 msg["sysLines"] = sys_lines
             return msg
@@ -130,12 +164,12 @@ def _format_message_for_display(m: dict) -> dict:
     if role == "assistant":
         tool_calls = m.get("tool_calls")
         if tool_calls:
+            # 2026-08-15 修复：带 tool_calls 的 assistant 过渡语正文不能丢——
+            # displayType 用 assistant 走正文渲染（保留 content 原文），toolCalls 附加供前端补 tool 折叠框。
             return {
                 "role": "assistant",
-                "displayType": "tool_call",
-                "content": ", ".join(
-                    tc.get("function", {}).get("name", "") for tc in tool_calls
-                ),
+                "displayType": "assistant",
+                "content": content or "",
                 "toolCalls": [
                     {
                         "name": tc.get("function", {}).get("name", ""),
@@ -184,13 +218,95 @@ def _format_message_for_display(m: dict) -> dict:
 
 _agent_manager = AgentManager()
 _web_server = None  # uvicorn.Server 实例引用，用于优雅关闭
-_workdir: str | None = None
 _current_session: str | None = None
+_session_lock = threading.RLock()
+_session_ui_cache: dict[str, dict] = {}  # per-session mode/lock/skill 快照（不依赖 focus 缓存）
 # /api/session/stats TTL 缓存：前端高频轮询，避免每次阻塞 2-7 秒（log 中 7s 慢请求即由此而来）
 _STATS_TTL = 8.0   # 5→8s：前端轮询间隔常 >5s 导致缓存频繁失效，每次落入 2~4s 慢路径
 _stats_cache: dict[str, tuple[float, dict]] = {}
 _SESSIONS_TTL = 8.0   # sessions 列表轮询缓存：前端每 10s 轮询，TTL 8s 保证命中缓存，避免反复扫描目录+锁检查（IO 慢）
 _sessions_cache: dict[str, tuple[float, dict]] = {}
+
+# ── 会话级消息队列（2026-08-30）：busy 时 chat 消息入队，回合结束后自动续跑 ──
+# 设计：队列放 web 层而非 agent 内核——manager.send_input 会覆盖 active_turn_id，
+# 且第二个回合无 WS 转发任务会导致前端看不到实时流。仅内存不持久化：web 重启丢失。
+# v1.1：每条消息带 qid（uuid）支持单条取消；快照供前端刷新/切会话后重建排队视图。
+CHAT_QUEUE_MAX = 10   # 每 session 排队上限，超出拒绝（前端 error 提示）
+_chat_queues: dict[str, list] = {}   # session -> [{"qid": str, "text": str, "ts": float}, ...]（FIFO）
+_chat_queue_lock = threading.Lock()
+# 2026-09-04 修复：转发循环空闲兜底阈值（秒）。正常回合有流式事件（thinking/text），
+# 连续无事件超过该值基本只有卡死残留（如 _safe_send 挂起导致 blocked 分支未收尾）。
+_CHAT_FORWARD_IDLE_TIMEOUT = 900.0
+
+
+def _enqueue_chat(session: str, text: str) -> dict:
+    """消息入队，返回 {"qid", "position"}（position 为 1-based）；队列满抛 ValueError。"""
+    import uuid
+    with _chat_queue_lock:
+        q = _chat_queues.setdefault(session, [])
+        if len(q) >= CHAT_QUEUE_MAX:
+            raise ValueError(f"排队消息已达上限（{CHAT_QUEUE_MAX} 条），请等待处理或停止当前回合")
+        item = {"qid": uuid.uuid4().hex, "text": text, "ts": time.time()}
+        q.append(item)
+        return {"qid": item["qid"], "position": len(q)}
+
+
+def _pop_chat_queue(session: str | None) -> dict | None:
+    """弹出队头消息（FIFO），返回 {"qid","text"}；队列空返回 None。"""
+    if not session:
+        return None
+    with _chat_queue_lock:
+        q = _chat_queues.get(session)
+        if not q:
+            return None
+        item = q.pop(0)
+        if not q:
+            _chat_queues.pop(session, None)
+        return {"qid": item["qid"], "text": item["text"]}
+
+
+def _cancel_chat_item(session: str, qid: str) -> tuple:
+    """按 qid 取消单条排队消息，返回 (ok, text)；已开始处理/不存在返回 (False, None)。"""
+    with _chat_queue_lock:
+        q = _chat_queues.get(session)
+        if not q:
+            return False, None
+        for _i, _it in enumerate(q):
+            if _it["qid"] == qid:
+                _text = _it["text"]
+                q.pop(_i)
+                if not q:
+                    _chat_queues.pop(session, None)
+                return True, _text
+        return False, None
+
+
+def _chat_queue_snapshot(session: str | None) -> list:
+    """队列快照 [{qid,text,position}]（供前端刷新/切会话后重建排队视图与取消入口）。"""
+    if not session:
+        return []
+    with _chat_queue_lock:
+        q = _chat_queues.get(session)
+        if not q:
+            return []
+        return [{"qid": _it["qid"], "text": _it["text"], "position": _i + 1}
+                for _i, _it in enumerate(q)]
+
+
+def _clear_chat_queue(session: str | None) -> int:
+    """清空指定 session 的排队消息，返回清除条数（Stop/rerun/stop_agent 时调用）。"""
+    if not session:
+        return 0
+    with _chat_queue_lock:
+        q = _chat_queues.pop(session, None)
+        return len(q) if q else 0
+
+
+def _chat_queue_size(session: str | None) -> int:
+    if not session:
+        return 0
+    with _chat_queue_lock:
+        return len(_chat_queues.get(session) or [])
 
 # ── 崩溃通知：记录 agent 崩溃（自动重启前捕获），供前端提示用户感知 ──
 # 崩溃后自动重启会替换 _AgentProcess 导致 error 丢失，因此必须先记录再重启。
@@ -202,8 +318,84 @@ _crash_seq: int = 0
 _hashed_password: str = ""
 _auth_username: str = "admin"
 _tokens: dict[str, tuple[str, float]] = {}  # token -> (username, creation timestamp)
-TOKEN_EXPIRE_SECONDS: int = 0   # 0 = session cookie (close browser = expire)
+TOKEN_EXPIRE_SECONDS: int = 12 * 60 * 60
+MAX_UPLOAD_BYTES: int = 50 * 1024 * 1024
+_AUTH_EXEMPT_PATHS = frozenset({
+    "/login", "/api/login", "/api/check-auth",
+    # 2026-09-07: 静态/探测端点免 401 噪音（项目无此二路由，免鉴权后落 404；API 鉴权保留）
+    "/favicon.ico", "/metrics",
+})
+
+
+def _normalize_auth_path(path: str) -> str:
+    """Strip reverse-proxy prefix; exact-match auth whitelist paths."""
+    p = (path or "/").split("?", 1)[0].rstrip("/") or "/"
+    m = re.match(r"^/dsw-[^/]+/proxy/\d+(/.*)?$", p)
+    if m:
+        p = m.group(1) or "/"
+        p = p.rstrip("/") or "/"
+    return p
+
+
+def _is_auth_exempt(path: str) -> bool:
+    return _normalize_auth_path(path) in _AUTH_EXEMPT_PATHS
+
+
 _AUTH_COOKIE_NAME: str = secrets.token_hex(8)  # M方案: 进程级随机 cookie 名，跨实例隔离（避免多实例同域 cookie 互踢）
+
+
+def _get_current_session() -> str | None:
+    with _session_lock:
+        return _current_session
+
+
+def _set_current_session(name: str | None) -> None:
+    global _current_session
+    with _session_lock:
+        _current_session = name
+
+
+def _cache_session_ui(session: str | None, info: dict) -> None:
+    if not session or not isinstance(info, dict):
+        return
+    with _session_lock:
+        entry = dict(_session_ui_cache.get(session, {}))
+        for key in ("mode", "is_observing", "holder_info"):
+            if key in info:
+                entry[key] = info[key]
+        entry.setdefault("mode", "plan")
+        entry.setdefault("is_observing", False)
+        entry.setdefault("holder_info", None)
+        _session_ui_cache[session] = entry
+
+
+def _ui_cache(session: str | None) -> dict:
+    if not session:
+        return {}
+    with _session_lock:
+        return dict(_session_ui_cache.get(session, {}))
+
+
+def _focus_session(session: str) -> AgentManager:
+    """切换 manager focus + 同步 Web 当前 session（仅显式切 session 时调用）。"""
+    from codes.session_registry import validate_session_name
+    error = validate_session_name(session)
+    if error:
+        raise HTTPException(400, error)
+    session = _agent_manager.resolve_session(session)
+    _set_current_session(session)
+    prev_focus = _agent_manager.focus
+    _record_crash_notice(_agent_manager, session)
+    session_list = [s.session for s in _agent_manager.list_sessions()]
+    if session not in session_list:
+        logger.info(f"_focus_session: starting agent session={session}")
+        _agent_manager.start_agent(session, wait_ready=False)
+        _agent_manager.focus_session(session)
+    else:
+        _agent_manager.switch_focus(session)
+        if session != prev_focus:
+            _agent_manager.focus_session(session)
+    return _agent_manager
 
 
 
@@ -240,67 +432,55 @@ def _record_crash_notice(mgr: AgentManager, session: str | None = None) -> None:
 
 
 def _get_agent(session: str | None = None) -> AgentManager:
-    """Get or create an agent for a session via the manager.
-
-    使用 manager.resolve_session 解析默认 session（最新优先），并回写
-    全局 _current_session，确保 stats 等接口对前端返回一致的当前会话。
-    """
-    global _current_session
-    session = _agent_manager.resolve_session(session or _current_session)
-    _current_session = session  # 默认选择回写全局（问题1修复）
-    prev_focus = _agent_manager.focus
-    # ── 崩溃记录：必须在任何可能触发重启的调用之前（重启会替换 proc 丢失 error） ──
-    _record_crash_notice(_agent_manager, session)
-    # Ensure agent thread is running
-    session_list = [s.session for s in _agent_manager.list_sessions()]
-    if session not in session_list:
-        logger.info(f"_get_agent: starting agent session={session}, workdir={_workdir}")
-        _agent_manager.start_agent(session, wait_ready=True)
-        # 对齐 repl：完整切换（switch_focus + resume + 缓存同步）
-        _agent_manager.focus_session(session)
-    else:
-        _agent_manager.switch_focus(session)
-        if session != prev_focus:
-            # 对齐 repl：仅焦点变化时 resume + 同步缓存
-            _agent_manager.focus_session(session)
-
-    # ── 崩溃自动重启说明 ──
-    # 注: 原实现此处的 crashed 检测为死代码——switch_focus 内部检测到非 running
-    # 会直接 start_agent 替换 proc，此处再查已全部是 running。崩溃信息已在
-    # 上方 _record_crash_notice 捕获，重启由 switch_focus/start_agent 完成。
-    return _agent_manager
+    """显式切换 focus 并回写当前 session（创建/切换 session 用）。"""
+    if session:
+        return _focus_session(session)
+    resolved = _agent_manager.resolve_session(_get_current_session())
+    return _focus_session(resolved)
 
 
-def _ensure_focus_agent(mgr: AgentManager) -> AgentManager:
-    """确保焦点 agent 线程存活（WS 路径自愈，P0 修复）。
+def _ensure_agent_running(session: str | None = None) -> tuple[AgentManager, str]:
+    """启动 session 对应 agent，但不切换全局 focus（供只读 API 使用）。"""
+    if session:
+        from codes.session_registry import validate_session_name
+        error = validate_session_name(session)
+        if error:
+            raise HTTPException(400, error)
+    session = session or _get_current_session() or _agent_manager.resolve_session(None)
+    names = [s.session for s in _agent_manager.list_sessions()]
+    if session not in names:
+        _agent_manager.start_agent(session, wait_ready=False)
+    return _agent_manager, session
 
-    设计考虑: WS 聊天/模式切换路径直接走 manager.send_input/send_command，
-    不经过 _get_agent（仅 REST 接口调用），因此 agent 崩溃后 WS 交互
-    无任何自动恢复路径（用户现象: "No agent session active" / 模式切不动）。
-    此函数在 _ws_loop 的 chat/mode 分支前调用：
-      1. 线程存活检测——status=running 但线程已死（BaseException 崩溃）→ 重启
-      2. crashed 状态检测（对齐 _get_agent）→ switch_focus 触发 start_agent
-    """
-    focus = mgr.focus
-    if focus is None:
+
+def _ensure_session_agent(mgr: AgentManager, session: str | None) -> AgentManager:
+    """确保指定 session 的 agent 线程存活（不切换 focus）。"""
+    if not session:
         return mgr
-    # 0) 崩溃记录：在重启替换 proc 之前捕获 error（同 _get_agent 逻辑）
-    _record_crash_notice(mgr, focus)
-    # 1) 线程存活检测（防 BaseException 崩溃后 status 残留 running）
-    proc = mgr._agents.get(focus)  # noqa: SLF001 同项目内部访问
-    if proc is not None and proc.thread is not None and not proc.thread.is_alive():
-        logger.warning(f"_ensure_focus_agent: 焦点 agent 线程已死 session={focus}，自动重启")
-        mgr._agents.pop(focus, None)
-        mgr.start_agent(focus, wait_ready=False)
-        mgr.switch_focus(focus)
+    _record_crash_notice(mgr, session)
+    with mgr._lock:  # noqa: SLF001
+        proc = mgr._agents.get(session)
+    if proc is None or proc.status != "running":
+        mgr.start_agent(session, wait_ready=False)
         return mgr
-    # 2) crashed 状态检测（对齐 _get_agent）
-    crashed = [s for s in mgr.list_sessions()
-               if s.session == mgr.focus and s.status == "crashed"]
-    if crashed:
-        logger.warning(f"_ensure_focus_agent: Agent 崩溃后重启 session={mgr.focus}")
-        mgr.switch_focus(mgr.focus)
+    if proc.thread is not None and not proc.thread.is_alive():
+        logger.warning(f"_ensure_session_agent: agent 线程已死 session={session}，自动重启")
+        mgr.stop_agent(session)
+        mgr.start_agent(session, wait_ready=False)
+        return mgr
+    if proc.status == "crashed":
+        logger.warning(f"_ensure_session_agent: Agent 崩溃后重启 session={session}")
+        mgr.start_agent(session, wait_ready=False)
     return mgr
+
+
+def _session_mode(mgr: AgentManager, session: str | None) -> str:
+    info = _get_session_info(mgr, session, 1.0) if session else None
+    if info and info.get("mode"):
+        return info["mode"]
+    if session and mgr.focus == session:
+        return getattr(mgr, "_focus_mode", "plan")
+    return "plan"
 
 
 def _session_busy(mgr, name: str) -> bool:
@@ -319,22 +499,62 @@ def _session_busy(mgr, name: str) -> bool:
     return False
 
 
+def _should_update_focus_cache(mgr: AgentManager, session: str) -> bool:
+    """后台转发时仅 focus session 才更新 Web 侧全局 _focus_* 缓存。"""
+    return bool(session) and session == mgr.focus
+
+
+def _get_session_info(mgr: AgentManager, session: str, timeout: float = 1.0) -> dict | None:
+    """读取指定 session 的 get_info，不切换 focus（供 stats 等只读 API）。"""
+    event = mgr.send_command_wait("get_info", None, session, timeout)
+    if event and isinstance(event.get("data"), dict):
+        info = event["data"]
+        _cache_session_ui(session, info)
+        return info
+    return None
+
+
 # ── Auth core functions ──
 
 def _hash_password(password: str) -> str:
-    """Hash a password using SHA-256."""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """使用带盐 PBKDF2 保存密码，格式内含参数便于后续升级。"""
+    iterations = 310_000
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
 
 def _verify_password(password: str, hashed: str) -> bool:
     """Verify a password against its hash (constant-time comparison)."""
-    return secrets.compare_digest(_hash_password(password), hashed)
+    try:
+        algorithm, rounds, salt_hex, digest_hex = hashed.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), bytes.fromhex(salt_hex), int(rounds))
+        return secrets.compare_digest(digest.hex(), digest_hex)
+    except (TypeError, ValueError):
+        return False
 
 def _generate_token() -> str:
     """Generate a cryptographically secure random token."""
     return secrets.token_hex(32)
 
+def _prune_expired_tokens() -> None:
+    """清理过期 token，避免长跑进程 _tokens 无界增长。"""
+    if TOKEN_EXPIRE_SECONDS <= 0 or not _tokens:
+        return
+    now = datetime.now()
+    expired = [
+        t for t, (_, created) in _tokens.items()
+        if (now - datetime.fromtimestamp(created)).total_seconds() > TOKEN_EXPIRE_SECONDS
+    ]
+    for t in expired:
+        _tokens.pop(t, None)
+
+
 def _validate_token(token: str) -> str | None:
     """Validate a token; return the bound username, or None if invalid/expired."""
+    _prune_expired_tokens()
     if token not in _tokens:
         return None
     username, created = _tokens[token]
@@ -391,7 +611,7 @@ async def auth_middleware(request, call_next):
     # 适配反向代理子路径（如 DSW /dsw-xxx/proxy/4096/）：代理可能保留或重写前缀，
     # 用 endswith 匹配，避免代理保留前缀时白名单失效导致 /login 被 401 拦截
     _path = request.url.path
-    if _path in ("/login", "/api/login", "/api/check-auth") or _path.endswith(("/login", "/api/login", "/api/check-auth")):
+    if _is_auth_exempt(_path):
         return await call_next(request)
 
     # Check authentication
@@ -426,6 +646,19 @@ async def auth_middleware(request, call_next):
 # ── Access log middleware ──
 
 
+def _is_client_disconnect(exc: Exception) -> bool:
+    """判断异常链中是否存在 anyio 客户端断连特征（WouldBlock/EndOfStream）。"""
+    cur = exc
+    seen = 0
+    while cur is not None and seen < 8:
+        name = type(cur).__name__
+        if "EndOfStream" in name or "WouldBlock" in name:
+            return True
+        cur = getattr(cur, "__cause__", None)
+        seen += 1
+    return False
+
+
 @app.middleware("http")
 async def access_log_middleware(request: Request, call_next):
     """统一请求访问日志：method/path/status/耗时 → log 文件（不落库）。
@@ -436,12 +669,25 @@ async def access_log_middleware(request: Request, call_next):
     _t0 = time.time()
     try:
         resp = await call_next(request)
-    except Exception:
-        logger.exception(f"REQ {request.method} {request.url.path} 异常")
+    except Exception as _exc:
+        if _is_client_disconnect(_exc):
+            # 客户端提前断开（WS/HTTP 中止）→ anyio 抛 WouldBlock/EndOfStream，
+            # 属正常现象，降级为 debug 避免刷 ERROR 日志。
+            logger.debug(f"REQ {request.method} {request.url.path} 客户端断连")
+        else:
+            logger.exception(f"REQ {request.method} {request.url.path} 异常")
         raise
     cost_ms = (time.time() - _t0) * 1000
     ip = request.client.host if request.client else "-"
-    logger.info(f"REQ {request.method} {request.url.path} -> {resp.status_code} {cost_ms:.0f}ms ip={ip}")
+    if resp.status_code >= 400:
+        # 2026-09-09: 4xx/5xx 记录完整 query，便于定位坏 URL（如硬编码的非法 session）
+        _q = request.url.query or ""
+        if len(_q) > 500:
+            _q = _q[:500] + "…(truncated)"
+        _qs = ("?" + _q) if _q else ""
+        logger.warning(f"REQ {request.method} {request.url.path}{_qs} -> {resp.status_code} {cost_ms:.0f}ms ip={ip}")
+    else:
+        logger.info(f"REQ {request.method} {request.url.path} -> {resp.status_code} {cost_ms:.0f}ms ip={ip}")
     return resp
 
 #  REST API
@@ -495,19 +741,37 @@ async def api_login(request: Request):
 
     # Generate token
     token = _generate_token()
+    _prune_expired_tokens()
     _tokens[token] = (username, datetime.now().timestamp())
 
     from fastapi.responses import JSONResponse
     logger.info(f"AUTH 登录成功: username={username}")
     resp = JSONResponse(content={"ok": True, "token": token})
+    secure = request.url.scheme == "https" or os.environ.get("XKAGENT_COOKIE_SECURE") == "1"
     resp.set_cookie(
         key=_AUTH_COOKIE_NAME,
         value=token,
         httponly=True,
         samesite="lax",
-        max_age=None,  # Session cookie (expires when browser closes)
+        secure=secure,
+        max_age=TOKEN_EXPIRE_SECONDS,
         path="/",
     )
+    return resp
+
+
+@app.post("/api/logout")
+async def api_logout(request: Request):
+    """撤销当前 token 并清除认证 cookie。"""
+    token = request.cookies.get(_AUTH_COOKIE_NAME)
+    if token:
+        _tokens.pop(token, None)
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        _tokens.pop(auth[7:], None)
+    from fastapi.responses import JSONResponse
+    resp = JSONResponse(content={"ok": True})
+    resp.delete_cookie(_AUTH_COOKIE_NAME, path="/")
     return resp
 
 # ── 输入历史 API（与 repl.py 共享 .xkagent/history.txt）──
@@ -529,14 +793,16 @@ async def api_get_history(limit: int = Query(200, ge=1, le=5000)):
     前端一次性拉取并在本地维护游标，浏览过程零请求。
     """
     hist_file = _get_history_file()
-    try:
-        with open(hist_file, "r", encoding="utf-8") as f:
-            lines = [line.rstrip("\n") for line in f if line.strip()]
-    except FileNotFoundError:
-        lines = []
-    except (UnicodeDecodeError, OSError) as e:
-        logger.warning(f"读取历史失败(降级为空): {e}")
-        lines = []
+    def _read():
+        try:
+            with open(hist_file, "r", encoding="utf-8") as f:
+                return [line.rstrip("\n") for line in f if line.strip()]
+        except FileNotFoundError:
+            return []
+        except (UnicodeDecodeError, OSError) as e:
+            logger.warning(f"读取历史失败(降级为空): {e}")
+            return []
+    lines = await asyncio.to_thread(_read)
     _log("HIST", f"GET /api/history -> {len(lines)} lines (limit={limit})")
     return {"history": lines[-limit:]}
 
@@ -553,8 +819,7 @@ async def api_append_history(data: dict):
     if not text:
         return {"ok": False, "reason": "empty"}
     hist_file = _get_history_file()
-    try:
-        # ① 末尾去重: 读取尾部最后一非空行
+    def _append():
         last = ""
         try:
             with open(hist_file, "rb") as f:
@@ -568,16 +833,20 @@ async def api_append_history(data: dict):
         except FileNotFoundError:
             pass
         if last == text:
-            return {"ok": False, "reason": "duplicate"}
-        # ② 追加写入
+            return "duplicate"
         os.makedirs(os.path.dirname(hist_file), exist_ok=True)
         with open(hist_file, "a", encoding="utf-8") as f:
             f.write(text + "\n")
-        _log("HIST", f"POST /api/history append: {text[:40]!r}")
-        return {"ok": True}
+        return "ok"
+    try:
+        status = await asyncio.to_thread(_append)
     except OSError as e:
         logger.warning(f"追加历史失败: {e}")
         return {"ok": False, "reason": "io_error"}
+    if status == "duplicate":
+        return {"ok": False, "reason": "duplicate"}
+    _log("HIST", f"POST /api/history append: {text[:40]!r}")
+    return {"ok": True}
 
 def _collect_sessions_info() -> tuple:
     """线程池中执行：扫描 session 列表 + 锁检查（均为文件系统 IO）。
@@ -597,6 +866,22 @@ def _collect_sessions_info() -> tuple:
     return sessions, lock_tags
 
 
+@app.get("/api/autocompactlimit")
+async def api_get_autocompactlimit(session: str = Query("")):
+    """读取指定 session 的 autocompactlimit（get_info 字段透传）。
+
+    复用 _get_session_info（send_command_wait("get_info")，不切换 focus）；
+    agent 未运行/超时 → value=null（前端隐藏 indicator，不报错）。
+    """
+    target = session or _get_current_session()
+    if not target:
+        return {"ok": True, "value": None}
+    info = await asyncio.to_thread(_get_session_info, _agent_manager, target, 1.5)
+    value = info.get("autocompactlimit") if isinstance(info, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool):
+        value = None
+    return {"ok": True, "value": value, "session": target}
+
 @app.get("/api/sessions")
 async def api_list_sessions():
     logger.info("API: 列出 session")
@@ -608,18 +893,26 @@ async def api_list_sessions():
         return cached[1]
     # 文件 IO（目录扫描 + 锁检查）放入线程池，避免阻塞事件循环
     sessions, lock_tags = await asyncio.to_thread(_collect_sessions_info)
-    current = _current_session
+    current = _get_current_session()
     # 崩溃记录兜底：前端 2s 轮询 /api/sessions 是最高频路径，必须在此主动检测
     # 崩溃并记录（纯浏览/不发消息场景的感知兜底；proc 若已被 manager 内部重启
     # 为 running，此处仍能从 _crash_notices 持久记录返回 crash_notices）。
     _record_crash_notice(_agent_manager)
     # 注：仅包含已启动的 agent 线程；未启动的 session 不在 agents 中（phase 视为 idle）
+    session_set = set(sessions)
     agents = {}
     for si in _agent_manager.list_sessions():
+        if si.session not in session_set:
+            continue
         agents[si.session] = {
             "phase": si.phase,       # "starting" | "idle" | "llm"
             "in_tool": si.in_tool,   # 是否有 tool 正在执行
             "turn_active": getattr(si, "turn_active", False),  # 回合级活跃标志（2026-08-10）
+            # 2026-09-04 修复：WS 转发任务活跃度（与 turn_active 独立）——转发任务卡死
+            # 时 agent 回合已结束但任务未结束，前端据此显示 busy，避免"静默排队"
+            "chat_forward_busy": _chat_forward_busy_global(si.session),
+            # 2026-09-04 修复：排队消息数（跨 session 可见——前端侧边栏徽标）
+            "queue_count": _chat_queue_size(si.session),
             "status": si.status,     # "running" | "stopped" | "crashed"
             "error": si.error,       # 崩溃错误信息（crashed 时非 None，供前端提示）
             "mode": si.mode,         # "plan" | "build" | "build-unsafe"（供面板徽标显示）
@@ -630,10 +923,36 @@ async def api_list_sessions():
     # 崩溃通知透传（未 ack 的）：供侧边栏 🔴crashed 徽标与消息区警告横幅
     crash_notices = {
         s: {"time": n["time"], "error": n["error"], "seq": n["seq"]}
-        for s, n in _crash_notices.items() if not n.get("acked")
+        for s, n in _crash_notices.items() if not n.get("acked") and s in session_set
     }
+    workdirs = {}
+    for session_name in sessions:
+        try:
+            workdirs[session_name] = _resolve_workdir(session_name)
+        except Exception:
+            workdirs[session_name] = ""
+    # 2026-09-10: 展示标题（title）随列表一并下发，前端零额外请求。
+    # title 未设置 → 回退 session name（display = title or name，唯一 fallback 规则）。
+    from codes import session_registry as _sreg
+    # 2026-09-10: 单次 list_contexts() 构建 titles——避免逐 session get() 造成 N 次
+    # registry 文件读取（/api/sessions 是 2s 高频轮询端点，读文件次数必须 O(1)）。
+    titles = {}
+    pins = []
+    try:
+        _contexts = _sreg.list_contexts()
+        for _ctx in _contexts:
+            titles[_ctx.name] = _ctx.title or _ctx.name
+        # 2026-09-10: 置顶列表（最近置顶在前；仅保留仍在列表中的会话，与 sessions 口径一致）
+        pins = [c.name for c in sorted(_contexts, key=lambda c: c.pinned_at or 0.0, reverse=True)
+                if c.pinned and c.name in session_set]
+    except Exception:
+        pass
+    # 目录发现的未注册 .msgz 会话无 context → 回退 name（与 get() None 分支同语义）
+    for session_name in sessions:
+        titles.setdefault(session_name, session_name)
     result = {"sessions": sessions, "current": current, "lock_tags": lock_tags,
-              "agents": agents, "crash_notices": crash_notices}
+              "agents": agents, "crash_notices": crash_notices, "workdirs": workdirs,
+              "titles": titles, "pins": pins}
     _sessions_cache["default"] = (now, result)
     return result
 
@@ -642,16 +961,22 @@ async def api_list_sessions():
 @app.post("/api/sessions")
 async def api_create_session(data: dict):
     """Create a new session via manager (对齐 repl: start_agent + switch)."""
-    global _current_session
     name = data.get("name", datetime.now().strftime("session_%Y%m%d_%H%M%S"))
     if not name or not re.match(r'^[a-zA-Z0-9_\-.]+$', str(name)):
         raise HTTPException(400, "Invalid session name")
-    ok, msg = add_session(name)
+    # title 可选：展示名（支持中文/空格/emoji），不参与路径；未设置则展示回退 name
+    title = data.get("title")
+    from codes.session_registry import validate_session_title as _vtitle
+    _terr = _vtitle(title)
+    if _terr:
+        raise HTTPException(400, _terr)
+    # 支持自定义 workdir（对齐 repl /session add --workdir）：
+    # 透传 add_session(name, workdir)，validate_workdir 校验失败时
+    # add_session 内部捕获 ValueError 返回 (False, msg)，此处转 400。
+    ok, msg = add_session(name, workdir=data.get("workdir") or None, title=title)
     if not ok:
         raise HTTPException(400, msg)
-    # 通过 manager 启动 agent 线程（不再覆盖全局单例）
     _get_agent(name)
-    _current_session = name
     logger.info(f"SESSION 创建: {name}")
     _sessions_cache.clear()  # 列表缓存失效，前端立即拿到新 session
     _stats_cache.clear()  # P0: stats 缓存失效，新 session 统计立即准确
@@ -659,20 +984,17 @@ async def api_create_session(data: dict):
 @app.post("/api/sessions/{name}/switch")
 async def api_switch_session(name: str):
     """Switch to an existing session (对齐 repl：更新 _current_session + 真实 msg_count)."""
-    global _current_session
     if not session_exists(name):
         raise HTTPException(404, f"Session '{name}' not found")
     agent = _get_agent(name)
-    _current_session = name
     # FIX: 2.0→1.0：agent 忙碌时 get_focus_info 必然超时（get_info 命令排队等 LLM 回合结束），
     # 降低超时避免 REST 切换被拖慢；_get_agent 内部 focus_session 已同步缓存
     info = await asyncio.to_thread(agent.get_focus_info, 1.0)
     if info:
-        # FIX: REST 切 session 后同步真实 mode/锁状态/技能选择到缓存
         agent._focus_mode = info.get("mode", agent._focus_mode)
         agent._focus_observing = info.get("is_observing", False)
         agent._focus_holder_info = info.get("holder_info", None)
-        agent._focus_skill_select = info.get("skill_select_enabled", agent._focus_skill_select)
+        _cache_session_ui(name, info)
     msg_count = info.get("msg_count", 0) if info else 0
     logger.info(f"SESSION 切换: {name}")
     _sessions_cache.clear()  # 列表缓存失效，切换后立即重排（选中置顶）
@@ -680,32 +1002,100 @@ async def api_switch_session(name: str):
     return {"session": name, "messages": msg_count}
 
 
-def _load_session_messages(name: str, after_id: int, limit: int | None = None) -> tuple:
+@app.post("/api/sessions/{name}/title")
+async def api_set_session_title(name: str, data: dict):
+    """设置/清空 session 展示标题（title）。
+
+    title 仅用于展示（支持中文/空格/emoji），不参与磁盘路径与调用寻址；
+    空串/空白 → 清除（展示回退 session name）。name 仍须为合法 ASCII key。
+    """
+    from codes.session_registry import set_title as _set_title
+    from codes.session_registry import validate_session_title as _vtitle
+    data = data or {}   # 空 body 防御：视为清除标题
+    error = _vtitle(data.get("title"))
+    if error:
+        raise HTTPException(400, error)
+    try:
+        context = await asyncio.to_thread(_set_title, name, data.get("title"))
+    except KeyError:
+        raise HTTPException(404, f"Session '{name}' not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _sessions_cache.clear()  # 列表缓存失效，前端立即拿到新标题
+    logger.info(f"SESSION 标题更新: {name} -> {context.title!r}")
+    return {"session": name, "title": context.title,
+            "display": context.display_name, "message": "title updated"}
+
+
+# ── 2026-08-23: 最近消息缓存（读路径降载 + EIO 降级）──
+# 前端 2s 轮询 messages（实测 17 次/分钟）全走 DB；EIO 时 sqlite 连接初始化
+# （-shm/-wal 写）即失败。缓存最近 N 条 + last_id，按 db 文件 mtime+size 失效；
+# EIO 期间命中缓存可绕过 DB（前端继续可用）；stat 失败时降级信任缓存。
+_MSG_CACHE_MAX_ROWS = 200
+_MSG_CACHE_MAX_SESSIONS = 100
+_msg_cache: dict[str, tuple] = {}   # name -> (mtime_ns, size, last_id, rows)
+_msg_cache_lock = threading.Lock()
+
+
+def _msg_cache_db_path(name: str) -> str:
+    """（2026-08-25 msgz 迁移）缓存已禁用，函数保留仅供诊断；
+    路径跟随 msgz 存储（.msgz 单文件）。"""
+    return os.path.join(str(_config.get_default_workdir()), ".xkagent", "historys", name + ".msgz")
+
+
+def _try_msg_cache(name: str, after_id: int):
+    """增量轮询缓存（已禁用 2026-08-25）。
+
+    根因：msgz 已替代 sqlite（内存主数据 + 原子落盘），sqlite EIO 降级
+    用的消息缓存不再需要；且 .db 文件已迁移移除，os.stat(.db) 恒失败
+    → key=None → 缓存永不失效 → 增量轮询返回旧数据 → 切回 session 后
+    历史消息丢失。直接禁用：每次走 DB（msgz 内存读，快），彻底消除
+    脏缓存风险。
+    """
+    return None
+
+
+def _fill_msg_cache(name: str, raw: list, last_id: int):
+    """填充消息缓存（已禁用 2026-08-25，与 _try_msg_cache 同步禁用）。"""
+    return
+
+
+def _load_session_messages(name: str, after_id: int, limit: int | None = None, before_id: int = 0) -> tuple:
     """在线程池中执行 DB 读取：连接 + 查询(可选分页) + 关闭连接。
 
-    独立函数以便 asyncio.to_thread 包裹——避免 sqlite 锁等待
-    （busy_timeout=10s）阻塞 asyncio 事件循环（check 报告根因1）。
+    独立函数以便 asyncio.to_thread 包裹——msgz 内存读 O(n) 快，
+    线程池隔离避免阻塞 asyncio 事件循环（原 sqlite busy_timeout 已随迁移消除）。
     limit 仅在 after_id=0（全量分页）时传入；增量路径必须完整返回（不截断），
     否则会漏消息导致前端缓存水位线错乱。
     返回 (messages, last_id) 或 (messages, last_id, total)（limit 非 None 时）。
     """
+    # 2026-08-23: 增量轮询路径（前端主形态）→ 先试内存缓存（命中可绕过 DB，EIO 降级）
+    if after_id > 0 and before_id == 0 and limit is None:
+        cached = _try_msg_cache(name, after_id)
+        if cached is not None:
+            return cached
     conn = get_conn(name)
     try:
+        if before_id > 0:
+            # "加载更早"向前分页：id < before_id 的最新 limit 条，不受 compact cutoff 限制
+            return get_messages_before(conn, before_id, limit=limit or 20,
+                                       fields=["command", "thinking"], with_id=True, with_time=True)
         if limit is not None:
             # 全量分页：COUNT 轻量统计可见消息总数（与 get_messages_since 过滤一致）。
             # 2026-08-05: 放开 command 渲染后，COUNT 排除集同步去掉 command，
             # 否则 total 与返回消息数不一致会误导 has_more/已渲染条数。
-            total = conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE role NOT IN ('git','compact','drop')"
-            ).fetchone()[0]
-            raw, last_id = get_messages_since(conn, None, with_id=True, limit=limit, fields=["command", "thinking"], with_time=True)
+            total = conn.count_visible(include_compact=True)   # 与 ignore_cutoff=True 返回集一致（含 compact marker，防 has_more/"加载更早"计数错乱）
+            raw, last_id = get_messages_since(conn, None, with_id=True, limit=limit, fields=["command", "thinking"], with_time=True, ignore_cutoff=True)
             return raw, last_id, total
-        return get_messages_since(conn, after_id or None, with_id=True, fields=["command", "thinking"], with_time=True)
+        raw, last_id = get_messages_since(conn, after_id or None, with_id=True, fields=["command", "thinking"], with_time=True, ignore_cutoff=True)
+        if after_id > 0:
+            _fill_msg_cache(name, raw, last_id)   # 2026-08-23: 填充缓存供下次轮询命中
+        return raw, last_id
     finally:
         conn.close()
 
 @app.get("/api/sessions/{name}/messages")
-async def api_get_session_messages(name: str, after_id: int = 0, limit: int = Query(50, ge=1, le=500)):
+async def api_get_session_messages(name: str, after_id: int = 0, limit: int = Query(50, ge=1, le=500), before_id: int = 0):
     """Get messages for a session, optionally incremental.
 
     - after_id=0（默认）→ 全量分页：返回最近 limit 条 + total 总数 + has_more
@@ -723,6 +1113,21 @@ async def api_get_session_messages(name: str, after_id: int = 0, limit: int = Qu
     # 崩溃通知：前端 2s 轮询 messages 是用户感知崩溃最快的路径（先记录再渲染）
     _record_crash_notice(_agent_manager, name)
     # DB 操作（连接+查询+关闭）整体放入线程池，避免 sqlite 锁等待阻塞事件循环
+    if before_id > 0:
+        # "加载更早"向前分页：id < before_id 的最新 limit 条，不受 compact cutoff 限制
+        raw, has_more, oldest_id = await asyncio.to_thread(_load_session_messages, name, 0, limit, before_id)
+        msgs = [_format_message_for_display(m) for m in raw]
+        for _m, _raw in zip(msgs, raw):
+            _m["_id"] = _raw.get("_id")
+            _m["created_at"] = _raw.get("created_at", "")
+        _log("CHAT", f"Loaded {len(msgs)} older messages for session '{name}' (before_id={before_id}, has_more={has_more})")
+        resp = {"session": name, "messages": msgs, "has_more": has_more, "oldest_id": oldest_id}
+        notice = _crash_notices.get(name)
+        if notice and not notice.get("acked"):
+            resp["crash_notice"] = {
+                "time": notice["time"], "error": notice["error"], "seq": notice["seq"],
+            }
+        return resp
     if after_id == 0:
         # 全量分页路径：limit 生效；增量路径不传 limit（必须完整返回防漏消息）
         raw, last_id, total = await asyncio.to_thread(_load_session_messages, name, after_id, limit)
@@ -736,7 +1141,12 @@ async def api_get_session_messages(name: str, after_id: int = 0, limit: int = Qu
     for _m, _raw in zip(msgs, raw):
         _m["_id"] = _raw.get("_id")
         _m["created_at"] = _raw.get("created_at", "")
-    _log("CHAT", f"Loaded {len(msgs)} messages for session '{name}' (after_id={after_id}, last_id={last_id}, total={total})")
+    # 日志降级（2026-08-22）：无新消息时前端 2s 轮询会重复请求空结果（last_id=0 被 || 短路），
+    # 无条件打 INFO 会每 2s 刷一条日志。有消息才打 INFO，空结果降级 DEBUG。
+    if msgs:
+        _log("CHAT", f"Loaded {len(msgs)} messages for session '{name}' (after_id={after_id}, last_id={last_id}, total={total})")
+    else:
+        logger.debug(f"Loaded 0 messages for session '{name}' (after_id={after_id}, last_id={last_id})")
     resp = {"session": name, "messages": msgs, "last_id": last_id}
     # 崩溃通知透传：前端据此弹出警告横幅（未 ack 才返回，ack 后清除）
     notice = _crash_notices.get(name)
@@ -789,25 +1199,28 @@ async def api_stop_session(name: str):
     其他会话并同步 _current_session（防止 stats 轮询经 resolve_session 重启刚停止的会话），
     返回 switched_to 供前端同步 UI；无其他会话时置 _current_session=None 交由 resolve_session 兜底。
     """
-    global _current_session
     if not session_exists(name):
         raise HTTPException(404, f"Session '{name}' not found")
     ok = _agent_manager.stop_agent(name)
     logger.warning(f"SESSION 停止: {name} (ok={ok})")
-    _sessions_cache.clear()  # 列表缓存失效，停止后立即从 running 组消失
-    _stats_cache.clear()  # stats 缓存失效：停止后统计立即刷新
+    _sessions_cache.clear()
+    _stats_cache.clear()
+    # 2026-08-30: 会话停止 → 排队消息一并清空（对齐 interrupt 的 Stop 语义）
+    queue_cleared = _clear_chat_queue(name)
+    if queue_cleared:
+        logger.info(f"SESSION 停止清空排队消息: {name} count={queue_cleared}")
     if not ok:
-        return {"ok": False, "reason": "not_running"}
+        return {"ok": False, "reason": "not_running", "queue_cleared": queue_cleared}
     switched_to = None
-    if name == _current_session:
+    if name == _get_current_session():
         switched_to = _pick_next_session(name)
         if switched_to:
-            _get_agent(switched_to)   # switch focus（未运行则自动启动）
-            _current_session = switched_to
-            _stats_cache.clear()  # P0: focus 已切走，旧 key 缓存立即失效
+            await asyncio.to_thread(_agent_manager.focus_session, switched_to)
+            _set_current_session(switched_to)
+            _stats_cache.clear()
         else:
-            _current_session = None   # 无其他会话：resolve_session 兜底
-    return {"ok": True, "switched_to": switched_to}
+            _set_current_session(None)
+    return {"ok": True, "switched_to": switched_to, "queue_cleared": queue_cleared}
 
 @app.post("/api/sessions/{name}/fork")
 async def api_fork_session(name: str, data: dict):
@@ -816,23 +1229,54 @@ async def api_fork_session(name: str, data: dict):
     设计考虑:
       - 与 /session fork <name> 的区别：repl 版固定 fork 当前 focus 会话，
         此端点可对列表中任意 session 操作（前端 fork 按钮直接调用）。
-      - 复用 history.fork_session（WAL checkpoint + 文件复制 + 回滚），
-        运行中会话亦可 fork（partial checkpoint 时 .db-wal 一并复制保数据完整）。
+      - 复用 history.fork_session（msgz 文件复制：先 sync 落盘再 shutil.copy2），
+        运行中会话亦可 fork（内存 store 先落盘保证最新数据）。
       - fork 后不自动切换/不启动 agent（对齐 repl 行为），新会话出现在列表，
         用户点击切换时 _get_agent 自动启动。
+      - 可选 cutoff（消息 id）：仅 fork 该消息及其上方历史/LLM 回复（截断复制），
+        不传则完整复制（向后兼容）。
     """
     if not session_exists(name):
         raise HTTPException(404, f"Session '{name}' not found")
     target = (data.get("target") or "").strip()
     if not target:
         raise HTTPException(400, "Missing target session name")
-    ok, msg = fork_session(name, target)
+    cutoff = data.get("cutoff")
+    if cutoff is not None:
+        try:
+            cutoff = int(cutoff)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "cutoff must be an integer message id")
+    ok, msg = fork_session(name, target, cutoff)
     if not ok:
         raise HTTPException(400, msg)
     _sessions_cache.clear()   # 列表缓存失效，新 session 立即出现
-    logger.info(f"SESSION fork: {name} -> {target}")
+    logger.info(f"SESSION fork: {name} -> {target}" + (f" (until msg {cutoff})" if cutoff is not None else ""))
     return {"ok": True, "session": target, "message": msg}
 
+
+
+@app.post("/api/sessions/{name}/pin")
+async def api_set_session_pin(name: str, data: dict):
+    """置顶/取消置顶 session（侧边栏「📌 置顶」分区固定显示；对齐 title 端点的异常/缓存语义）。
+
+    置顶状态持久化在 registry 记录（pinned/pinned_at 字段，与 title 同文件同锁）；
+    返回更新后的完整置顶列表，供前端立即重排列表。
+    """
+    from codes.session_registry import set_pin as _set_pin
+    from codes.session_registry import list_pins as _list_pins
+    data = data or {}   # 空 body 防御：默认置顶
+    pinned = bool(data.get("pinned", True))
+    try:
+        await asyncio.to_thread(_set_pin, name, pinned)
+    except KeyError:
+        raise HTTPException(404, f"Session '{name}' not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _sessions_cache.clear()   # 列表缓存失效，前端立即拿到新置顶顺序
+    pins = await asyncio.to_thread(_list_pins)
+    logger.info(f"SESSION 置顶更新: {name} pinned={pinned}")
+    return {"session": name, "pinned": pinned, "pins": pins, "message": "pin updated"}
 
 
 def _fetch_token_stats(session: str) -> dict:
@@ -849,12 +1293,13 @@ def _fetch_token_stats(session: str) -> dict:
         return {
             "prompt_tokens": _ts.get("prompt_tokens", 0) or 0,
             "completion_tokens": _ts.get("completion_tokens", 0) or 0,
+            "reasoning_tokens": _ts.get("reasoning_tokens", 0) or 0,
         }
     except Exception:
-        return {"prompt_tokens": 0, "completion_tokens": 0}
+        return {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}
 
 
-def _resolve_effective_model(info: dict) -> str:
+def _resolve_effective_model(info: dict, session: str | None = None) -> str:
     """解析当前实际生效的模型名。
 
     设计考虑：agent.get_info 返回的 model 是 self.model（用户显式 /model 设置过才非空）；
@@ -866,20 +1311,52 @@ def _resolve_effective_model(info: dict) -> str:
     prov = (info.get("provider") or "").strip()
     if not prov:
         return ""
+    token = None
     try:
+        if session:
+            _context, token = _config.activate_session(session, ensure=False)
         from codes import provider_config as _pc
         return str(_pc.get_provider(prov).get("default_model", "") or "").strip()
     except Exception:
         return ""
+    finally:
+        if token is not None:
+            _config.reset_session(token)
 
 
 @app.post("/api/model/test")
-async def api_model_test():
+async def api_model_test(session: str = Query(None)):
     """测试全部 provider+model 的联通性（复用 /model test 全量测速逻辑）。"""
+    token = None
     try:
+        effective = _checked_session(session) or _get_current_session()
+        if effective:
+            _context, token = _config.activate_session(effective, ensure=False)
         from codes import llm as _llm
         results, elapsed = await asyncio.to_thread(_llm.test_all_connectivity, timeout=15)
         return {"ok": True, "results": results, "elapsed": elapsed}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        if token is not None:
+            _config.reset_session(token)
+
+
+@app.get("/api/model/list")
+async def api_model_list(session: str = Query(None)):
+    # 列出 config 全部 provider+model（不测速），供前端下拉框选择切换。
+    # current 复用 api_session_stats 的实际生效模型解析（含 default_model 兜底）。
+    try:
+        from codes import llm as _llm
+        models = [{"provider": p, "model": m} for p, m in _llm._iter_test_targets()]
+        current = None
+        try:
+            stats = await api_session_stats(session=session)
+            if stats.get("provider") or stats.get("model"):
+                current = {"provider": stats.get("provider") or "", "model": stats.get("model") or ""}
+        except Exception:
+            current = None
+        return {"ok": True, "models": models, "current": current}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -902,30 +1379,51 @@ async def api_model_set(data: dict):
         """对单个 agent 设置 provider/model，返回错误信息或 None。"""
         try:
             if provider:
-                agent.send_command("set_provider", {"provider": provider})
-            agent.send_command("set_model", {"model": model})
+                ev = agent.send_command_wait("set_provider", {"provider": provider},
+                                             session=name, timeout=2.0)
+                if not ev or ev.get("ok") is False:
+                    return f"{name}: provider switch failed"
+            # 拆分 :effort 后缀：model 存纯名，effort 走 reasoning_effort 临时覆盖
+            # （对齐 commands.py /model 命令语义，否则 web 侧 effort 只能靠配置推导）
+            from codes import provider_config as _pc
+            model_part, effort_arg = _pc.split_model_effort(str(model))
+            send_kwargs = {"model": model_part}
+            if effort_arg:
+                send_kwargs["reasoning_effort"] = effort_arg
+            ev = agent.send_command_wait("set_model", send_kwargs,
+                                         session=name, timeout=2.0)
+            if not ev or ev.get("ok") is False:
+                return f"{name}: model switch failed"
             return None
         except Exception as e:
             return f"{name}: {e}"
 
     if scope == "current":
-        agent = _get_agent()
-        err = _set_one(agent, _current_session or "current")
+        agent = await asyncio.to_thread(_get_agent)
+        err = await asyncio.to_thread(_set_one, agent, _get_current_session() or "current")
         if err:
             return {"ok": False, "error": err}
         _stats_cache.clear()
-        return {"ok": True, "scope": "current", "session": _current_session, "model": model, "provider": provider}
+        return {"ok": True, "scope": "current", "session": _get_current_session(), "model": model, "provider": provider}
 
-    # all：遍历全部已启动 agent 设置
-    results = {}
-    for si in _agent_manager.list_sessions():
-        name = si.session
-        try:
-            agent = _get_agent(name)
-            err = _set_one(agent, name)
-            results[name] = "ok" if err is None else err
-        except Exception as e:
-            results[name] = str(e)
+    # all：全部 registry session 写 DB；已运行 agent 再发 set_* 命令
+    def _set_all():
+        from codes.history import list_sessions, set_agent_state, get_agent_state
+        results = {}
+        running = {si.session for si in _agent_manager.list_sessions() if si.status == "running"}
+        for name in list_sessions():
+            try:
+                if name in running:
+                    err = _set_one(_agent_manager, name)
+                    results[name] = "ok" if err is None else err
+                else:
+                    cur_p, _cur_m = get_agent_state(name)
+                    set_agent_state(name, provider=provider or cur_p or None, model=model)
+                    results[name] = "ok (db)"
+            except Exception as e:
+                results[name] = str(e)
+        return results
+    results = await asyncio.to_thread(_set_all)
     _sessions_cache.clear()
     _stats_cache.clear()
     ok_count = sum(1 for v in results.values() if v == "ok")
@@ -940,9 +1438,10 @@ async def api_session_stats(session: str = Query(None)):
     _current_session），切换 session 后 key 自然变化不再命中旧缓存；
     各切换路径同时 _stats_cache.clear() 双保险立即失效。
     P1-C: tokens 与 last_* 统一读 effective 的 db，返回 session 也用 effective。
+    UX 修复: 使用 _ensure_agent_running + send_command_wait(get_info, session=...)
+    代替 _get_agent，避免 stats 轮询悄悄 switch_focus 导致 chat 进错 session。
     """
-    agent = _get_agent(session)   # resolve + 回写 _current_session（stats 权威当前会话）
-    effective = _current_session or ""
+    agent, effective = await asyncio.to_thread(_ensure_agent_running, session)
     cache_key = effective
     now = time.time()
     cached = _stats_cache.get(cache_key)
@@ -950,7 +1449,7 @@ async def api_session_stats(session: str = Query(None)):
         return cached[1]
 
     tokens = await asyncio.to_thread(_fetch_token_stats, effective)
-    info = await asyncio.to_thread(agent.get_focus_info, 1.0)  # 2.0→1.0：stats 慢请求(日志 2~4s)主要阻塞源之一
+    info = await asyncio.to_thread(_get_session_info, agent, effective, 1.0)
     # v2: 最近一轮单轮值（last_*）与累计值同源读 effective 的 db
     try:
         _ts = get_token_state(effective)
@@ -965,15 +1464,16 @@ async def api_session_stats(session: str = Query(None)):
             "messages": info.get("msg_count", 0),
             "prompt_tokens": tokens["prompt_tokens"],
             "completion_tokens": tokens["completion_tokens"],
+            "reasoning_tokens": tokens["reasoning_tokens"],
             "last_prompt_tokens": _last_p,
             "last_completion_tokens": _last_c,
-            "model": _resolve_effective_model(info),
+            "model": _resolve_effective_model(info, effective),
             "provider": info.get("provider", "") or "",
             # T5: 透传锁状态（观察者模式 / 持有者信息），供前端渲染 ⏳/🔒 标签
             "observing": info.get("is_observing", False),
             "holder": info.get("holder_info", None),
             # 路径链接：项目根（前端据此识别绝对路径）
-            "workdir": _resolve_workdir(),
+            "workdir": _resolve_workdir(effective),
         }
     else:
         # info 为 None（agent 忙碌/未就绪，get_focus_info 超时）时，从 session db 读取
@@ -984,38 +1484,141 @@ async def api_session_stats(session: str = Query(None)):
         except Exception:
             _p, _m = "", ""
         if not _m and _p:
-            try:
-                from codes import provider_config as _pc2
-                _m = str(_pc2.get_provider(_p).get("default_model", "") or "").strip()
-            except Exception:
-                _m = ""
-        result = {"session": effective, "mode": getattr(agent, "_focus_mode", "plan"), "messages": 0,
+            _m = _resolve_effective_model({"provider": _p}, effective)
+        _ui = _ui_cache(effective)
+        _mode = _ui.get("mode") or ("plan" if agent.focus != effective else getattr(agent, "_focus_mode", "plan"))
+        result = {"session": effective, "mode": _mode, "messages": 0,
                 "prompt_tokens": tokens["prompt_tokens"],
                 "completion_tokens": tokens["completion_tokens"],
+                "reasoning_tokens": tokens["reasoning_tokens"],
                 "last_prompt_tokens": _last_p,
                 "last_completion_tokens": _last_c,
                 "model": _m,
                 "provider": _p,
-                "observing": False,
-                "holder": None,
-                "workdir": _resolve_workdir()}
+                "observing": _ui.get("is_observing", False),
+                "holder": _ui.get("holder_info"),
+                "workdir": _resolve_workdir(effective)}
     _stats_cache[cache_key] = (time.time(), result)
     return result
-def _resolve_workdir() -> str:
-    """项目根目录：优先模块级 _workdir（run_web 设置），否则回退 cwd。"""
-    if _workdir:
-        return os.path.realpath(_workdir)
-    return os.path.realpath(os.getcwd())
+def _resolve_workdir(session: str | None = None) -> str:
+    """解析 session 创建时固定的 workdir；无 session 时回退启动默认目录。"""
+    effective = session or _get_current_session()
+    if effective:
+        from codes.session_registry import get as _get_session_context
+        context = _get_session_context(effective)
+        if context is not None:
+            return str(context.workdir)
+    return str(_config.get_default_workdir().resolve())
+
+
+def _checked_session(session: str | None) -> str | None:
+    """校验可选 session 名；非法名称直接 400，避免 files/stats 路径穿越。"""
+    if not session:
+        return None
+    from codes.session_registry import validate_session_name
+    error = validate_session_name(session)
+    if error:
+        raise HTTPException(400, error)
+    return session
+
+
+def _checked_session_soft(session: str | None) -> str | None:
+    """文件类端点专用：非法 session 名不再 400，warning 后视同缺省（回退当前会话）。
+
+    设计考虑（2026-09-09）：历史消息/书签里硬编码的绝对 URL 可能携带非法 session 值
+    （如 LLM 误写 ``{sess}``），严格 400 会让浏览器地址栏显示裸 JSON。session 仅用于
+    挑选允许根、不参与路径拼接，忽略非法值回退当前会话不会扩大访问面。
+    """
+    if not session:
+        return None
+    from codes.session_registry import validate_session_name
+    error = validate_session_name(session)
+    if error:
+        logger.warning(f"files: 忽略非法 session={session!r}（{error}），回退当前会话")
+        return None
+    return session
+
+
+_FILE_ERROR_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} · XKAgent</title>
+<style>
+  :root {{ --bg:#f3f5fb; --surface:#fff; --text:#1c1f23; --muted:#57606a; --border:rgba(28,31,35,.08); --accent:#0066ff; }}
+  * {{ box-sizing:border-box; margin:0; padding:0; }}
+  body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;
+         background:var(--bg); color:var(--text); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }}
+  .card {{ max-width:640px; width:100%; background:var(--surface); border:1px solid var(--border); border-radius:12px;
+          padding:28px 30px; box-shadow:0 2px 12px rgba(28,31,35,.06); }}
+  .icon {{ font-size:34px; line-height:1; }}
+  h1 {{ font-size:19px; margin:12px 0 8px; }}
+  .name {{ display:inline-block; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:14px;
+          background:#f6f8fa; border:1px solid var(--border); border-radius:6px; padding:3px 8px; word-break:break-all; }}
+  .path {{ color:var(--muted); font-size:12.5px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+          word-break:break-all; margin-top:10px; }}
+  .hint {{ color:var(--muted); font-size:13px; margin-top:14px; line-height:1.6; }}
+  a.btn {{ display:inline-block; margin-top:20px; color:var(--accent); text-decoration:none; font-size:13.5px; }}
+  a.btn:hover {{ text-decoration:underline; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">📄</div>
+  <h1>{title}</h1>
+  <div class="name">{name}</div>
+  <div class="path">原始路径：{path}</div>
+  <div class="hint">{hint}</div>
+  <a class="btn" href="javascript:history.back()">← 返回上一页</a>
+</div>
+</body>
+</html>
+"""
+
+
+def _wants_html(request: Request) -> bool:
+    """浏览器地址栏导航（Accept 含 text/html）→ 友好 HTML；XHR/fetch/img 调用保持 JSON。"""
+    try:
+        return "text/html" in (request.headers.get("accept") or "").lower()
+    except Exception:
+        return False
+
+
+def _friendly_file_error(request: Request, path: str, status: int, detail: str):
+    """文件类端点错误响应：浏览器导航返回友好 HTML（显式显示文件名），API 调用仍返回 JSON。
+
+    设计考虑：历史消息里硬编码的绝对 URL（坏 session / 已删除文件）被点击时浏览器会
+    直接打开 API URL，裸 JSON 对用户毫无意义。
+    """
+    from fastapi.responses import JSONResponse
+    if not _wants_html(request):
+        return JSONResponse({"detail": detail}, status_code=status)
+    raw = (path or "").strip()
+    name = os.path.basename(raw.rstrip("/")) or (raw or "(未指定文件名)")
+    return HTMLResponse(
+        _FILE_ERROR_HTML.format(
+            title="文件未找到",
+            name=html.escape(name),
+            path=html.escape(raw or "-"),
+            hint=html.escape(detail or "该文件可能已被移动、重命名或删除。"),
+        ),
+        status_code=status,
+    )
 
 
 def _files_allowed_roots(session: str | None = None) -> list[str]:
-    """files 允许根集合：workdir + 全局 permission.txt + 该 session 动态挂载（去重）。
+    """files 允许根集合：workdir + /tmp + 全局 permission.txt + 该 session 动态挂载（去重）。
 
-    与 pythonrt 沙箱软边界对齐：/mount 动态挂载（per-session mount_state 表）与
-    permission.txt 全局挂载在 files 浏览器同样可见/可访问；根外路径一律 404。
+    与 pythonrt 沙箱软边界对齐：/tmp（沙箱恒可写、非持久化）与 /mount 动态挂载
+    （per-session mount_state 表）及 permission.txt 全局挂载在 files 浏览器同样
+    可见/可访问；根外路径一律 404。
     失效路径（已删除）过滤掉，对齐 _load_dyn_mounts 语义。
     """
-    roots = [os.path.realpath(_resolve_workdir())]
+    roots = [os.path.realpath(_resolve_workdir(session))]
+    rp_tmp = os.path.realpath("/tmp")
+    if rp_tmp not in roots:
+        roots.append(rp_tmp)  # /tmp 恒为可浏览根（对齐沙箱软边界）
     try:
         for p, _w in _parse_permission_file():
             rp = os.path.realpath(p)
@@ -1037,46 +1640,227 @@ def _files_allowed_roots(session: str | None = None) -> list[str]:
 def _path_allowed(target: str, roots: list[str]) -> bool:
     """target（已 realpath）是否落在任一允许根内（前缀校验，防路径穿越）。"""
     t = os.path.realpath(target)
-    return any(t == r or t.startswith(r + os.sep) for r in roots)
+    return any(root_contains(r, t) for r in roots)
 
 
-def _resolve_files_base(path: str, session: str | None = None) -> tuple[str, list[str]]:
-    """解析 files API 请求路径 → (realpath target, 允许根集合)。
+def _files_rel_in_root(target: str, root: str) -> str:
+    """Return API-relative path within root ('' = root itself)."""
+    t, r = os.path.realpath(target), os.path.realpath(root)
+    if t == r:
+        return ""
+    rel = os.path.relpath(t, r)
+    return "" if rel == "." else rel.replace("\\", "/")
 
-    支持绝对路径（须落在允许根内）与相对路径（依次尝试每个根，首个命中生效）。
-    """
+
+def _resolve_files_target(path: str, session: str | None, root_index: int = 0) -> tuple[str, list[str], int]:
+    """解析 files API 请求路径 → (realpath target, 允许根集合, root_index)。"""
     roots = _files_allowed_roots(session)
+    if not roots:
+        raise HTTPException(404, "No allowed roots")
+    idx = max(0, min(root_index, len(roots) - 1))
+    base = roots[idx]
     if os.path.isabs(path):
         target = os.path.realpath(path)
-        if not _path_allowed(target, roots):
-            raise HTTPException(404, "Path outside allowed root")
-        return target, roots
-    for r in roots:
-        target = os.path.realpath(os.path.join(r, path or ""))
-        if _path_allowed(target, roots) and os.path.exists(target):
-            return target, roots
-    # 兜底：所有根下均不存在该相对路径时，回退首根（workdir）解析，由调用方返回标准 404
-    for r in roots:
-        target = os.path.realpath(os.path.join(r, path or ""))
-        if _path_allowed(target, roots):
-            return target, roots
-    raise HTTPException(404, "Path outside allowed root")
+    else:
+        target = os.path.realpath(os.path.join(base, path or ""))
+    if not _path_allowed(target, roots):
+        raise HTTPException(404, "Path outside allowed root")
+    for i, r in enumerate(roots):
+        if root_contains(r, target):
+            idx = i
+            break
+    return target, roots, idx
+
+
+def _resolve_files_base(path: str, session: str | None = None,
+                        root_index: int = 0) -> tuple[str, list[str], int]:
+    """兼容旧调用：解析 files API 请求路径。"""
+    return _resolve_files_target(path, session, root_index)
+
+
+# ── 路径解析（resolve）：LLM 路径片段 → 真实文件（多根尝试 / 前缀补全 / 按名搜索）──
+# 2026-09-09: LLM 回复中的路径常为裸文件名/半路径/跨根相对路径；精确解析失败时按成本
+# 递增逐级回退，所有命中仍受允许根校验（_path_allowed），不越权。
+_FILE_REF_SKIP_DIRS = frozenset({
+    ".git", "node_modules", "__pycache__", ".trash", "venv", ".venv",
+    ".mypy_cache", ".pytest_cache", ".idea", ".vscode", ".ipynb_checkpoints",
+})
+_FILE_REF_SKIP_REL = (".xkagent/historys", ".xkagent/logs", ".xkagent/search_index")
+_FILE_REF_PREFIXES = (".xkagent/files", ".xkagent/docs/{session}", ".xkagent", "files")
+_FILE_REF_MAX_DEPTH = 6
+_FILE_REF_MAX_DIRS = 3000
+_FILE_REF_MAX_RESULTS = 20
+_FILE_REF_TIME_BUDGET = 1.5
+_FILE_REF_CACHE_TTL = 60.0
+_FILE_REF_CACHE_MAX = 512
+_FILE_REF_CACHE: dict = {}
+
+
+def _normalize_file_ref(ref: str) -> str:
+    """规范化 LLM 路径片段：去包裹引号/反引号、file://、URL 解码、反斜杠、./ 前缀、~ 展开。"""
+    s = (ref or "").strip()
+    while len(s) >= 2 and s[0] == s[-1] and s[0] in ("\"", "'", "`"):
+        s = s[1:-1].strip()
+    if s.startswith("file://"):
+        s = s[7:]
+    try:
+        from urllib.parse import unquote
+        s = unquote(s)
+    except Exception:
+        pass
+    s = s.replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    if s.startswith("~/"):
+        s = os.path.expanduser(s)
+    return s
+
+
+def _search_file_in_roots(ref: str, roots: list, session: str | None = None,
+                          limit: int = _FILE_REF_MAX_RESULTS) -> list:
+    """在允许根内按 basename / 路径后缀搜索（BFS 按目录 mtime 新→旧，带预算与缓存）。
+
+    Returns: [(real_path, mtime, root_index)]，按启发式排序（目录优先级 > 尾部匹配 > mtime 新）。
+    """
+    ref_n = _normalize_file_ref(ref)
+    base_name = os.path.basename(ref_n)
+    if not ref_n or not base_name:
+        return []
+    suffix = ref_n.lstrip("/")
+    roots_key = tuple(roots)
+    ck = (roots_key, ref_n, session or "")
+    now = time.monotonic()
+    cached = _FILE_REF_CACHE.get(ck)
+    if cached and cached[0] > now:
+        return cached[1]
+    hits = []
+    deadline = time.monotonic() + _FILE_REF_TIME_BUDGET
+    visited = 0
+    for ri, root in enumerate(roots):
+        queue = [(root, 0)]
+        while queue and time.monotonic() < deadline and visited < _FILE_REF_MAX_DIRS:
+            d, depth = queue.pop(0)
+            visited += 1
+            subdirs = []
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        try:
+                            if e.is_dir(follow_symlinks=False):
+                                nm = e.name
+                                if nm in _FILE_REF_SKIP_DIRS:
+                                    continue
+                                if nm.startswith(".") and nm != ".xkagent":
+                                    continue
+                                rel = os.path.relpath(e.path, root).replace(os.sep, "/")
+                                if any(rel == s or rel.startswith(s + "/") for s in _FILE_REF_SKIP_REL):
+                                    continue
+                                subdirs.append((e.stat().st_mtime, e.path))
+                            elif e.is_file(follow_symlinks=False):
+                                if e.name != base_name:
+                                    continue
+                                pl = e.path.replace(os.sep, "/")
+                                if suffix and not (pl.endswith("/" + suffix) or pl.endswith(suffix)):
+                                    continue
+                                if _path_allowed(e.path, roots):
+                                    hits.append((e.path, e.stat().st_mtime, ri))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+            if depth < _FILE_REF_MAX_DEPTH:
+                subdirs.sort(reverse=True)
+                queue.extend((p, depth + 1) for _, p in subdirs)
+
+    def _score(h):
+        p, mt, _ri = h
+        pl = p.replace(os.sep, "/")
+        s = 0.0
+        if "/.xkagent/files/" in pl:
+            s += 300
+        elif "/.xkagent/docs/" in pl:
+            s += 200
+        elif "/.xkagent/" in pl:
+            s += 100
+        if session and ("/.xkagent/docs/%s/" % session) in pl:
+            s += 60
+        if suffix and pl.endswith("/" + suffix):
+            s += 40
+        s -= pl.count("/")
+        return (s, mt)
+
+    hits.sort(key=_score, reverse=True)
+    out = hits[:limit]
+    if len(_FILE_REF_CACHE) >= _FILE_REF_CACHE_MAX:
+        _FILE_REF_CACHE.clear()
+    _FILE_REF_CACHE[ck] = (now + _FILE_REF_CACHE_TTL, out)
+    return out
+
+
+def _resolve_files_deep(ref: str, session: str | None, root_index: int = 0):
+    """LLM 路径片段 → (target, roots, root_index, candidates)。
+
+    逐级回退：精确（绝对/指定根）→ 多根尝试 → 前缀补全 → 按名搜索；找不到抛 404。
+    """
+    roots = _files_allowed_roots(session)
+    if not roots:
+        raise HTTPException(404, "No allowed roots")
+    ref_n = _normalize_file_ref(ref)
+    if not ref_n:
+        raise HTTPException(404, "Empty path")
+    idx0 = max(0, min(root_index, len(roots) - 1))
+    # 1) 精确解析（保持既有语义：绝对路径 / 指定根相对路径）
+    if os.path.isabs(ref_n):
+        cand = os.path.realpath(ref_n)
+        if os.path.exists(cand) and _path_allowed(cand, roots):
+            for i, r in enumerate(roots):
+                if root_contains(r, cand):
+                    return cand, roots, i, []
+    else:
+        cand = os.path.realpath(os.path.join(roots[idx0], ref_n))
+        if os.path.exists(cand) and _path_allowed(cand, roots):
+            return cand, roots, idx0, []
+    # 2) 多根尝试（相对路径跨根：workdir ↔ 挂载根）
+    if not os.path.isabs(ref_n):
+        for i, r in enumerate(roots):
+            if i == idx0:
+                continue
+            cand = os.path.realpath(os.path.join(r, ref_n))
+            if os.path.exists(cand) and _path_allowed(cand, roots):
+                return cand, roots, i, []
+    # 3) 前缀补全（.xkagent/files、session docs 等常见产出目录）
+    prefixes = [p.format(session=session or "") for p in _FILE_REF_PREFIXES]
+    for i, r in enumerate(roots):
+        for pre in prefixes:
+            cand = os.path.realpath(os.path.join(r, pre, ref_n))
+            if os.path.exists(cand) and _path_allowed(cand, roots):
+                return cand, roots, i, []
+    # 4) 搜索兜底（裸文件名 / 半路径）
+    hits = _search_file_in_roots(ref_n, roots, session)
+    if hits:
+        p, _mt, ri = hits[0]
+        return p, roots, ri, hits
+    raise HTTPException(404, f"File not found: {ref}")
+
+
+def _files_candidate_dict(hit, roots) -> dict:
+    """搜索结果 → 前端候选结构（path 相对该根，root_index 用于构造 URL）。"""
+    p, mt, ri = hit
+    return {"path": _files_rel_in_root(p, roots[ri]), "root_index": ri,
+            "name": os.path.basename(p), "mtime": mt}
 
 
 @app.get("/api/files/list")
-async def api_files_list(path: str = Query("", description="目录路径（相对 workdir/挂载根，或落在允许根内的绝对路径）"),
+async def api_files_list(path: str = Query("", description="目录路径（相对当前 root_index 根）"),
+                         root_index: int = Query(0, description="允许根索引"),
                          session: str = Query(None, description="session 名（缺省回退当前会话，取其动态挂载）")):
-    """列出目录内容（FTP 风格），允许根 = workdir + 全局挂载 + 该 session 动态挂载。
-
-    设计考虑：realpath 归一化后对允许根集合逐根前缀校验（防路径穿越，符号链接指向根外仍 404），
-    目录项用 os.scandir 惰性迭代避免整目录载入内存。
-    """
-    sess = session or _current_session
-    target, roots = _resolve_files_base(path, sess)
+    """列出目录内容（FTP 风格），允许根 = workdir + 全局挂载 + 该 session 动态挂载。"""
+    sess = _checked_session_soft(session) or _get_current_session()
+    target, roots, idx = _resolve_files_target(path, sess, root_index)
     if not os.path.isdir(target):
         raise HTTPException(404, f"Not a directory: {path or '/'}")
-    entries = []
-    try:
+    def _scan():
+        entries = []
         with os.scandir(target) as it:
             for e in it:
                 try:
@@ -1090,55 +1874,91 @@ async def api_files_list(path: str = Query("", description="目录路径（相�
                     "size": None if is_dir else st.st_size,
                     "mtime": st.st_mtime,
                 })
+        entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+        return entries
+    try:
+        entries = await asyncio.to_thread(_scan)
     except OSError as exc:
         raise HTTPException(500, f"Failed to scan directory: {exc}")
-    entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
-    rel = os.path.relpath(target, _resolve_workdir())
+    rel = _files_rel_in_root(target, roots[idx])
+    parent = os.path.dirname(rel).replace("\\", "/") if rel else None
+    if parent == ".":
+        parent = ""
+    can_up = bool(rel)
     return {
-        "path": "" if rel == "." else rel,
-        "parent": None if rel == "." else os.path.dirname(rel),
+        "path": rel,
+        "parent": parent,
+        "can_up": can_up,
+        "root_index": idx,
         "entries": entries,
-        "root": target,          # 当前绝对路径（前端拼接子项）
-        "roots": roots,          # 允许根集合（前端根选择器）
+        "roots": [{"index": i, "label": os.path.basename(r) or r} for i, r in enumerate(roots)],
         "session": sess,
     }
 
 
 @app.get("/api/files/download")
-async def api_files_download(path: str = Query("", description="文件路径（相对 workdir/挂载根，或落在允许根内的绝对路径）"),
-                             session: str = Query(None, description="session 名（缺省回退当前会话，取其动态挂载）")):
-    """流式下载允许根内文件（FileResponse 流式，避免整文件读入内存），防路径穿越。"""
-    sess = session or _current_session
-    target, _roots = _resolve_files_base(path, sess)
+async def api_files_download(request: Request,
+                             path: str = Query("", description="文件路径（相对 root_index 根）"),
+                             root_index: int = Query(0, description="允许根索引"),
+                             session: str = Query(None, description="session 名（缺省回退当前会话，取其动态挂载）"),
+                             preview: bool = Query(False, description="在线预览：inline 展示（图片/HTML/PDF 浏览器直接渲染）而非下载"),
+                             resolve: bool = Query(False, description="路径解析：精确失败时多根尝试/前缀补全/按名搜索（LLM 路径片段）")):
+    """流式下载允许根内文件（FileResponse 流式，避免整文件读入内存），防路径穿越。
+
+    2026-09-09：session 宽松化（非法值忽略）；找不到文件时浏览器导航返回友好 HTML。
+    """
+    sess = _checked_session_soft(session) or _get_current_session()
+    try:
+        if resolve:
+            target, _roots, _idx, _cands = await asyncio.to_thread(_resolve_files_deep, path, sess, root_index)
+        else:
+            target, _roots, _idx = _resolve_files_target(path, sess, root_index)
+    except HTTPException as exc:
+        return _friendly_file_error(request, path, exc.status_code, str(exc.detail))
     if not os.path.isfile(target):
-        raise HTTPException(404, f"Not a file: {path}")
+        return _friendly_file_error(request, path, 404, f"Not a file: {path}")
     from fastapi.responses import FileResponse
     logger.info(f"FILE 下载: {path} session={sess}")
-    return FileResponse(target)
+    fname = os.path.basename(target)
+    return FileResponse(
+        target,
+        filename=fname,
+        headers={"X-Content-Type-Options": "nosniff"},
+        content_disposition_type="inline" if preview else "attachment",
+    )
 
 @app.get("/api/files/open")
-async def api_files_open(path: str = Query("", description="文件/目录路径（绝对或相对 workdir/挂载根）"),
-                         session: str = Query(None, description="session 名（缺省回退当前会话，取其动态挂载）")):
+async def api_files_open(request: Request,
+                         path: str = Query("", description="文件/目录路径（相对 root_index 根）"),
+                         root_index: int = Query(0, description="允许根索引"),
+                         session: str = Query(None, description="session 名（缺省回退当前会话，取其动态挂载）"),
+                         resolve: bool = Query(False, description="路径解析：精确失败时多根尝试/前缀补全/按名搜索（LLM 路径片段）")):
     """打开允许根内文件/目录（新标签页）。文件→302 到下载流；目录→302 到文件浏览器定位。
 
-    设计考虑：支持绝对/相对/裸文件名三档；realpath 对允许根集合逐根前缀校验防穿越；
-    302 重定向复用现有 download/files 路由，避免重复实现文件读取；目录跳转带绝对路径+session。
+    2026-09-09：session 宽松化；找不到时浏览器导航返回友好 HTML（显示文件名）。
     """
-    sess = session or _current_session
-    target, _roots = _resolve_files_base(path, sess)
+    sess = _checked_session_soft(session) or _get_current_session()
+    try:
+        if resolve:
+            target, roots, idx, _cands = await asyncio.to_thread(_resolve_files_deep, path, sess, root_index)
+        else:
+            target, roots, idx = _resolve_files_target(path, sess, root_index)
+    except HTTPException as exc:
+        return _friendly_file_error(request, path, exc.status_code, str(exc.detail))
     from fastapi.responses import RedirectResponse
     from urllib.parse import quote
-    rel = os.path.relpath(target, _resolve_workdir())
-    # URL 编码（safe='/' 保留路径分隔符可读性），防文件名含空格/# 等特殊字符损坏 URL
+    rel = _files_rel_in_root(target, roots[idx])
     rel_q = quote(rel, safe='/')
-    abs_q = quote(target, safe='/')
     sess_q = quote(sess or '', safe='')
+    ri_q = str(idx)
     logger.info(f"FILE 打开: {path} session={sess}")
     if os.path.isdir(target):
-        return RedirectResponse(url=f"../../files?path={abs_q}&session={sess_q}", status_code=302)
+        return RedirectResponse(
+            url=f"../../files?path={rel_q}&root_index={ri_q}&session={sess_q}", status_code=302)
     if os.path.isfile(target):
-        return RedirectResponse(url=f"../../api/files/download?path={abs_q}&session={sess_q}", status_code=302)
-    raise HTTPException(404, f"Not found: {path}")
+        return RedirectResponse(
+            url=f"../../api/files/download?path={rel_q}&root_index={ri_q}&session={sess_q}", status_code=302)
+    return _friendly_file_error(request, path, 404, f"Not found: {path}")
 
 
 # ── Upload API: 上传文件至 .xkagent/files/ ──
@@ -1148,20 +1968,50 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"}
 @app.get("/api/files/roots")
 async def api_files_roots(session: str = Query(None, description="session 名（缺省回退当前会话）")):
     """返回 files 允许根集合（workdir + 全局挂载 + 该 session 动态挂载），供前端根选择器。"""
-    sess = session or _current_session
-    return {"roots": _files_allowed_roots(sess),
-            "workdir": os.path.realpath(_resolve_workdir()),
+    sess = _checked_session_soft(session) or _get_current_session()
+    return {"roots": [{"index": i, "label": os.path.basename(r) or r} for i, r in enumerate(_files_allowed_roots(sess))],
             "session": sess}
 
 
+@app.get("/api/files/resolve")
+async def api_files_resolve(ref: str = Query(..., description="LLM 给出的路径片段（绝对/相对/裸文件名）"),
+                            root_index: int = Query(0, description="优先尝试的允许根索引"),
+                            session: str = Query(None, description="session 名（缺省回退当前会话）"),
+                            limit: int = Query(10, ge=1, le=50, description="最多返回候选数")):
+    """把 LLM 回复中的路径片段解析为真实文件（多根/前缀补全/按名搜索），供前端定位。
+
+    2026-09-09 新增：未命中返回 404 + 候选列表（可能为空）。
+    """
+    from fastapi.responses import JSONResponse
+    sess = _checked_session_soft(session) or _get_current_session()
+    roots = _files_allowed_roots(sess)
+    if not roots:
+        raise HTTPException(404, "No allowed roots")
+    try:
+        target, roots2, idx, hits = await asyncio.to_thread(_resolve_files_deep, ref, sess, root_index)
+    except HTTPException:
+        hits = await asyncio.to_thread(_search_file_in_roots, ref, roots, sess, limit)
+        return JSONResponse(status_code=404, content={
+            "ok": False, "ref": ref, "resolved": None,
+            "candidates": [_files_candidate_dict(h, roots) for h in hits[:limit]],
+        })
+    rel = _files_rel_in_root(target, roots2[idx])
+    resolved = {"path": rel, "root_index": idx, "name": os.path.basename(target)}
+    cands = [_files_candidate_dict(h, roots2) for h in hits][:limit]
+    if not any(c["path"] == rel and c["root_index"] == idx for c in cands):
+        cands.insert(0, resolved)
+    return {"ok": True, "ref": ref, "resolved": resolved, "candidates": cands[:limit]}
+
+
 @app.post("/api/upload")
-async def api_upload(file: UploadFile = File(...)):
+async def api_upload(file: UploadFile = File(...), session: str = Query(None)):
     """上传文件至 <workdir>/.xkagent/files/，返回文件/图片路径。
 
     设计考虑：文件名 basename 净化防路径穿越；重名加时间戳前缀去重；
     流式分块写入（1MB）防大文件整读内存；auth middleware 自动保护该路由。
     """
-    base = os.path.realpath(_resolve_workdir())
+    sess = _checked_session_soft(session) or _get_current_session()
+    base = os.path.realpath(_resolve_workdir(sess))
     files_dir = os.path.join(base, _config.DATA_DIR_NAME, "files")
     os.makedirs(files_dir, exist_ok=True)
     fname = os.path.basename(file.filename or "upload.bin") or "upload.bin"
@@ -1171,26 +2021,35 @@ async def api_upload(file: UploadFile = File(...)):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = f"{ts}_{fname}"
         target = os.path.join(files_dir, safe_name)
+    total = 0
     try:
         with open(target, "wb") as out:
             while True:
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, f"Upload exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit")
                 out.write(chunk)
+    except Exception:
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+        raise
     finally:
         await file.close()
     ext = os.path.splitext(safe_name)[1].lower()
     is_image = ext in IMAGE_EXTS
     rel = os.path.join(_config.DATA_DIR_NAME, "files", safe_name).replace(os.sep, "/")
     from urllib.parse import quote
-    url = f"api/files/download?path={quote(rel, safe='/')}"
-    logger.info(f"UPLOAD: {rel} ({os.path.getsize(target)} bytes)")
+    url = f"api/files/download?path={quote(rel, safe='/')}&root_index=0&session={quote(sess or '', safe='')}"
+    logger.info(f"UPLOAD: {rel} session={sess} ({os.path.getsize(target)} bytes)")
     return {
         "ok": True,
         "filename": safe_name,
         "path": rel,
-        "abs_path": target,
         "url": url,
         "is_image": is_image,
         "size": os.path.getsize(target),
@@ -1198,10 +2057,18 @@ async def api_upload(file: UploadFile = File(...)):
 
 
 @app.get("/api/skills")
-async def api_list_skills():
+async def api_list_skills(session: str = Query(None)):
     """List available skills."""
     from codes.skill import SkillLoader
-    return {"skills": SkillLoader.list_skills()}
+    token = None
+    try:
+        effective = _checked_session(session) or _get_current_session()
+        if effective:
+            _context, token = _config.activate_session(effective, ensure=False)
+        return {"skills": SkillLoader.list_skills()}
+    finally:
+        if token is not None:
+            _config.reset_session(token)
 
 
 @app.post("/api/chat")
@@ -1211,107 +2078,117 @@ async def api_chat(data: dict):
     text = data.get("text", "")
     session = data.get("session")
     _log("CHAT", f"User (REST): {text[:200]}{'...' if len(text) > 200 else ''}")
-    agent = _get_agent(session)
-    # non-streaming chat via manager
-    agent.send_input(text)
+    agent, target = await asyncio.to_thread(_ensure_agent_running, session)
+    agent = await asyncio.to_thread(_ensure_session_agent, agent, target)
+    if not target:
+        raise HTTPException(503, "No agent session active")
+    subscription = agent.subscribe(target, maxsize=2048)
+    if subscription is None:
+        raise HTTPException(503, "Agent event stream unavailable")
+    if not agent.send_input(text, session=target):
+        agent.unsubscribe(subscription)
+        raise HTTPException(503, "Agent session unavailable")
     result = ""
     blocked_reason = ""  # T4: 观察者模式拒绝输入时记录原因
     prompt_tokens = 0
     completion_tokens = 0
+    reasoning_tokens = 0  # B3 修复（2026-08-22）：与 WS 路径一致，累计 reasoning
     deadline = time.time() + 300.0
-    while time.time() < deadline:
-        evt = agent.read_output(timeout=1.0)
-        if evt is None:
-            continue
-        if evt.get("type") == "_turn_end":
-            break
-        # T4: 观察者模式拒绝输入（blocked 事件）→ 记录原因，正常返回
-        if evt.get("type") == "blocked":
-            blocked_reason = evt.get("reason", "session 已被其他进程占用")
-        if evt.get("type") == "text":
-            result += evt.get("data", "")
-        elif evt.get("type") == "stats":
-            prompt_tokens += evt.get("prompt_tokens", 0)
-            completion_tokens += evt.get("completion_tokens", 0)
+    try:
+        while time.time() < deadline:
+            evt = await asyncio.to_thread(agent.read_output_for, target, 1.0, subscription)
+            if evt is None:
+                continue
+            if evt.get("type") == "_turn_end":
+                break
+            if evt.get("type") == "blocked":
+                blocked_reason = evt.get("reason", "session 已被其他进程占用")
+            if evt.get("type") == "text":
+                result += evt.get("data", "")
+            elif evt.get("type") == "stats":
+                prompt_tokens += evt.get("prompt_tokens", 0)
+                completion_tokens += evt.get("completion_tokens", 0)
+                reasoning_tokens += evt.get("reasoning_tokens", 0)
+    finally:
+        agent.unsubscribe(subscription)
     _log("CHAT", f"Assistant (REST): {result[:500]}{'...' if len(result) > 500 else ''}")
     if blocked_reason:
         # T4: 观察者只读 → 返回 blocked 提示（而非空 response）
         return {
             "blocked": True,
             "reason": blocked_reason,
-            "session": _current_session or "",
+            "session": target or "",
         }
     return {
         "response": result,
-        "session": _current_session or "",
+        "session": target or "",
         "stats": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            "reasoning_tokens": reasoning_tokens,
         },
     }
+
+
+@app.get("/api/chat/queue")
+async def api_chat_queue(session: str = Query(None)):
+    """排队消息快照：qid/text/position，供前端刷新/切会话后重建排队视图与取消入口。"""
+    target = session or _get_current_session()
+    items = await asyncio.to_thread(_chat_queue_snapshot, target)
+    return {"session": target or "", "items": items}
 
 
 
 @app.get("/api/mode")
 async def api_get_mode(session: str = Query(None)):
-    """Get current mode."""
-    agent = _get_agent(session)
-    return {"mode": getattr(agent, "_focus_mode", "plan")}
+    """Get mode for the requested session without stealing global focus."""
+    mgr, sess = await asyncio.to_thread(_ensure_agent_running, session)
+    event = await asyncio.to_thread(mgr.send_command_wait, "get_info", None, sess, 1.0)
+    if event and isinstance(event.get("data"), dict):
+        return {"mode": event["data"].get("mode", "plan")}
+    return {"mode": _ui_cache(sess).get("mode", "plan")}
 
 
-@app.get("/api/skill-select")
-async def api_get_skill_select(session: str = Query(None)):
-    """Get skill select enabled status."""
-    agent = _get_agent(session)
-    return {"enabled": getattr(agent, "_focus_skill_select", True)}
 
 
-@app.post("/api/skill-select")
-async def api_set_skill_select(data: dict):
-    """Set or toggle skill select enabled status."""
-    session = data.get("session")
-    agent = _get_agent(session)
-    enabled = data.get("enabled")
-    if enabled is not None:
-        agent.send_command("set_skill_select", {"enabled": enabled})
-        agent._focus_skill_select = enabled
-    else:
-        new_state = not getattr(agent, "_focus_skill_select", True)
-        agent.send_command("set_skill_select", {"enabled": new_state})
-        agent._focus_skill_select = new_state
-    logger.info(f"SKILL_SELECT 切换: session={session} enabled={getattr(agent, '_focus_skill_select', True)}")
-    return {"enabled": getattr(agent, "_focus_skill_select", True)}
+async def _apply_control(agent: AgentManager, command: str, args: dict,
+                         cache_attr: str, info_key: str,
+                         session: str | None = None):
+    """等待控制命令真实结果后再更新 Web 缓存，避免乐观状态漂移。"""
+    target = session or agent.focus
+    event = await asyncio.to_thread(agent.send_command_wait, command, args, target, 2.0)
+    if event and event.get("ok", True):
+        value = event.get("data")
+        if value is not None and target:
+            if target == agent.focus:
+                setattr(agent, cache_attr, value)
+            if info_key == "mode":
+                _cache_session_ui(target, {"mode": value})
+        return value
+    info = await asyncio.to_thread(_get_session_info, agent, target, 1.0) if target else None
+    if info and info_key in info and target and target == agent.focus:
+        setattr(agent, cache_attr, info[info_key])
+    if info and info_key in info:
+        return info[info_key]
+    return getattr(agent, cache_attr, None)
+
+
 
 
 @app.post("/api/mode")
 async def api_set_mode(data: dict):
     """Set or toggle mode."""
     session = data.get("session")
-    agent = _get_agent(session)
+    agent, target = await asyncio.to_thread(_ensure_agent_running, session)
+    agent = await asyncio.to_thread(_ensure_session_agent, agent, target)
     mode = data.get("mode")
     if mode and mode in ("plan", "build", "build-unsafe"):
-        _ok = agent.send_command("set_mode", {"mode": mode})
-        if _ok:
-            agent._focus_mode = mode
-        else:
-            # 命令未送达：回读真实 mode，防 UI 缓存与 agent 实际状态脱节
-            info = agent.get_focus_info(timeout=2.0)
-            if info:
-                agent._focus_mode = info.get("mode", agent._focus_mode)
+        new_mode = mode
     else:
-        # Toggle
-        current_mode = getattr(agent, '_focus_mode', 'plan')
-        new_mode = MODE_CYCLE.get(current_mode, "plan")
-        _ok = agent.send_command("set_mode", {"mode": new_mode})
-        if _ok:
-            agent._focus_mode = new_mode
-        else:
-            # 命令未送达：回读真实 mode，防 UI 缓存与 agent 实际状态脱节
-            info = agent.get_focus_info(timeout=2.0)
-            if info:
-                agent._focus_mode = info.get("mode", agent._focus_mode)
-    logger.info(f"MODE 切换: session={session} -> {getattr(agent, '_focus_mode', 'plan')}")
-    return {"mode": getattr(agent, "_focus_mode", "plan")}
+        new_mode = MODE_CYCLE.get(_session_mode(agent, target), "plan")
+    new_mode = await _apply_control(agent, "set_mode", {"mode": new_mode}, "_focus_mode", "mode", target)
+    logger.info(f"MODE 切换: session={target} -> {new_mode}")
+    return {"mode": new_mode or getattr(agent, "_focus_mode", "plan")}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1323,39 +2200,75 @@ async def websocket_chat(ws: WebSocket, session: str):
     logger.info(f"WebSocket 连接: session={session}")
     # WebSocket auth check
     if _hashed_password:
-        token = ws.cookies.get(_AUTH_COOKIE_NAME) or ws.query_params.get("token")
+        token = ws.cookies.get(_AUTH_COOKIE_NAME)
         if not token or _validate_token(token) != _auth_username:
             await ws.close(code=4001, reason="Unauthorized")
             return
+    try:
+        _checked_session(session)
+    except HTTPException as e:
+        await ws.close(code=4002, reason=str(e.detail)[:120])
+        return
     await ws.accept()
-    agent = _get_agent(session)
-    await _ws_loop(ws, agent)
+    _, sess = await asyncio.to_thread(_ensure_agent_running, session)
+    await _ws_loop(ws, _agent_manager, ws_session=sess)
 
 
 @app.websocket("/ws")
 async def websocket_chat_default(ws: WebSocket):
     # WebSocket auth check
     if _hashed_password:
-        token = ws.cookies.get(_AUTH_COOKIE_NAME) or ws.query_params.get("token")
+        token = ws.cookies.get(_AUTH_COOKIE_NAME)
         if not token or _validate_token(token) != _auth_username:
             await ws.close(code=4001, reason="Unauthorized")
             return
     await ws.accept()
-    agent = _get_agent()
-    await _ws_loop(ws, agent)
+    await _ws_loop(ws, _agent_manager, ws_session=_get_current_session())
 
 
-async def _ws_loop(ws: WebSocket, agent: Agent):
+async def _ws_loop(ws: WebSocket, agent: AgentManager, ws_session: str | None = None):
     logger.info("WebSocket 循环开始")
     """WebSocket message loop."""
-    global _current_session
-    send_lock = asyncio.Lock()          # P2: 并发发送互斥（后台 chat 任务 × 主循环响应）
-    active_chat_task: asyncio.Task | None = None  # P2: 追踪进行中的 LLM 回合
+    send_lock = asyncio.Lock()
+    chat_tasks: dict[str, asyncio.Task] = {}
 
     async def _send(data: dict) -> None:
-        # P2: 带锁发送，避免后台 chat 任务与主循环响应并发写 ws
         async with send_lock:
             await ws.send_text(json.dumps(data))
+
+    def _ws_target_session(mgr: AgentManager, msg: dict | None = None) -> str | None:
+        if msg:
+            explicit = (msg.get("session") or "").strip()
+            if explicit:
+                return explicit
+        return _get_current_session() or mgr.focus
+
+    async def _target_busy(mgr: AgentManager, session: str | None) -> bool:
+        """指定 session 是否忙（turn_active 或 WS 仍在转发）。"""
+        if not session:
+            return False
+        busy = await asyncio.to_thread(_session_busy, mgr, session)
+        return busy or _chat_forward_busy(chat_tasks, session)
+
+    # 2026-08-30: 连接建立时若该 session 有残留排队消息且空闲 → 自动续跑
+    # （覆盖"链式任务随旧连接断开而中止"的场景：刷新/重连后队列继续被消费）
+    _boot_session = ws_session or _get_current_session() or agent.focus
+    if _boot_session and _chat_queue_size(_boot_session) > 0:
+        try:
+            # 稍等前端完成首屏历史渲染，避免 chat_dequeued 补渲染的气泡被 loadSessionMessages 清空
+            await asyncio.sleep(2.0)
+            _boot_busy = await asyncio.to_thread(_session_busy, agent, _boot_session)
+            if not _boot_busy:
+                _boot_item = await asyncio.to_thread(_pop_chat_queue, _boot_session)
+                if _boot_item is not None:
+                    await _send({"type": "chat_dequeued",
+                                 "data": {"qid": _boot_item["qid"], "text": _boot_item["text"]},
+                                 "session": _boot_session})
+                    _register_chat_task(chat_tasks, _boot_session, asyncio.create_task(
+                        _handle_chat_chain(ws, agent, _boot_item["text"], send_lock, _boot_session)))
+                    _log("CHAT", f"chat queue auto-drain: session={_boot_session}")
+        except Exception:
+            logger.exception("chat queue auto-drain failed: session=%s", _boot_session)
 
     try:
         while True:
@@ -1372,124 +2285,231 @@ async def _ws_loop(ws: WebSocket, agent: Agent):
                 text = msg.get("text", "")
                 if not text:
                     continue
-                # P0 修复: WS 路径自愈——chat/mode 前确保焦点 agent 存活
-                # （崩溃后自动重启），不再依赖 REST 接口的 _get_agent 触发，
-                # 消除 "No agent session active" 与模式切换无响应。
-                agent = _ensure_focus_agent(agent)
-                if active_chat_task is not None and not active_chat_task.done():
-                    # P2: busy 保护：LLM 执行中不再接受新消息
-                    await _send({"type": "info", "data": "⏳ Agent 正在处理上一条消息，请稍候"})
+                target = _ws_target_session(agent, msg)
+                agent = await asyncio.to_thread(_ensure_session_agent, agent, target)
+                if not target:
+                    await _send({"type": "error", "data": "No agent session active."})
                     continue
-                # F1c: 新回合开始前清空队列残留（覆盖所有路径：
-                # /session 命令切走、switch_session、直接发新消息）
-                # 正常回合结束后队列已空（done 已发），drain 立即返回。
-                _drain_output_until_turn_end(agent)
-                # P2: 后台运行回合，主循环继续接收消息（可切 session / 改 mode）
-                active_chat_task = asyncio.create_task(
-                    _handle_chat_ws(ws, agent, text, send_lock)
+                if await _target_busy(agent, target):
+                    # 2026-08-30: busy 不再丢弃消息 → 入会话级 FIFO 队列，回合结束后链式续跑
+                    try:
+                        qitem = await asyncio.to_thread(_enqueue_chat, target, text)
+                    except ValueError as e:
+                        # 队列段错误走 info：error 分支会封板流式文本段并复位按钮，干扰进行中的回合
+                        await _send({"type": "info", "data": str(e), "session": target})
+                        continue
+                    await _send({"type": "chat_queued",
+                                 "data": {"qid": qitem["qid"], "position": qitem["position"],
+                                          "text": text},
+                                 "session": target})
+                    _log("CHAT", f"Message queued: session={target} position={qitem['position']}")
+                    continue
+                # 空闲但队列非空（重连/刷新残留）→ 新消息也入队，从队头按 FIFO 续跑
+                if _chat_queue_size(target) > 0:
+                    try:
+                        await asyncio.to_thread(_enqueue_chat, target, text)
+                    except ValueError as e:
+                        await _send({"type": "info", "data": str(e), "session": target})
+                        continue
+                    _fitem = await asyncio.to_thread(_pop_chat_queue, target)
+                    if _fitem is None:
+                        continue   # 队列已被其他连接的链式任务接管（FIFO 保持）
+                    first = _fitem["text"]
+                else:
+                    first = text
+                await asyncio.to_thread(_drain_output_until_turn_end, agent, target)
+                task = asyncio.create_task(
+                    _handle_chat_chain(ws, agent, first, send_lock, target)
                 )
+                _register_chat_task(chat_tasks, target, task)
+
+            elif msg_type == "chat_cancel":
+                # 2026-08-30(v1.1): 取消单条排队消息（qid 来自 chat_queued 事件 / 队列快照）
+                target = _ws_target_session(agent, msg)
+                qid = (msg.get("qid") or "").strip()
+                if not target or not qid:
+                    await _send({"type": "info", "data": "chat_cancel 缺少 qid/session",
+                                 "session": target or ""})
+                    continue
+                cres = await asyncio.to_thread(_cancel_chat_item, target, qid)
+                cok = bool(cres[0])
+                ctext = cres[1]
+                if cok:
+                    await _send({"type": "chat_cancelled",
+                                 "data": {"qid": qid, "text": ctext},
+                                 "session": target})
+                    _log("CHAT", f"Queued message cancelled: session={target} qid={qid[:8]}")
+                else:
+                    await _send({"type": "info",
+                                 "data": "该消息已开始处理或不在队列中，无法取消",
+                                 "session": target})
+
+            elif msg_type == "chat_queue_clear":
+                # 2026-08-30(v1.1): 清空排队队列但不停当前回合（与 interrupt 的 Stop 语义区分）
+                target = _ws_target_session(agent, msg)
+                n = await asyncio.to_thread(_clear_chat_queue, target) if target else 0
+                if n:
+                    await _send({"type": "chat_queue_cleared", "data": {"count": n},
+                                 "session": target})
+                    _log("CHAT", f"chat queue cleared: session={target} count={n}")
+                else:
+                    await _send({"type": "info", "data": "当前没有排队消息",
+                                 "session": target or ""})
+
+            elif msg_type == "rerun":
+                # 从指定 user 消息重新开始：截断历史后复用普通 chat 的流式执行链路。
+                target = _ws_target_session(agent, msg)
+                if not target or not session_exists(target):
+                    await _send({"type": "error", "data": "Session not found",
+                                 "session": target or ""})
+                    continue
+                agent = await asyncio.to_thread(_ensure_session_agent, agent, target)
+                if await _target_busy(agent, target):
+                    await _send({"type": "error",
+                                 "data": "⏳ Agent 正在处理上一条消息，请稍候",
+                                 "session": target})
+                    continue
+
+                raw_message_id = msg.get("message_id")
+                try:
+                    if isinstance(raw_message_id, bool):
+                        raise ValueError
+                    message_id = int(raw_message_id)
+                    if message_id <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    await _send({"type": "error",
+                                 "data": "message_id must be a positive integer",
+                                 "session": target})
+                    continue
+
+                # get_info 是现有锁状态查询；观察者模式不能改写共享历史。
+                info_evt = await asyncio.to_thread(
+                    agent.send_command_wait, "get_info", None, target, 2.0)
+                info = info_evt.get("data") if isinstance(info_evt, dict) else None
+                if not isinstance(info, dict):
+                    await _send({"type": "error",
+                                 "data": "无法确认 session 锁状态，请稍后重试",
+                                 "session": target})
+                    continue
+                if info.get("is_observing") or not info.get("is_locked", True):
+                    await _send({"type": "error",
+                                 "data": "session 当前为只读/未持有写锁，无法重新生成",
+                                 "session": target})
+                    continue
+
+                try:
+                    ok, detail, replay = await asyncio.to_thread(
+                        prepare_rerun, target, message_id)
+                except Exception as e:
+                    logger.exception("SESSION rerun 准备失败: %s", e)
+                    await _send({"type": "error", "data": f"Rerun failed: {e}",
+                                 "session": target})
+                    continue
+                if not ok or not replay:
+                    await _send({"type": "error", "data": detail,
+                                 "session": target})
+                    continue
+
+                _sessions_cache.clear()
+                _stats_cache.clear()
+                # 2026-08-30: rerun 物理截断历史 → 排队消息基于旧分支，语义已失效，一并清空
+                _rq_cleared = _clear_chat_queue(target)
+                if _rq_cleared:
+                    await _send({"type": "chat_queue_cleared", "data": {"count": _rq_cleared},
+                                 "session": target})
+                logger.info("SESSION rerun: %s from message %s (removed=%s, queue_cleared=%s)",
+                            target, message_id, replay.get("removed", 0), _rq_cleared)
+                # 前端先清空旧分支；新的 user 消息由 data.text 显示，随后 DB 正常落库。
+                await _send({
+                    "type": "history_reset",
+                    "data": {
+                        "message_id": message_id,
+                        "last_id": replay.get("last_id", 0),
+                        "removed": replay.get("removed", 0),
+                        "text": replay.get("text", ""),
+                    },
+                    "session": target,
+                })
+                await asyncio.to_thread(_drain_output_until_turn_end, agent, target)
+                task = asyncio.create_task(
+                    _handle_chat_ws(ws, agent, replay["text"], send_lock, target)
+                )
+                _register_chat_task(chat_tasks, target, task)
 
             elif msg_type == "mode":
-                agent = _ensure_focus_agent(agent)  # P0: 同 chat 分支，模式切换前自愈
+                target = _ws_target_session(agent, msg)
+                agent = await asyncio.to_thread(_ensure_session_agent, agent, target)
                 mode = msg.get("mode")
                 if mode and mode in ("plan", "build", "build-unsafe"):
-                    _ok = agent.send_command("set_mode", {"mode": mode})
-                    if _ok:
-                        agent._focus_mode = mode
-                    else:
-                        # 命令未送达：回读真实 mode，防 UI 缓存与 agent 实际状态脱节
-                        info = agent.get_focus_info(timeout=2.0)
-                        if info:
-                            agent._focus_mode = info.get("mode", agent._focus_mode)
+                    new_mode = mode
                 else:
-                    new_mode = MODE_CYCLE.get(getattr(agent, "_focus_mode", "plan"), "plan")
-                    _ok = agent.send_command("set_mode", {"mode": new_mode})
-                    if _ok:
-                        agent._focus_mode = new_mode
-                    else:
-                        # 命令未送达：回读真实 mode，防 UI 缓存与 agent 实际状态脱节
-                        info = agent.get_focus_info(timeout=2.0)
-                        if info:
-                            agent._focus_mode = info.get("mode", agent._focus_mode)
-                _log("SYSTEM", f"Mode: {getattr(agent, '_focus_mode', 'plan')}")
-                await _send({
-                    "type": "mode_changed",
-                    "data": getattr(agent, "_focus_mode", "plan"),
-                })
+                    new_mode = MODE_CYCLE.get(_session_mode(agent, target), "plan")
+                new_mode = await _apply_control(agent, "set_mode", {"mode": new_mode}, "_focus_mode", "mode", target)
+                _log("SYSTEM", f"Mode ({target}): {new_mode}")
+                await _send({"type": "mode_changed", "data": new_mode, "session": target or ""})
 
             elif msg_type == "mode_toggle":
-                new_mode = MODE_CYCLE.get(getattr(agent, "_focus_mode", "plan"), "plan")
-                _ok = agent.send_command("set_mode", {"mode": new_mode})
-                if _ok:
-                    agent._focus_mode = new_mode
-                else:
-                    # 命令未送达：回读真实 mode，防 UI 缓存与 agent 实际状态脱节
-                    info = agent.get_focus_info(timeout=2.0)
-                    if info:
-                        agent._focus_mode = info.get("mode", agent._focus_mode)
-                _log("SYSTEM", f"Mode: {getattr(agent, '_focus_mode', 'plan')} (toggled)")
-                await _send({
-                    "type": "mode_changed",
-                    "data": getattr(agent, "_focus_mode", "plan"),
-                })
+                target = _ws_target_session(agent, msg)
+                agent = await asyncio.to_thread(_ensure_session_agent, agent, target)
+                new_mode = MODE_CYCLE.get(_session_mode(agent, target), "plan")
+                new_mode = await _apply_control(agent, "set_mode", {"mode": new_mode}, "_focus_mode", "mode", target)
+                _log("SYSTEM", f"Mode ({target}): {new_mode} (toggled)")
+                await _send({"type": "mode_changed", "data": new_mode, "session": target or ""})
 
-            elif msg_type == "skill_select_toggle":
-                enabled = msg.get("enabled")
-                if enabled is not None:
-                    agent.send_command("set_skill_select", {"enabled": enabled})
-                    agent._focus_skill_select = enabled
-                else:
-                    new_state = not getattr(agent, "_focus_skill_select", True)
-                    agent.send_command("set_skill_select", {"enabled": new_state})
-                    agent._focus_skill_select = new_state
-                _log("SYSTEM", f"Skill select: {getattr(agent, '_focus_skill_select', True)}")
-                await _send({
-                    "type": "skill_select_changed",
-                    "data": getattr(agent, "_focus_skill_select", True),
-                })
 
             elif msg_type == "command":
                 cmd = msg.get("cmd", "")
                 _log("SYSTEM", f"Command: {cmd}")
                 # ── /compact: 走 chat 流式路径（复用 run_stream 流式压缩），
-                #    而非旧同步命令轮询（曾导致 5s 假超时 + 无流式反馈）──
+                #    而非旧同步命令轮询（曾导致 5s 假超时 + 无流式反馈）。
+                #    2026-09-02: 改走 _handle_chat_chain——compact 也是一回合，
+                #    结束后自动续跑排队队列（修复 /compact 完成后队列滞留）──
                 if cmd.strip().lower() == "/compact":
-                    if active_chat_task is not None and not active_chat_task.done():
-                        await _send({"type": "info", "data": "⏳ Agent 正在处理上一条消息，请稍候"})
+                    target = _ws_target_session(agent, msg)
+                    agent = await asyncio.to_thread(_ensure_session_agent, agent, target)
+                    if await _target_busy(agent, target):
+                        await _send({"type": "info", "data": "⏳ Agent 正在处理上一条消息，请稍候",
+                                     "session": target or ""})
                         continue
-                    _drain_output_until_turn_end(agent)
-                    active_chat_task = asyncio.create_task(
-                        _handle_chat_ws(ws, agent, COMPACT_MARKER + COMPACT_PROMPT, send_lock)
+                    if not target:
+                        await _send({"type": "error", "data": "No agent session active."})
+                        continue
+                    await asyncio.to_thread(_drain_output_until_turn_end, agent, target)
+                    task = asyncio.create_task(
+                        _handle_chat_chain(ws, agent, COMPACT_MARKER + COMPACT_PROMPT, send_lock, target)
                     )
+                    _register_chat_task(chat_tasks, target, task)
                     continue
-                before = _current_session
-                result = await asyncio.to_thread(_execute_command, agent, cmd)
-                # ── 命令历史落库：/xxx 与 !xxx 及回应持久化（T2）──
-                _record_web_cmd_history(cmd, result)
+                before = _get_current_session()
+                cmd_sess = _ws_target_session(agent, msg)
+                result = await asyncio.to_thread(_execute_command, agent, cmd, cmd_sess)
+                _record_web_cmd_history(cmd, result, cmd_sess)
                 await _send({
                     "type": "command_result",
                     "data": result,
+                    # A3 修复（2026-08-22）：注入 session 标识，前端据此分流——
+                    # 切走后到达的命令结果不再污染当前视图（handleBackgroundEvent 丢弃非当前 session 事件）
+                    "session": cmd_sess or "",
                 })
                 # F4: /session 命令切换会话后补发 session_switched，
                 # 让前端同步更新 session-name（command_result 仅展示文本，
                 # 无刷新路径，否则显示停留在旧会话名）。
-                if _current_session != before:
-                    # FIX: 2.0→1.0：agent 忙碌时 get_info 排队超时是预期，降低切换阻塞
-                    info = await asyncio.to_thread(agent.get_focus_info, 1.0)
-                    if info:
-                        # FIX: /session 切换后同步真实 mode/锁状态/技能选择到缓存（对齐 switch_session 路径）
+                if _get_current_session() != before:
+                    cur = _get_current_session()
+                    info = await asyncio.to_thread(_get_session_info, agent, cur, 1.0) if cur else None
+                    if info and cur == agent.focus:
                         agent._focus_mode = info.get("mode", agent._focus_mode)
                         agent._focus_observing = info.get("is_observing", False)
                         agent._focus_holder_info = info.get("holder_info", None)
-                        agent._focus_skill_select = info.get("skill_select_enabled", agent._focus_skill_select)
                     msg_count = info.get("msg_count", 0) if info else 0
-                    _stats_cache.clear()  # P0: /session 命令切走后 stats 缓存立即失效
+                    _stats_cache.clear()
                     await _send({
                         "type": "session_switched",
                         "data": {
-                            "session": _current_session,
+                            "session": cur,
                             "messages": msg_count,
-                            "busy": _session_busy(agent, _current_session),
+                            "busy": _session_ws_busy(agent, cur, chat_tasks),
                         },
                     })
 
@@ -1502,18 +2522,22 @@ async def _ws_loop(ws: WebSocket, agent: Agent):
                     # 切回该 session 时前端从 DB 增量拉取可见完整结果。
                     # 卡死残留风险已由 llm.py 2026-08-10 读超时修复兜底；
                     # 用户仍可用 interrupt 按钮手动强杀旧回合。
-                    if active_chat_task is not None and not active_chat_task.done():
-                        active_chat_task.cancel()
-                        try:
-                            await active_chat_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                        active_chat_task = None
-                        # 不 drain 旧队列：旧回合仍在产出事件，drain 会丢尾部事件；
-                        # 切回后新回合 F1c 清空残留兜底，DB 已落库消息不受影响。
+                    # C1：切走保留旧 session 的后台转发任务；busy 仅看目标 session。
+                    for sess, task in list(chat_tasks.items()):
+                        if sess != name and not task.done():
+                            _log("CHAT", f"切走保留后台转发: session={sess} task={task}")
                     _log("SYSTEM", f"Session switch: {name}")
-                    mgr = _get_agent(name)   # 切 focus（内部 switch_focus + focus_session）
-                    _current_session = name
+                    try:
+                        mgr = await asyncio.to_thread(_focus_session, name)
+                    except Exception as _sw_err:
+                        # 2026-08-23: 切换目标 session 的 DB 不可用（IOERR 冷却/存储故障）
+                        # → 立即通知前端（error 事件会 clearSessionSwitchPending），
+                        # 避免前端 8s "切换会话超时"；不阻塞 WS 处理循环。
+                        _log("SYSTEM", f"Session switch 失败: {name} -> {_sw_err}")
+                        await _send({"type": "error",
+                                     "data": f"会话 {name} 数据库暂不可用（存储 IO 故障冷却中），请稍后重试"})
+                        return
+                    agent = mgr
                     # FIX: 移除新 focus 的 drain（队列理论干净，drain 阻塞 3s 是主要瓶颈）
                     # FIX: 移除重复的 get_focus_info（focus_session 内部已调用并更新缓存）
                     # focus_session 已同步 mode/锁状态/技能选择到 mgr 缓存
@@ -1526,7 +2550,7 @@ async def _ws_loop(ws: WebSocket, agent: Agent):
                         "data": {
                             "session": name,
                             "messages": msg_count,
-                            "busy": _session_busy(mgr, name),
+                            "busy": _session_ws_busy(mgr, name, chat_tasks),
                         },
                     })
                 else:
@@ -1535,61 +2559,183 @@ async def _ws_loop(ws: WebSocket, agent: Agent):
                         "data": f"Session '{name}' not found",
                     })
             elif msg_type == "interrupt":
-                # 对齐 repl Ctrl+C：请求 agent 线程完全停止（Event + bashkit.cancel），
-                # 而非仅 cancel asyncio 转发任务（后者 agent 线程仍在后台跑完、污染下回合）。
-                if active_chat_task is not None and not active_chat_task.done():
-                    if agent.request_interrupt(_current_session or agent.focus):
-                        active_chat_task.cancel()   # 立即停止转发
-                        try:
-                            await active_chat_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                        active_chat_task = None
-                        # 排空残留事件至 _turn_end（对齐 repl._drain_until_turn_end）
-                        await asyncio.to_thread(_drain_output_until_turn_end, agent, 3.0)
-                        await _send({"type": "system", "data": "⏹ 已停止"})
-                        await _send({"type": "done", "data": ""})
-                    else:
-                        await _send({"type": "system", "data": "⚠️ 无法中断：会话未激活或正在收尾"})
-                        await _send({"type": "done", "data": ""})
-                else:
-                    # 无活跃回合：幂等回执 done，前端复位 isStreaming
-                    await _send({"type": "done", "data": ""})
+                target = (msg.get("session") or "").strip() or _get_current_session() or agent.focus
+                stopped = False
+                if target and agent.request_interrupt(target):
+                    stopped = True
+                had_forward = bool(target and _chat_forward_busy(chat_tasks, target))
+                # 2026-08-30: 停止语义 = 中断当前回合 + 清空该 session 排队队列
+                # （先 clear 后 cancel：_handle_chat_ws 会吞掉 CancelledError，若先 cancel
+                #   链式任务可能在吞异常后继续 pop；先清空则 pop 必为 None，循环自然退出）
+                _cleared = _clear_chat_queue(target)
+                if _cleared:
+                    await _send({"type": "chat_queue_cleared", "data": {"count": _cleared},
+                                 "session": target})
+                if target and (had_forward or stopped):
+                    await _cancel_chat_task(chat_tasks, target)
+                    await asyncio.to_thread(_drain_output_until_turn_end, agent, target, 3.0)
+                note = "⏹ 已停止" if stopped else "⚠️ 无活跃回合可中断"
+                if _cleared:
+                    note += f"，已清空 {_cleared} 条排队消息"
+                payload = {"type": "system", "data": note}
+                if target:
+                    payload["session"] = target
+                await _send(payload)
+                if stopped or had_forward:
+                    done_payload = {"type": "done", "data": ""}
+                    if target:
+                        done_payload["session"] = target
+                    await _send(done_payload)
     finally:
-        logger.info(f"WS 断开: session={agent.session}")
-        # P2: 连接断开时取消未完成的 chat 任务
-        if active_chat_task is not None and not active_chat_task.done():
-            active_chat_task.cancel()
-            try:
-                await active_chat_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        logger.info(f"WS 断开: session={agent.focus}")
+        for sess in list(chat_tasks.keys()):
+            await _cancel_chat_task(chat_tasks, sess)
 
 
 async def _safe_send(ws: WebSocket, data: dict) -> bool:
     """Send JSON to WebSocket, return False if client disconnected."""
     try:
-        await ws.send_text(json.dumps(data))
+        # 10s 写超时：浏览器标签页休眠/网络中断时 ws.send_text 可能长期阻塞，
+        # 导致回合订阅消费停滞、事件队列溢出（subscriber overflow 根因之一）。
+        # 2026-09-04 修复（Task-406 卡死根因）：wait_for 直接包裹 send_text 时，
+        # 超时后需取消并等待底层任务结束；若 websockets drain 吞掉 CancelledError
+        # 继续阻塞，wait_for 会永久挂起（10s 超时形同虚设，转发任务卡死 → busy 恒真）。
+        # shield 隔离后：超时只取消 shield 协程，底层任务泄漏但 _safe_send 必返回。
+        await asyncio.wait_for(asyncio.shield(ws.send_text(json.dumps(data))), timeout=10.0)
         return True
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, asyncio.TimeoutError, ConnectionError, OSError):
         return False
 
-def _drain_output_until_turn_end(mgr: AgentManager, total_timeout: float = 3.0) -> None:
-    """Drain the focused agent's output queue, discarding events until _turn_end.
+def _drain_output_until_turn_end(mgr: AgentManager, session: str | None = None,
+                                 total_timeout: float = 3.0) -> None:
+    """等待指定 session 的回合结束，不消费任何订阅者的流式事件。"""
+    session = session or mgr.focus
+    if session:
+        mgr.wait_for_turn_end(session=session, timeout=total_timeout)
 
-    对齐 repl._drain_until_turn_end（Ctrl+C 语义）：切换 focus 后，旧回合
-    （被 cancel 但 agent 线程仍在后台跑）的残留事件会积压在其队列；若不清空，
-    切回后 read_output 会先读到旧事件，污染新回合界面。
-    此函数丢弃这些残留（选项 A：与 repl 对齐，接受"切回丢弃旧输出"）。
-    仅对当前 focus 的队列有效——调用方须在 focus 未变化时调用。
+
+def _chat_forward_busy(chat_tasks: dict[str, asyncio.Task], session: str | None) -> bool:
+    """该 session 是否仍有 WS 转发任务在跑（与 agent turn_active 独立）。"""
+    if not session:
+        return False
+    task = chat_tasks.get(session)
+    return task is not None and not task.done()
+
+
+def _session_ws_busy(mgr: AgentManager, session: str | None,
+                     chat_tasks: dict[str, asyncio.Task] | None = None) -> bool:
+    """session 是否忙：agent 回合进行中或 WS 仍在转发（与 _focus_busy 同口径）。"""
+    if not session:
+        return False
+    if _session_busy(mgr, session):
+        return True
+    return chat_tasks is not None and _chat_forward_busy(chat_tasks, session)
+
+
+# 2026-09-04 修复（busy 口径对齐）：跨 WS 连接的活跃转发任务计数。
+# chat_tasks 是 per-connection 局部变量，/api/sessions 无法访问；
+# 用模块级计数汇总，供前端 busy 判定（转发任务卡死时 turn_active 已复位
+# false 但任务未结束 → 前端需显示 busy，避免"静默排队"）。
+_chat_forward_count: dict[str, int] = {}
+_chat_forward_lock = threading.Lock()
+
+
+def _register_chat_task(chat_tasks: dict[str, asyncio.Task], session: str,
+                        task: asyncio.Task) -> None:
+    """登记 per-session 转发任务，完成后自动清理。"""
+    def _cleanup(t: asyncio.Task) -> None:
+        if chat_tasks.get(session) is t:
+            chat_tasks.pop(session, None)
+        with _chat_forward_lock:
+            _n = _chat_forward_count.get(session, 0) - 1
+            if _n <= 0:
+                _chat_forward_count.pop(session, None)
+            else:
+                _chat_forward_count[session] = _n
+    with _chat_forward_lock:
+        _chat_forward_count[session] = _chat_forward_count.get(session, 0) + 1
+    chat_tasks[session] = task
+    task.add_done_callback(_cleanup)
+
+
+def _chat_forward_busy_global(session: str | None) -> bool:
+    """跨连接汇总：该 session 是否有活跃 WS 转发任务（供 /api/sessions busy 判定）。"""
+    if not session:
+        return False
+    with _chat_forward_lock:
+        return _chat_forward_count.get(session, 0) > 0
+
+
+async def _cancel_chat_task(chat_tasks: dict[str, asyncio.Task],
+                            session: str | None) -> None:
+    """取消并 await 指定 session 的 WS 转发任务。"""
+    if not session:
+        return
+    task = chat_tasks.pop(session, None)
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def _handle_chat_chain(ws: WebSocket, mgr: AgentManager, first_text: str,
+                             send_lock: asyncio.Lock, session: str | None = None) -> None:
+    """链式执行：当前回合结束后自动消费该 session 的排队消息（FIFO）。
+
+    2026-08-30: 配合 _chat_queues 实现"busy 时排队、空闲后依次处理"。
+    - 全程占用 chat_tasks[session]（_chat_forward_busy 恒真）→ 链式期间新消息继续入队；
+    - 每条排队消息都是独立完整回合（独立技能选择/工具调用/落库），非拼接 prompt；
+    - _handle_chat_ws 先 send_input 再转发：ws 断开仅影响实时转发（早退），
+      回合仍由 agent 执行并落库（P2 语义），故队列继续消费不丢消息；
+    - CancelledError 向上传播（interrupt 取消链式任务 → 队列已由 interrupt 分支先行清空）。
     """
-    deadline = time.time() + total_timeout
-    while time.time() < deadline:
-        event = mgr.read_output(timeout=0.2)
-        if event is None:
+    target = session
+    text = first_text
+    while text is not None:
+        try:
+            await _handle_chat_ws(ws, mgr, text, send_lock, target)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("chat chain turn failed: session=%s", target)
+        # 下一回合前确认 session 未被其他连接的回合抢占（防御：避免 send_input
+        # 在他人回合进行中覆盖 active_turn_id）。短暂 busy 视为回合收尾时序，重试等待。
+        _waited = 0.0
+        while target and await asyncio.to_thread(_session_busy, mgr, target) and _waited < 2.0:
+            await asyncio.sleep(0.3)
+            _waited += 0.3
+        if target and await asyncio.to_thread(_session_busy, mgr, target):
+            _log("CHAT", f"chat chain 停止续跑（session 仍被占用，队列保留）: session={target}")
+            # 2026-09-02(A2): 滞留不再静默——队列非空时通知前端，避免用户误判卡死
+            # 后用 Stop 清队（interrupt 会丢弃排队消息）。恢复：发任意新消息（chat 分支
+            # FIFO 续跑）或刷新页面（WS 连接建立 auto-drain）。
+            if _chat_queue_size(target) > 0:
+                try:
+                    async with send_lock:
+                        await ws.send_text(json.dumps({
+                            "type": "info",
+                            "data": "⏳ 会话仍被占用，已暂停排队消息续跑（队列已保留）；"
+                                    "发送任意新消息或刷新页面可恢复",
+                            "session": target or ""}))
+                except Exception:
+                    logger.debug("chain 滞留通知发送失败（ws 可能已断开）")
             break
-        if isinstance(event, dict) and event.get("type") == "_turn_end":
+        nitem = await asyncio.to_thread(_pop_chat_queue, target)
+        if nitem is None:
             break
+        text = nitem["text"]
+        try:
+            async with send_lock:
+                await ws.send_text(json.dumps({
+                    "type": "chat_dequeued",
+                    "data": {"qid": nitem["qid"], "text": text},
+                    "session": target or ""}))
+        except Exception:
+            logger.debug("chat_dequeued 发送失败（ws 可能已断开），继续处理队列")
+        _log("CHAT", f"Queued message dequeued: session={target}")
 
 
 # ── Logging ──
@@ -1600,7 +2746,8 @@ def _log(level: str, msg: str):
     logger.info(f"[{level}] {msg}")
 
 
-async def _handle_chat_ws(ws: WebSocket, mgr: AgentManager, text: str, send_lock: asyncio.Lock):
+async def _handle_chat_ws(ws: WebSocket, mgr: AgentManager, text: str, send_lock: asyncio.Lock,
+                          session: str | None = None):
     """Handle a chat message over WebSocket with streaming (via manager).
 
     对齐 repl._handle_event 的事件集：补全 stats 成本、tool 字段、
@@ -1608,50 +2755,71 @@ async def _handle_chat_ws(ws: WebSocket, mgr: AgentManager, text: str, send_lock
 
     P2 修复：
     - 本函数作为后台 asyncio 任务运行（_ws_loop 中 create_task），
-      read_output 改用 asyncio.to_thread，避免同步阻塞事件循环，
-      使主循环能持续接收消息（切 session / 改 mode / 发命令）。
-    - target 在启动时捕获，循环内 mgr.focus != target 即停止转发
-      （切 session 后旧回合输出积压其队列，不再串台）。
-    - 收到取消（切 session）时吞掉 CancelledError，不重发 done。
+      read_output 改用 asyncio.to_thread，避免同步阻塞事件循环。
+    - target 在启动时捕获；C1 切走后仍按 target 读队列继续转发（非 focus）。
+    - 收到取消（interrupt）时吞掉 CancelledError，不重发 done。
     """
-    _log("CHAT", f"User: {text[:200]}{'...' if len(text) > 200 else ''}")
-
     async def _send(data: dict) -> bool:
         # P2: 与主循环共享发送锁，避免后台任务与主循环并发写 ws
+        # C1: 统一注入 session 标识，前端据此区分当前/后台 session 事件
+        # （仅注入一次，避免嵌套 dict 重复污染）
+        if "session" not in data:
+            data = dict(data)
+            data["session"] = target
         async with send_lock:
             return await _safe_send(ws, data)
 
-    # F3: 捕获本回合所属 session（前置到 send_input 之前）
-    target = mgr.focus
+    # F3: 捕获本回合所属 session（_ws_loop 在 create_task 前锁定，避免 switch 竞态）
+    target = session or mgr.focus
     if target is None:
         await _send({"type": "error", "data": "No agent session active."})
         return
-    # Delegate to the manager's focused agent
-    if not mgr.send_input(text):
+    _session_context, session_token = _config.activate_session(target, ensure=False)
+    _log("CHAT", f"User: {text[:200]}{'...' if len(text) > 200 else ''}")
+    subscription = mgr.subscribe(target, maxsize=4096)
+    if subscription is None:
+        _config.reset_session(session_token)
+        await _send({"type": "error", "data": "Agent event stream unavailable."})
+        return
+    # Delegate to the manager's focused agent（显式 session=target，切 focus 后仍投递正确队列）
+    if not mgr.send_input(text, session=target):
+        mgr.unsubscribe(subscription)
+        _config.reset_session(session_token)
         await _send({"type": "error", "data": "No agent session active."})
         return
-    # F3: send_input 后校验 focus 一致性（极小竞态窗口：create_task 调度期间
-    # focus 可能已被 switch_session 改走），不一致则丢弃本回合并提示
-    if mgr.focus != target:
-        _log("CHAT", f"回合丢弃: focus 已变为 {mgr.focus}（消息已入旧队列）")
-        await _send({"type": "system", "data": "⏹ 会话已切换，消息未投递"})
-        return
     reply_parts: list[str] = []
+    # 2026-09-04 修复：转发循环空闲兜底——subscription 未关闭但长时间无事件
+    # （_safe_send 修复前 blocked 分支挂起导致 unsubscribe 未执行）→ 主动收尾，
+    # 避免 _chat_forward_busy 恒真拖死队列消费。阈值保守（正常回合有流式事件）。
+    _idle_deadline = time.monotonic() + _CHAT_FORWARD_IDLE_TIMEOUT
     try:
         while True:
-            # P2: focus 守卫：切 session 后立即停止本回合转发（避免读错 focus 队列）
-            if mgr.focus != target:
-                _log("CHAT", f"回合中止: focus {target} -> {mgr.focus}")
-                # F2: 补发 done——/session 命令路径切 focus 时本任务静默退出，
-                # 若不发 done，前端 isStreaming 永久卡死（send() 拒绝新消息）。
-                # switch_session 路径已由前端 session_switched 重置，此处幂等安全。
-                await _send({"type": "done", "data": ""})
-                return
-            # P2: 同步 read_output 放到线程池，避免阻塞事件循环
-            event = await asyncio.to_thread(mgr.read_output, 0.2)
+            # C1（2026-08-21）：focus 守卫改为"后台转发"而非"中止"。
+            # 切走后 mgr.focus != target，但本回合仍按 target 读队列继续转发，
+            # 事件附带 session 标识，前端对非当前 session 只更新缓存不渲染 DOM。
+            # 切回 target 时前端缓存已含后台事件，实时流无缝继续。
+            # （原实现：focus 变化即 return，切回后无恢复机制 = 实时渲染中断根因之一）
+            # C1（2026-08-21）：按 target session 读队列，而非 focus。
+            # 切走后 mgr.focus 已变化，read_output 会读错队列；read_output_for
+            # 固定读本回合所属 session 的队列，实现"切走后后台继续接收"。
+            event = await asyncio.to_thread(mgr.read_output_for, target, 0.2, subscription)
             if event is None:
+                if subscription.closed:
+                    await _send({"type": "error", "data": "Agent event stream ended unexpectedly."})
+                    await _send({"type": "done", "data": ""})
+                    return
+                # 空闲兜底：subscription 未关闭但长时间无事件 → 强制收尾（防转发任务卡死残留）
+                if time.monotonic() >= _idle_deadline:
+                    _log("CHAT", f"回合转发空闲超时({int(_CHAT_FORWARD_IDLE_TIMEOUT)}s)，强制收尾: session={target}")
+                    await _send({"type": "done", "data": ""})
+                    return
                 continue
+            _idle_deadline = time.monotonic() + _CHAT_FORWARD_IDLE_TIMEOUT  # 有事件则重置空闲计时
             t = event.get("type", "")
+            if t == "_dropped_events":
+                await _send({"type": "stream_gap", "data": event.get("data", {})})
+                await _send({"type": "system", "data": "⚠️ 事件消费者过慢，部分实时输出已丢弃；正在从数据库补全。"})
+                continue
 
             if t == "thinking":
                 if not await _send({"type": "thinking", "data": ""}):
@@ -1686,7 +2854,7 @@ async def _handle_chat_ws(ws: WebSocket, mgr: AgentManager, text: str, send_lock
                 if _tc_name == "pythonrt" and isinstance(_tc_args, dict):
                     _fp = str(_tc_args.get("code_or_filepath") or "").strip()
                     if _fp.endswith(".py") and not _fp.startswith(("http://", "https://")):
-                        _base = os.path.realpath(_resolve_workdir())
+                        _base = os.path.realpath(_resolve_workdir(target))
                         _full = os.path.realpath(os.path.join(_base, _fp))
                         if _full == _base or _full.startswith(_base + os.sep):
                             try:
@@ -1733,6 +2901,7 @@ async def _handle_chat_ws(ws: WebSocket, mgr: AgentManager, text: str, send_lock
             elif t == "stats":
                 pt = event.get("prompt_tokens", 0)
                 ct = event.get("completion_tokens", 0)
+                rt = event.get("reasoning_tokens", 0)
                 model = event.get("model", "")
                 # 对齐 repl：估算成本
                 try:
@@ -1745,6 +2914,7 @@ async def _handle_chat_ws(ws: WebSocket, mgr: AgentManager, text: str, send_lock
                     "data": {
                         "prompt_tokens": pt,
                         "completion_tokens": ct,
+                        "reasoning_tokens": rt,
                         "cost": cost,
                         "model": model,
                     },
@@ -1773,27 +2943,12 @@ async def _handle_chat_ws(ws: WebSocket, mgr: AgentManager, text: str, send_lock
                     if not await _send({"type": "system", "data": lines}):
                         return
 
-            elif t == "skill_selected":
-                name = event.get("name", "")
-                reason = event.get("reason") or ""
-                suffix = f"（{reason}）" if reason else ""
-                if not await _send({"type": "system", "data": f"🎯 技能选择: {name}{suffix}"}):
-                    return
-
             elif t == "skill_req":
                 # 对齐 repl：显示 Skill loaded
                 sname = event.get("name", "")
                 if sname:
                     if not await _send({"type": "system", "data": f"💡 Skill loaded: {sname}"}):
                         return
-
-            elif t == "no_skill":
-                reason = event.get("reason") or ""
-                label = "🎯 技能选择: 无"
-                if reason:
-                    label += f"（{reason[:120]}）"
-                if not await _send({"type": "system", "data": label}):
-                    return
 
             elif t == "_sync_update":
                 # 对齐 repl：打印同步消息
@@ -1818,42 +2973,54 @@ async def _handle_chat_ws(ws: WebSocket, mgr: AgentManager, text: str, send_lock
                 return
 
             elif t == "_lock_status":
-                # T7: 观察者状态 → 更新 manager 缓存 + 转发前端渲染 ⏳/🔒 标签
-                mgr._focus_observing = event.get("is_observing", False)
-                mgr._focus_holder_info = event.get("holder_info", None)
+                _cache_session_ui(target, {
+                    "is_observing": event.get("is_observing", False),
+                    "holder_info": event.get("holder_info"),
+                })
+                if _should_update_focus_cache(mgr, target):
+                    mgr._focus_observing = event.get("is_observing", False)
+                    mgr._focus_holder_info = event.get("holder_info", None)
                 if not await _send({
                     "type": "lock_status_changed",
                     "data": {
-                        "observing": mgr._focus_observing,
-                        "holder": mgr._focus_holder_info,
+                        "observing": event.get("is_observing", False),
+                        "holder": event.get("holder_info", None),
                     },
+                    "session": target,
                 }):
                     return
 
             elif t == "_cmd_result":
+                if isinstance(event.get("data"), dict) and target:
+                    _cache_session_ui(target, event["data"])
                 # 对齐 repl：内部状态事件不渲染，但回流真实状态到缓存
                 # （FIX: 原实现 pass，get_info/set_mode 结果无法同步缓存，导致状态过期）
-                cmd = event.get("cmd")
-                data = event.get("data")
-                if cmd == "get_info" and isinstance(data, dict):
-                    mgr._focus_mode = data.get("mode", mgr._focus_mode)
-                    mgr._focus_observing = data.get("is_observing", False)
-                    mgr._focus_holder_info = data.get("holder_info", None)
-                    mgr._focus_skill_select = data.get("skill_select_enabled", mgr._focus_skill_select)
-                elif cmd == "set_mode":
-                    if data:
-                        mgr._focus_mode = data
-                    elif event.get("ok") is False:
-                        # 观察者拒绝写命令（无 data）：回读真实 mode，防缓存保留错误状态
-                        info = mgr.get_focus_info(timeout=2.0)
-                        if info:
-                            mgr._focus_mode = info.get("mode", mgr._focus_mode)
-                elif cmd == "set_skill_select" and isinstance(data, bool):
-                    mgr._focus_skill_select = data
+                if not _should_update_focus_cache(mgr, target):
+                    pass
+                else:
+                    cmd = event.get("cmd")
+                    data = event.get("data")
+                    if cmd == "get_info" and isinstance(data, dict):
+                        mgr._focus_mode = data.get("mode", mgr._focus_mode)
+                        mgr._focus_observing = data.get("is_observing", False)
+                        mgr._focus_holder_info = data.get("holder_info", None)
+                    elif cmd == "set_mode":
+                        if data:
+                            mgr._focus_mode = data
+                        elif event.get("ok") is False:
+                            # 观察者拒绝写命令（无 data）：回读真实 mode，防缓存保留错误状态
+                            info = await asyncio.to_thread(mgr.get_focus_info, 2.0)
+                            if info:
+                                mgr._focus_mode = info.get("mode", mgr._focus_mode)
 
 
             elif t == "clear_thinking":
                 await _send({"type": "clear_thinking"})
+
+            elif t == "info":
+                # 2026-09-11: 非错误提示转发（对齐 repl.py 的 info 分支）——
+                # 如 autocompact 自动压缩通知 / 上下文超限修剪提示（前端 addMsg('info') 渲染）
+                await _send({"type": "info", "data": event.get("data", "")})
 
             elif t == "error":
                 err_msg = event.get("data", "Unknown error")
@@ -1882,19 +3049,28 @@ async def _handle_chat_ws(ws: WebSocket, mgr: AgentManager, text: str, send_lock
         # P2: 切 session 取消本任务：静默退出，不重发 done
         _log("CHAT", f"回合取消: {target}")
         return
-    full_reply = "".join(reply_parts)
-    if full_reply:
-        _log("CHAT", f"Assistant: {full_reply[:500]}{'...' if len(full_reply) > 500 else ''}")
+    finally:
+        full_reply = "".join(reply_parts)
+        if full_reply:
+            _log("CHAT", f"Assistant: {full_reply[:500]}{'...' if len(full_reply) > 500 else ''}")
+        mgr.unsubscribe(subscription)
+        _config.reset_session(session_token)
 
     # Send done signal
     await _send({"type": "done", "data": ""})
 
-def _run_bash(cmd: str) -> str:
+def _run_bash(cmd: str, cwd: str | None = None) -> str:
     """执行 bash 命令并返回输出（对齐 repl 的 !command 快捷方式）。"""
     if not cmd:
         return ""
+    # workdir 目录失效（已删除/不可访问）时回退 None（继承 server cwd，保持原行为）
+    if cwd and not os.path.isdir(cwd):
+        cwd = None
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, errors="replace")
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           errors="replace", timeout=30, cwd=cwd)
+    except subprocess.TimeoutExpired:
+        return "❌ Error: command timed out after 30s"
     except Exception as e:
         return f"❌ Error: {e}"
     parts = []
@@ -1908,34 +3084,51 @@ def _run_bash(cmd: str) -> str:
 
 
 
-def _record_web_cmd_history(cmd: str, result: str) -> None:
-    """将 web 端执行的 /xxx 或 !xxx 命令与回应写入当前 session DB（role='command'）。
+_WEB_WRITE_CMD_PREFIXES = (
+    "/clear", "/drop", "/compact", "/mount", "/unmount", "/mode", "/model",
+    "/plan", "/build", "/build-unsafe", "/info", "/autocompactlimit",
+    "/session add", "/session remove", "/session fork", "/session rename",
+    "/session stop", "/session sync", "/session title",
+    "/addinfo", "/rminfo",
+    "/skill", "/validate", "/updateembedding",
+)
 
-    设计意图：web 命令不经 agent 队列（_execute_command 为同步直调），观察者 gate
-    不拦截，故此处统一落库并 try/except 降级（观察者只读连接写失败仅告警）。
-    连接解析：使用 web 侧全局 _current_session（_execute_command 同样依赖它），
-    避免依赖 Agent 对象内部字段，跨版本更稳。
-    """
+
+def _web_observer_blocks(mgr: AgentManager, session: str | None, cmd: str) -> str | None:
     cmd = (cmd or "").strip()
-    if not cmd or not _current_session:
+    if not cmd.startswith("/"):
+        return None
+    low = cmd.lower()
+    if not any(low == p or low.startswith(p + " ") for p in _WEB_WRITE_CMD_PREFIXES):
+        return None
+    if not session:
+        return None
+    evt = mgr.send_command_wait("get_info", session=session, timeout=2.0)
+    if evt and isinstance(evt.get("data"), dict) and evt["data"].get("is_observing"):
+        return "⚠️ session 已被其他进程占用（观察者只读模式），写命令已拒绝"
+    return None
+
+
+def _record_web_cmd_history(cmd: str, result: str, session: str | None = None) -> None:
+    """将 web 端执行的 /xxx 或 !xxx 命令与回应写入 session DB（role='command'）。"""
+    cmd = (cmd or "").strip()
+    sess = session or _get_current_session()
+    if not cmd or not sess:
         return
     try:
         from codes.history import add_command, get_conn
         add_command(
-            get_conn(_current_session), cmd, result,
+            get_conn(sess), cmd, result,
             kind="bang" if cmd.startswith("!") else "slash",
         )
     except Exception:
         logger.warning(f"记录 command 历史失败: {cmd!r}", exc_info=True)
 
 
-def _web_cmd_context(mgr) -> CommandContext:
+def _web_cmd_context(mgr, session: str | None = None) -> CommandContext:
     """构造 Web 侧命令上下文（注入全局会话同步 / 服务器退出能力）。"""
-    global _current_session
-
     def _switch_hook(name: str) -> None:
-        global _current_session
-        _current_session = name
+        _set_current_session(name)
 
     def _exit_hook() -> str:
         close_web_server()
@@ -1943,3076 +3136,50 @@ def _web_cmd_context(mgr) -> CommandContext:
 
     return CommandContext(
         exit_hook=_exit_hook,
-        get_session=lambda: _current_session,
+        get_session=lambda: session or _get_current_session(),
         switch_session_hook=_switch_hook,
     )
 
 
-def _execute_command(agent: AgentManager, cmd: str) -> str:
-    """统一命令调度（codes.commands.dispatch），对齐 repl。
-
-    覆盖全部共享命令：help/logfile/clear/drop/session/sessions/model/skills/
-    validate/updateembedding/info/skill/plan/build/build-unsafe/mode/mount/
-    unmount/turnonskill/turnoffskill/restart/exit/cmds + !xxx bash 快捷方式。
-    """
+def _execute_command(agent: AgentManager, cmd: str, session: str | None = None) -> str:
+    """统一命令调度（codes.commands.dispatch），对齐 repl。"""
     cmd = cmd.strip()
     if not cmd:
         return ""
-    # ── !command: bash 快捷方式（保留 web 侧实现） ──
+    sess = session or _get_current_session()
+    if cmd.startswith("/"):
+        block = _web_observer_blocks(agent, sess, cmd)
+        if block:
+            return block
     if cmd.startswith("!"):
-        return _run_bash(cmd[1:].strip())
-    return dispatch(agent, cmd, ctx=_web_cmd_context(agent))
+        return _run_bash(cmd[1:].strip(), cwd=_resolve_workdir(sess))
+    return dispatch(agent, cmd, ctx=_web_cmd_context(agent, sess))
 
 
-# ── Login page HTML ──
-
-LOGIN_PAGE = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XKAgent - Login</title>
-<style>
-  :root {
-    --bg: #f3f5fb;
-    --surface: #ffffff;
-    --surface2: #f6f6f6;
-    --accent: #0066ff;
-    --accent-hover: #0052cc;
-    --text: #1c1f23;
-    --text-muted: #57606a;
-    --border: rgba(28, 31, 35, 0.08);
-    --radius: 12px;
-    --err: #dc2626;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .login-box {
-    background: var(--surface);
-    padding: 40px;
-    border-radius: 16px;
-    border: 1px solid var(--border);
-    box-shadow: 0 4px 24px rgba(28, 31, 35, 0.06);
-    width: 380px;
-    text-align: center;
-  }
-  .login-box h1 { font-size: 26px; margin-bottom: 8px; color: var(--accent); font-weight: 600; }
-  .login-box p { font-size: 14px; color: var(--text-muted); margin-bottom: 28px; }
-  .login-box input {
-    width: 100%;
-    padding: 12px 16px;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    background: var(--surface2);
-    color: var(--text);
-    font-size: 15px;
-    outline: none;
-    margin-bottom: 16px;
-    transition: border-color .15s;
-  }
-  .login-box input:focus { border-color: var(--accent); }
-  .login-box button {
-    width: 100%;
-    padding: 12px;
-    border: none;
-    border-radius: 10px;
-    background: var(--accent);
-    color: #fff;
-    font-size: 15px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background .15s;
-  }
-  .login-box button:hover { background: var(--accent-hover); }
-  .login-box .error { color: var(--err); font-size: 13px; margin-top: 12px; display: none; }
-  .login-box .loading { color: var(--text-muted); font-size: 13px; margin-top: 12px; display: none; }
-.thinking-wait { color: #999; font-style: italic; padding: 4px 0; }
-</style>
-</head>
-<body>
-<div class="login-box">
-  <h1>⚡ XKAgent</h1>
-  <p>Enter credentials to continue</p>
-  <input type="text" id="username" placeholder="Username" autofocus
-         onkeydown="if(event.key==='Enter') login()">
-  <input type="password" id="password" placeholder="Password"
-         onkeydown="if(event.key==='Enter') login()">
-  <button onclick="login()">Login</button>
-  <div class="error" id="error-msg">Invalid password</div>
-  <div class="loading" id="loading-msg">Authenticating...</div>
-</div>
-<script>
-// ── 相对路径基准：适配反向代理子路径（如 DSW /dsw-xxx/proxy/4096/）──
-// 所有 fetch/WS/跳转基于 BASE 拼接，避免绝对路径丢失代理前缀
-const BASE = (function(){ var p = location.pathname; return p.endsWith('/') ? p : p.substring(0, p.lastIndexOf('/') + 1); })();
-async function login() {
-  const user = document.getElementById('username').value.trim();
-  const pw = document.getElementById('password').value;
-  if (!user || !pw) return;
-  document.getElementById('error-msg').style.display = 'none';
-  document.getElementById('loading-msg').style.display = 'block';
-  try {
-    const resp = await fetch(BASE + 'api/login', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({username: user, password: pw})
-    });
-    if (resp.ok) {
-      window.location.href = BASE;
-    } else {
-      document.getElementById('error-msg').style.display = 'block';
-    }
-  } catch(e) {
-    document.getElementById('error-msg').style.display = 'block';
-  }
-  document.getElementById('loading-msg').style.display = 'none';
-}
-</script>
-</body>
-</html>"""
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  HTML single-page interface (embedded)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-FILES_PAGE = r"""<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>📂 Files — XKAgent</title>
-<style>
-  :root {
-    --bg: #f3f5fb; --surface: #ffffff; --surface2: #f6f6f6; --border: rgba(28,31,35,.08);
-    --text: #1c1f23; --text-muted: #57606a; --accent: #0066ff; --accent-hover: #0052cc;
-    --err: #dc2626; --radius: 10px;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-    background: var(--bg); color: var(--text); min-height: 100vh;
-  }
-  .topbar {
-    padding: 14px 24px; background: var(--surface); border-bottom: 1px solid var(--border);
-    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-  }
-  .topbar h1 { font-size: 16px; color: var(--accent); font-weight: 600; }
-  .crumb { font-size: 13px; color: var(--text-muted); display: flex; align-items: center; gap: 2px; flex-wrap: wrap; }
-  .crumb a { color: var(--accent); cursor: pointer; text-decoration: none; }
-  .crumb a:hover { text-decoration: underline; }
-  .actions { margin-left: auto; display: flex; gap: 8px; }
-  .actions button {
-    padding: 6px 14px; border: 1px solid var(--border); border-radius: 9999px;
-    background: var(--surface); color: var(--text); cursor: pointer; font-size: 12px;
-    transition: background .15s, color .15s;
-  }
-  .actions button:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
-  #listing { max-width: 960px; margin: 24px auto; padding: 0 24px; }
-  table {
-    width: 100%; border-collapse: collapse; font-size: 13px;
-    background: var(--surface); border-radius: 12px; overflow: hidden;
-    box-shadow: 0 1px 3px rgba(28,31,35,.05);
-  }
-  th, td { text-align: left; padding: 10px 16px; border-bottom: 1px solid var(--border); }
-  th {
-    color: var(--text-muted); font-weight: 600; font-size: 12px;
-    position: sticky; top: 0; background: var(--surface2);
-  }
-  tr:hover td { background: #f7f9fc; }
-  .name { cursor: pointer; }
-  .name .icon { margin-right: 6px; }
-  .dir .name { color: var(--accent); font-weight: 500; }
-  .size { color: var(--text-muted); text-align: right; }
-  .mtime { color: var(--text-muted); }
-  .empty { padding: 48px; text-align: center; color: var(--text-muted); }
-  .err { padding: 16px 24px; color: var(--err); font-size: 13px; }
-  #loading { padding: 48px; text-align: center; color: var(--text-muted); }
-</style>
-</head>
-<body>
-<div class="topbar">
-  <h1>📂 Files</h1>
-  <div class="crumb" id="crumbs"></div>
-  <div class="actions">
-    <select id="root-sel" title="允许根（workdir + 挂载）" style="padding:5px 8px;border:1px solid var(--border);border-radius:9999px;font-size:12px;color:var(--text);background:var(--surface);max-width:340px;"></select>
-    <button onclick="refresh()" title="Refresh">🔄 Refresh</button>
-    <button onclick="window.close()" title="Close this tab">✖ Close</button>
-  </div>
-</div>
-<div id="listing"><div id="loading">Loading...</div></div>
-<script>
-// ── 相对路径基准：适配反向代理子路径（如 DSW /dsw-xxx/proxy/4096/）──
-// 所有 fetch/WS/跳转基于 BASE 拼接，避免绝对路径丢失代理前缀
-const BASE = (function(){ var p = location.pathname; return p.endsWith('/') ? p : p.substring(0, p.lastIndexOf('/') + 1); })();
-let currentPath = '';
-let currentRoot = '';   // 当前所在允许根的绝对路径
-let rootsList = [];     // 允许根集合（workdir + 挂载）
-const qpInit = new URLSearchParams(location.search);
-const currentSession = qpInit.get('session') || '';   // 透传 session（缺省后端回退当前会话）
-
-function fmtSize(n) {
-  if (n == null) return '';
-  if (n < 1024) return n + ' B';
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
-  return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
-}
-
-function fmtTime(ts) {
-  if (!ts) return '';
-  const d = new Date(ts * 1000);
-  const p = (x) => String(x).padStart(2, '0');
-  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
-}
-
-function renderCrumbs(root, rel) {
-  const crumb = document.getElementById('crumbs');
-  crumb.innerHTML = '';
-  // 第一级：允许根（workdir 或挂载根），点击回到该根
-  const home = document.createElement('a');
-  home.textContent = root || '/';
-  home.title = root || '/';
-  home.onclick = () => load(root || '');
-  crumb.appendChild(home);
-  const parts = rel ? rel.split('/').filter(Boolean) : [];
-  let acc = '';
-  parts.forEach((p, i) => {
-    const sep = document.createElement('span');
-    sep.textContent = ' / ';
-    crumb.appendChild(sep);
-    acc = acc ? acc + '/' + p : p;
-    const a = document.createElement('a');
-    a.textContent = p;
-    if (i === parts.length - 1) {
-      a.style.color = 'var(--text)';
-      a.style.cursor = 'default';
-    } else {
-      a.onclick = () => load(root + '/' + acc);
-    }
-    crumb.appendChild(a);
-  });
-}
-
-function load(path) {
-  currentPath = path || '';
-  const listing = document.getElementById('listing');
-  listing.innerHTML = '<div id="loading">Loading...</div>';
-  const q = 'path=' + encodeURIComponent(currentPath) + (currentSession ? '&session=' + encodeURIComponent(currentSession) : '');
-  fetch(BASE + 'api/files/list?' + q)
-    .then(r => {
-      if (!r.ok) return r.json().then(d => { throw new Error(d.detail || '加载失败'); });
-      return r.json();
-    })
-    .then(data => {
-      currentRoot = data.root || currentPath;
-      renderCrumbs(data.root, data.path);
-      renderList(data.entries, data.root);
-      syncRootSel(data.roots);
-    })
-    .catch(err => {
-      listing.innerHTML = '';
-      const errorEl = document.createElement('div');
-      errorEl.className = 'err';
-      errorEl.textContent = '❌ ' + err.message;
-      listing.appendChild(errorEl);
-    });
-}
-
-function renderList(entries, root) {
-  const listing = document.getElementById('listing');
-  if (!entries.length) {
-    listing.innerHTML = '<div class="empty">(空目录)</div>';
-    return;
-  }
-  const table = document.createElement('table');
-  const thead = document.createElement('thead');
-  thead.innerHTML = '<tr><th>Name</th><th class="size">Size</th><th>Modified</th></tr>';
-  table.appendChild(thead);
-  const tbody = document.createElement('tbody');
-  const sessQ = currentSession ? '&session=' + encodeURIComponent(currentSession) : '';
-  entries.forEach(e => {
-    const tr = document.createElement('tr');
-    tr.className = e.is_dir ? 'dir' : 'file';
-    const tdName = document.createElement('td');
-    tdName.className = 'name';
-    const icon = document.createElement('span');
-    icon.className = 'icon';
-    icon.textContent = e.is_dir ? '📁' : '📄';
-    tdName.appendChild(icon);
-    tdName.appendChild(document.createTextNode(e.name));
-    tdName.onclick = () => {
-      const abs = (root ? root + '/' : (currentPath ? currentPath + '/' : '')) + e.name;
-      if (e.is_dir) {
-        load(abs);
-      } else {
-        window.open(BASE + 'api/files/download?path=' + encodeURIComponent(abs) + sessQ);
-      }
-    };
-    const tdSize = document.createElement('td');
-    tdSize.className = 'size';
-    tdSize.textContent = e.is_dir ? '' : fmtSize(e.size);
-    const tdTime = document.createElement('td');
-    tdTime.className = 'mtime';
-    tdTime.textContent = fmtTime(e.mtime);
-    tr.appendChild(tdName);
-    tr.appendChild(tdSize);
-    tr.appendChild(tdTime);
-    tbody.appendChild(tr);
-  });
-  table.appendChild(tbody);
-  listing.innerHTML = '';
-  listing.appendChild(table);
-}
-
-function refresh() { load(currentPath); }
-function syncRootSel(roots) {
-  rootsList = roots || rootsList;
-  const sel = document.getElementById('root-sel');
-  if (!sel) return;
-  sel.innerHTML = '';
-  rootsList.forEach(r => {
-    const opt = document.createElement('option');
-    opt.value = r;
-    opt.textContent = r;
-    sel.appendChild(opt);
-  });
-  if (currentRoot) sel.value = currentRoot;
-}
-function loadRoots() {
-  fetch(BASE + 'api/files/roots' + (currentSession ? '?session=' + encodeURIComponent(currentSession) : ''))
-    .then(r => r.json())
-    .then(data => { syncRootSel(data.roots); })
-    .catch(() => {});
-}
-// 支持 ?path= 参数定位目录（路径链接/文件浏览器入口）；?session= 透传会话
-const qp = new URLSearchParams(location.search);
-load(qp.get('path') || '');
-loadRoots();
-</script>
-</body>
-</html>
-"""
-HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XKAgent Web</title>
-<style>
-  :root {
-    --bg: #f3f5fb;
-    --surface: #ffffff;
-    --surface2: #f6f6f6;
-    --surface3: #eef1f6;
-    --text: #1c1f23;
-    --text-muted: #57606a;
-    --accent: #0066ff;
-    --accent-hover: #0052cc;
-    --accent-soft: rgba(0, 102, 255, 0.09);
-    --warn: #d97706;
-    --err: #dc2626;
-    --border: rgba(28, 31, 35, 0.08);
-    --radius: 12px;
-    --tool-bg: #ffffff;
-    --thinking-bg: #f6f8fa;
-    --thinking-pre-bg: rgba(28, 31, 35, 0.06);
-    --on-accent: #ffffff;
-    --code-bg: #f6f8fa;
-    --link: #0066ff;
-    --sidebar-w: 320px;
-  }
-  html[data-theme="dark"] {
-    --bg: #16161a;
-    --surface: #232429;
-    --surface2: #2e2f35;
-    --surface3: #35363c;
-    --text: rgba(249, 249, 249, 0.9);
-    --text-muted: rgba(249, 249, 249, 0.6);
-    --accent: #3295fb;
-    --accent-hover: #5aa2fb;
-    --accent-soft: rgba(50, 149, 251, 0.15);
-    --warn: #ffc234;
-    --err: #ff4f42;
-    --border: rgba(255, 255, 255, 0.08);
-    --tool-bg: #232429;
-    --thinking-bg: #1e1f24;
-    --thinking-pre-bg: rgba(255, 255, 255, 0.06);
-    --on-accent: #ffffff;
-    --code-bg: #1d1e22;
-    --link: #77b0ff;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-    background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: row; overflow: hidden;
-  }
-  /* ── 左侧边栏（常驻，可折叠）── */
-  #sidebar {
-    width: var(--sidebar-w); flex-shrink: 0;
-    background: var(--surface);
-    border-right: 1px solid var(--border);
-    display: flex; flex-direction: column;
-    height: 100vh; overflow-y: auto;
-    transition: margin-left .25s ease, width .25s ease;
-    z-index: 50;
-  }
-  body.sidebar-collapsed #sidebar { margin-left: calc(-1 * var(--sidebar-w)); }
-  .sidebar-header {
-    padding: 14px 16px; display: flex; align-items: center; gap: 8px;
-    border-bottom: 1px solid var(--border);
-  }
-  .sidebar-header h1 { font-size: 16px; color: var(--accent); font-weight: 600; flex: 1; white-space: nowrap; }
-  #btn-sidebar-toggle, #btn-hamburger {
-    border: none; background: transparent; color: var(--text-muted);
-    cursor: pointer; font-size: 14px; padding: 4px 8px; border-radius: 8px;
-    transition: background .15s, color .15s;
-  }
-  #btn-sidebar-toggle:hover, #btn-hamburger:hover { background: var(--surface2); color: var(--text); }
-  .sidebar-status {
-    padding: 10px 16px; font-size: 12px; color: var(--text-muted);
-    display: flex; flex-direction: column; gap: 4px;
-    border-bottom: 1px solid var(--border);
-  }
-  .sidebar-status #token-stats { margin-left: 0; }
-  #session-label { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-  #session-name { font-size: 16px; font-weight: 600; color: var(--text); word-break: break-all; }
-  #provider-model { font-size: 11px; color: var(--text-muted); }
-  #btn-ping { background: none; border: none; cursor: pointer; font-size: 12px; padding: 0 2px; color: var(--accent, #4a9eff); }
-  #btn-ping:hover { opacity: 0.7; }
-  /* ── 模型测试弹窗 ── */
-  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center; }
-  .modal-box { background: var(--bg, #1e1e1e); border: 1px solid var(--border, #444); border-radius: 8px; max-width: 720px; width: 90%; max-height: 80vh; display: flex; flex-direction: column; }
-  .modal-head { padding: 12px 16px; border-bottom: 1px solid var(--border, #444); display: flex; justify-content: space-between; align-items: center; }
-  .modal-title { font-weight: bold; }
-  .modal-close { cursor: pointer; background: none; border: none; font-size: 16px; color: var(--text-muted, #888); }
-  .modal-body { padding: 12px 16px; overflow-y: auto; }
-  .model-test-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  .model-test-table th, .model-test-table td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border, #333); }
-  .model-test-table th { color: var(--text-muted, #888); font-weight: normal; }
-  .mt-ok { color: #4caf50; } .mt-fail { color: #f44336; }
-  .mt-set-btn { font-size: 11px; padding: 2px 8px; margin: 0 4px; cursor: pointer; border: 1px solid var(--border, #555); border-radius: 4px; background: var(--bg2, #2a2a2a); color: inherit; }
-  .mt-set-btn:hover { border-color: var(--accent, #4a9eff); }
-  /* 消息耗时提示 */
-  .msg-latency { font-size: 11px; color: var(--text-muted, #888); margin-left: 8px; }
-  .session-input-row {
-    padding: 10px 12px; display: flex; gap: 6px;
-    border-bottom: 1px solid var(--border);
-  }
-  .session-input-row input {
-    flex: 1; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px;
-    background: var(--surface2); color: var(--text); font-size: 12px; outline: none;
-  }
-  .session-input-row input:focus { border-color: var(--accent); }
-  .session-input-row button {
-    padding: 6px 12px; background: var(--accent); border: none; border-radius: 8px;
-    color: #fff; cursor: pointer; font-size: 14px;
-  }
-  .session-input-row button:hover { background: var(--accent-hover); }
-  #session-list { flex: 1; overflow-y: auto; padding: 8px; }
-  .session-item {
-    padding: 8px 10px; cursor: pointer; border-radius: 8px; margin: 2px 0; font-size: 13px;
-    display: flex; align-items: center; gap: 4px;
-  }
-  .session-item > .session-name-text { flex: 1; word-break: break-all; }
-  .session-item:hover { background: var(--surface2); }
-  .session-item.active { background: var(--accent-soft); border-left: 3px solid var(--accent); }
-  .session-stop {
-    display: none; border: none; background: transparent; color: var(--text-muted);
-    cursor: pointer; font-size: 12px; padding: 2px 4px; border-radius: 4px;
-    flex-shrink: 0;
-  }
-  .session-stop:hover { color: #f59e0b; background: rgba(245,158,11,.1); }
-  .session-fork {
-    display: none; border: none; background: transparent; color: var(--text-muted);
-    cursor: pointer; font-size: 12px; padding: 2px 4px; border-radius: 4px;
-    flex-shrink: 0;
-  }
-  .session-fork:hover { color: var(--accent); background: rgba(99,102,241,.12); }
-  .session-item:hover .session-fork { display: inline-block; }
-  .session-item:hover .session-stop { display: inline-block; }
-  .session-mode-tag { font-size: 11px; color: var(--muted, #888); margin-left: 6px; }
-  .session-lock-tag { font-size: 11px; color: #f59e0b; font-weight: bold; }
-  .session-divider { margin: 10px 0 4px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted, #888); text-transform: uppercase; letter-spacing: .05em; }
-  .session-status-dot { font-size: 10px; color: #22c55e; margin-right: 4px; }
-  .session-phase-tag { font-size: 11px; color: var(--accent); margin-left: 6px; font-weight: bold; }
-  .session-pending-tag { font-size: 11px; color: #f59e0b; margin-left: 6px; font-weight: bold; }
-
-  /* ── 主区域 ── */
-  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100vh; }
-  #btn-hamburger { display: none; position: fixed; top: 8px; left: 8px; z-index: 60; font-size: 18px; background: var(--surface); border: 1px solid var(--border); box-shadow: 0 1px 4px rgba(0,0,0,.06); }
-  body.sidebar-collapsed #btn-hamburger { display: block; }
-  #chat {
-    flex: 1; overflow-y: auto; padding: 16px;
-    display: flex; flex-direction: column; gap: 8px;
-    width: 100%; max-width: 768px; margin: 0 auto;
-  }
-  #chat > * { flex-shrink: 0; }   /* F2: 防 flex 压缩子元素导致 scrollHeight 失真 */
-  .msg { max-width: 85%; padding: 8px 12px; border-radius: var(--radius); line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
-  .msg.user {
-    align-self: flex-end; background: var(--accent-soft); color: var(--text);
-    border-top-right-radius: 4px;
-  }
-  .msg.assistant { align-self: flex-start; background: transparent; }
-  .msg.assistant .msg-head { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
-  .msg.assistant .view-toggle { font-size: 10px; padding: 1px 8px; border: 1px solid var(--border); border-radius: 10px; background: transparent; color: var(--text-muted); cursor: pointer; opacity: 0.7; }
-  .msg.assistant .view-toggle:hover { opacity: 1; }
-  .msg.assistant .md-body { white-space: normal; }
-  .msg.assistant .md-body pre { background: var(--code-bg); padding: 10px 12px; border-radius: 8px; overflow-x: auto; font-size: 12.5px; line-height: 1.45; border: 1px solid var(--border); }
-  .msg.assistant .md-body code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  .msg.assistant .md-body pre code { background: none; padding: 0; border: none; }
-  .msg.assistant .md-body h1, .msg.assistant .md-body h2, .msg.assistant .md-body h3 { margin: 10px 0 6px; line-height: 1.3; }
-  .msg.assistant .md-body h1 { font-size: 17px; }
-  .msg.assistant .md-body h2 { font-size: 15.5px; }
-  .msg.assistant .md-body h3 { font-size: 14px; }
-  .msg.assistant .md-body p { margin: 4px 0; }
-  .msg.assistant .md-body ul, .msg.assistant .md-body ol { margin: 4px 0; padding-left: 20px; }
-  .msg.assistant .md-body blockquote { margin: 6px 0; padding: 2px 12px; border-left: 3px solid var(--accent); color: var(--text-muted); }
-  .msg.assistant .md-body a { color: var(--link); }
-  .msg.assistant .md-body a.file-link { text-decoration: underline; cursor: pointer; }
-  .msg.assistant .md-body table { border-collapse: collapse; margin: 6px 0; font-size: 13px; }
-  .msg.assistant .md-body th, .msg.assistant .md-body td { border: 1px solid var(--border); padding: 4px 10px; }
-  .msg.assistant .md-body th { background: var(--surface2); }
-  .msg.assistant .md-body hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
-  .msg.assistant .code-body { white-space: pre-wrap; word-break: break-word; }
-  .msg.tool {
-    align-self: flex-start; background: var(--tool-bg); font-size: 12px; color: var(--text-muted);
-    border: 1px solid var(--border);
-  }
-  .msg.system { align-self: flex-start; background: transparent; font-size: 12px; color: var(--text-muted); text-align: left; }   /* 2026-08-07: 统一左对齐（历史+实时） */
-  .msg.error { align-self: center; background: var(--err); color: #fff; font-size: 12px; }
-  .msg .msg-meta { font-size: 11px; opacity: 0.7; margin-bottom: 4px; }
-  .msg-meta-outside {
-    align-self: flex-end;
-    font-size: 11px;
-    color: var(--text-muted);
-    opacity: 0.7;
-    margin-bottom: 2px;
-    padding: 0 4px;
-  }
-  .msg details { cursor: pointer; }
-  .msg details summary { font-weight: bold; }
-  .msg.tool details pre {
-    margin-top: 6px; font-size: 11px; white-space: pre-wrap; word-break: break-all;
-    color: var(--text-muted); max-height: 200px; overflow-y: auto;
-  }
-  .msg details[open] summary { margin-bottom: 4px; }
-  /* 2026-08-11: 工具参数 markdown 渲染——不截断（覆盖 .msg.tool details pre 的 max-height） */
-  .msg.tool .tool-args-md { margin-top: 6px; font-size: 12px; }
-  .msg.tool .tool-args-md pre { max-height: none; overflow: visible; }
-  .msg.tool .tool-args-md code { white-space: pre-wrap; word-break: break-word; }
-  .msg.thinking-box {
-    align-self: flex-start; background: var(--thinking-bg); max-width: 85%;
-    padding: 6px 12px; border-radius: var(--radius); border: 1px solid var(--border);
-  }
-  .msg.thinking-box summary { font-size: 12px; color: var(--text-muted); cursor: pointer; font-weight: bold; }
-  .msg.thinking-box pre.thinking-content {
-    margin-top: 6px; font-size: 11px; white-space: pre-wrap; word-break: break-all;
-    color: var(--text-muted); max-height: 200px; overflow-y: auto;
-    background: var(--thinking-pre-bg); padding: 6px 8px; border-radius: 4px;
-  }
-  .tool-call-info { font-size: 11px; color: var(--warn); }
-  .thinking { align-self: flex-start; color: var(--text-muted); font-size: 12px; animation: pulse 1.5s infinite; }
-  @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
-  .status-indicator {
-    display: inline-block; padding: 5px 14px; border-radius: 9999px;
-    font-size: 11px; font-weight: 600;
-    background: var(--surface2); color: var(--text-muted);
-    border: 1px solid var(--border); user-select: none;
-    white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;
-    transition: background .15s, color .15s, border-color .15s;
-  }
-  .status-indicator.clickable { cursor: pointer; }
-  .status-indicator.clickable:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .status-indicator.mode-indicator { min-width: 96px; text-align: center; }
-  .status-indicator.skill-indicator { min-width: 72px; text-align: center; }
-  .status-indicator.skill-indicator.skill-on { color: var(--accent); border-color: var(--accent); }
-  .status-indicator.skill-indicator.skill-off { opacity: .55; }
-  .status-indicator.lock-indicator { display: none; }
-  .status-indicator.lock-indicator.has-lock { display: inline-block; background: rgba(245,158,11,.15); color: #b45309; }
-  .status-indicator.lock-indicator.has-lock:hover { background: #b45309; color: #fff; }
-
-  /* ── 底部输入区 + 工具条 ── */
-  .input-area {
-    padding: 12px 24px 16px; background: var(--surface); border-top: 1px solid var(--border);
-    display: flex; flex-direction: column; gap: 8px;
-    width: 100%; max-width: 768px; margin: 0 auto;
-  }
-  .input-row { display: flex; gap: 8px; align-items: flex-end; }
-  .input-area textarea {
-    flex: 1; padding: 12px 16px; border: 1px solid var(--border); border-radius: 24px;
-    background: var(--surface2); color: var(--text); font-family: inherit; font-size: 14px;
-    resize: none; min-height: 44px; max-height: 120px;
-    transition: border-color .15s;
-  }
-  .input-area textarea:focus { outline: none; border-color: var(--accent); }
-  .input-area .send-btn {
-    padding: 10px 22px; border: none; border-radius: 9999px;
-    background: var(--accent); color: #fff; cursor: pointer; font-weight: 500;
-    transition: background .15s; height: 44px; align-self: flex-end;
-  }
-  .input-area .send-btn:hover { background: var(--accent-hover); }
-  .input-area .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .input-area .upload-btn {
-    padding: 10px 14px; border: 1px solid var(--border); border-radius: 9999px;
-    background: var(--surface2); color: var(--text); cursor: pointer; font-size: 15px;
-    transition: background .15s, color .15s; height: 44px; align-self: flex-end;
-    flex-shrink: 0;
-  }
-  .input-area .upload-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
-
-  .toolbar {
-    display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
-    padding: 0 4px; font-size: 12px;
-  }
-  .toolbar button {
-    padding: 4px 12px; border: 1px solid var(--border); border-radius: 9999px;
-    background: var(--surface2); color: var(--text); cursor: pointer; font-size: 12px;
-    transition: background .15s, color .15s;
-  }
-  .toolbar button:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .toolbar-spacer { flex: 1; }
-
-  /* ── 右侧定位锚点竖条 ── */
-  #msg-anchors {
-    position: fixed; right: 10px; top: 70px; bottom: 175px;
-    display: flex; flex-direction: column; gap: 4px; z-index: 80;
-    overflow-y: auto; align-items: center;
-  }
-  .anchor-dot {
-    width: 9px; height: 9px; border-radius: 50%;
-    background: var(--accent); opacity: .55; cursor: pointer;
-    transition: background .15s, transform .15s;
-    flex-shrink: 0;
-  }
-  .anchor-dot:hover { background: var(--accent); transform: scale(1.4); opacity: 1; }
-  .anchor-dot.active { background: var(--accent); transform: scale(1.3); opacity: 1; }
-
-  /* ── 回底圆点 ── */
-  #back-to-bottom, #jump-last-user {
-    position: fixed; right: 18px; width: 42px; height: 42px;
-    border-radius: 50%; border: none; cursor: pointer;
-    background: var(--accent); color: #fff; font-size: 16px;
-    box-shadow: 0 2px 12px rgba(0,0,0,.15); z-index: 85;
-    transition: opacity .15s, transform .15s;
-  }
-  #back-to-bottom { bottom: 18px; display: none; }
-  #jump-last-user { bottom: 68px; background: var(--surface2); color: var(--accent); border: 1px solid var(--border); font-weight: bold; }
-  #jump-last-user:hover { background: var(--accent); color: #fff; }
-  #back-to-bottom.show { display: block; }
-  #back-to-bottom:hover { background: var(--accent-hover); transform: translateY(-2px); }
-
-  /* ── 移动端响应式 ── */
-  @media (max-width: 768px) {
-    #sidebar { position: fixed; left: 0; top: 0; bottom: 0; box-shadow: 2px 0 12px rgba(0,0,0,.08); }
-    body.sidebar-collapsed #sidebar { margin-left: calc(-1 * var(--sidebar-w)); }
-    #btn-hamburger { display: block; }
-    #chat { padding-top: 44px; }
-    .msg { max-width: 92%; }
-    #msg-anchors { right: 6px; top: 44px; bottom: 155px; }
-    #jump-last-user { bottom: 64px; right: 14px; }
-  }
-
-  /* ── 用户友好度增强：info 消息（非错误警示）/ 骨架屏 / 消息时间戳 ── */
-  .msg.info {
-    align-self: center; background: var(--accent-soft); color: var(--text);
-    font-size: 12px; border: 1px solid var(--border);
-  }
-  .msg-time {
-    font-size: 10px; color: var(--text-muted); opacity: 0.65;
-    margin-left: 8px; font-weight: normal;
-  }
-  .msg.system .msg-time { display: block; text-align: left; margin: 2px 0 0; }   /* 2026-08-07: system 时间戳随左对齐 */
-  .msg.error .msg-time, .msg.info .msg-time { display: block; text-align: center; margin: 2px 0 0; }
-  .crash-notice {
-    align-self: stretch;
-    margin: 4px 0 8px;
-    padding: 8px 12px;
-    border: 1px solid #e5534b;
-    border-left: 4px solid #e5534b;
-    background: rgba(229, 83, 75, 0.08);
-    border-radius: var(--radius);
-    color: #ffb3ad;
-    font-size: 12.5px;
-    line-height: 1.5;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-  }
-  .crash-notice .crash-ack {
-    background: transparent;
-    border: 1px solid #e5534b;
-    color: #ffb3ad;
-    border-radius: 4px;
-    padding: 2px 8px;
-    cursor: pointer;
-    font-size: 12px;
-    flex-shrink: 0;
-  }
-  .crash-notice .crash-ack:hover { background: rgba(229, 83, 75, 0.15); }
-  .session-crash-tag {
-    color: #ff6b60;
-    font-weight: bold;
-    font-size: 12px;
-  }
-  .loading-skeleton {
-    align-self: center; display: flex; flex-direction: column; gap: 8px;
-    width: 60%; padding: 12px 16px; border-radius: var(--radius);
-    background: var(--surface2); border: 1px solid var(--border);
-  }
-  .loading-skeleton .sk-line {
-    height: 12px; border-radius: 6px;
-    background: linear-gradient(90deg, var(--surface3) 25%, var(--surface2) 50%, var(--surface3) 75%);
-    background-size: 200% 100%;
-    animation: sk-shimmer 1.2s infinite;
-  }
-  .loading-skeleton .sk-line.short { width: 40%; }
-  .loading-skeleton .sk-line.mid { width: 70%; }
-  @keyframes sk-shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-</style>
-</head>
-<body>
-<div id="sidebar">
-  <div class="sidebar-header">
-    <h1>⚡ XKAgent</h1>
-    <button id="btn-sidebar-toggle" onclick="toggleSidebar()" title="Collapse sidebar">◀</button>
-  </div>
-  <div class="sidebar-status">
-    <span id="session-label"><span id="session-name">-</span></span>
-    <span id="provider-model"></span>
-    <button id="btn-ping" title="测试所有模型联通性" onclick="openModelTestModal()">⚡</button>
-    <span id="token-stats"></span>
-  </div>
-  <div class="session-input-row">
-    <input id="new-session-name" placeholder="New session name">
-    <button onclick="createSession()" title="Create session">+</button>
-  </div>
-  <div id="session-list"></div>
-</div>
-
-<div id="main">
-  <button id="btn-hamburger" onclick="toggleSidebar()" title="Menu">☰</button>
-  <div id="chat"></div>
-  <div class="input-area">
-    <div class="input-row">
-      <textarea id="input" rows="1" placeholder="Enter 发送 · Shift+Enter 换行 · ↑/↓ 顶/底行切历史 · Tab 切 mode"
-                onkeydown="return onInputKeydown(event)"></textarea>
-      <button id="upload-btn" class="upload-btn" onclick="document.getElementById('file-input').click()"
-              title="上传文件到 .xkagent/files/（可多选）">📤</button>
-      <input type="file" id="file-input" multiple style="display:none" onchange="uploadFiles(this)">
-      <button id="send-btn" class="send-btn" onclick="send()">Send</button>
-    </div>
-    <div class="toolbar">
-      <span id="mode-indicator" class="status-indicator mode-indicator clickable" title="点击切换 mode"></span>
-      <span id="skill-indicator" class="status-indicator skill-indicator clickable" title="点击切换 skill"></span>
-      <span id="lock-indicator" class="status-indicator lock-indicator" title="回合执行锁状态"></span>
-      <button id="btn-theme" onclick="toggleTheme()" title="Toggle light/dark theme">☀️ light</button>
-      <span class="toolbar-spacer"></span>
-      <button onclick="window.open(BASE + 'files')" title="Open file browser (new tab)">📂 Files</button>
-      <button onclick="clearChat()" title="Clear the current browser view without deleting history">🗑️ Clear View</button>
-      <button onclick="loadSkills()" title="List skills">📦 Skills</button>
-    </div>
-  </div>
-</div>
-
-<div id="msg-anchors"></div>
-<button id="jump-last-user" onclick="jumpToLastUserMsg()" title="跳到最近一条历史输入">⌃</button>
-<button id="back-to-bottom" onclick="scrollToBottomForce()" title="Back to bottom">⬇</button>
-
-<script>
-// ── 相对路径基准：适配反向代理子路径（如 DSW /dsw-xxx/proxy/4096/）──
-// 所有 fetch/WS/跳转基于 BASE 拼接，避免绝对路径丢失代理前缀
-const BASE = (function(){ var p = location.pathname; return p.endsWith('/') ? p : p.substring(0, p.lastIndexOf('/') + 1); })();
-let ws = null;
-let currentSession = '';
-let isStreaming = false;
-let curMode = 'plan';
-let curSkillEnabled = true;
-let curLockMsg = null;   // 非空时状态胶囊显示锁占用
-let hasWsStats = false;    // v2: 本会话是否收到过 WS stats(当前轮). false=仅看到 db 的上一轮
-
-let sessionCache = {};      // session -> {lastId, messages, ids, nodes}；切回直接复用 DOM 节点（nodes）+ 增量拉取
-let loadToken = 0;          // 防竞态：每次 loadSessionMessages 递增，响应时校验仍是当前会话才渲染
-const MAX_CACHED_SESSIONS = 5;  // LRU 上限：切换多个会话后释放旧缓存（nodes/messages），防内存无限增长
-let reconnectDelay = 1000;  // WS 重连退避基数（1s→2s→4s→...→30s 上限）
-let pendingQueue = [];      // 断线期间用户发送的普通消息队列（重连后自动 flush，P0 修复）
-
-function updateModeIndicator() {
-  const el = document.getElementById('mode-indicator');
-  if (!el) return;
-  el.textContent = curMode;
-  // 事件只绑定一次：点击=切 mode（保留 Tab 快捷键 toggleMode）
-  if (!el.dataset.bound) {
-    el.dataset.bound = '1';
-    el.onclick = function() { toggleMode(); };
-  }
-}
-function updateSkillIndicator() {
-  const el = document.getElementById('skill-indicator');
-  if (!el) return;
-  el.textContent = curSkillEnabled ? '🎯 skill ON' : '🚫 skill OFF';
-  el.classList.toggle('skill-on', curSkillEnabled);
-  el.classList.toggle('skill-off', !curSkillEnabled);
-  // 事件只绑定一次：点击=切 skill
-  if (!el.dataset.bound) {
-    el.dataset.bound = '1';
-    el.onclick = function() { toggleSkillSelect(); };
-  }
-}
-function updateLockIndicator() {
-  const el = document.getElementById('lock-indicator');
-  if (!el) return;
-  if (curLockMsg) {
-    el.textContent = curLockMsg;
-    el.classList.add('has-lock');
-  } else {
-    el.textContent = '';
-    el.classList.remove('has-lock');
-  }
-}
-let stickToBottom = true;   // 智能滚动：贴底时自动跟随，用户上卷后不打扰
-let olderTriggered = false;   // 滚动到顶触发历史加载的防抖标志（避免连续滚动重复触发）
-let currentWorkdir = '';    // 项目根（fetchStatus 获取，用于路径链接化）
-
-// ── 输入历史（↑/↓ 切换，对齐 repl._RawReader 的 _history_up/_history_down 语义）──
-let inputHistory = [];    // 历史数组，最新在末尾（与 repl._history 顺序一致）
-let histIdx = -1;         // -1=未在浏览；>=0=当前浏览下标（对齐 repl._hist_idx）
-let histDraft = '';       // 浏览前的草稿，按 ↓ 越过最新一条后恢复（对齐 repl._hist_pending）
-let histLoaded = false;   // 后端历史是否已加载；加载失败则静默降级（不阻塞输入）
-
-function loadInputHistory() {
-  fetch(BASE + 'api/history?limit=500')
-    .then(r => r.json())
-    .then(data => { inputHistory = (data.history || []).slice(); histLoaded = true; })
-    .catch(() => { histLoaded = false; });   // 降级：API 不可用时仅禁用 ↑/↓
-}
-
-function historyUp() {
-  if (!histLoaded || inputHistory.length === 0) return;
-  if (histIdx === -1) {                       // 首次 ↑：保存当前草稿，跳到最新一条
-    histDraft = document.getElementById('input').value;
-    histIdx = inputHistory.length - 1;
-  } else if (histIdx > 0) {                   // 继续 ↑：逐条回溯
-    histIdx -= 1;
-  } else {
-    return;                                   // 已到最旧一条：保持不动（对齐 repl）
-  }
-  setHistoryValue();
-}
-
-function historyDown() {
-  if (!histLoaded || histIdx === -1) return;  // 未在浏览状态：↓ 不动作（对齐 repl）
-  histIdx += 1;
-  if (histIdx >= inputHistory.length) {       // 越过最新一条：恢复浏览前草稿
-    histIdx = -1;
-    document.getElementById('input').value = histDraft;
-    histDraft = '';
-  } else {
-    setHistoryValue();
-  }
-}
-
-function setHistoryValue() {
-  const input = document.getElementById('input');
-  input.value = inputHistory[histIdx];
-  input.selectionStart = input.selectionEnd = input.value.length;  // 光标移到末尾
-  input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
-}
-
-// 光标是否位于输入框第一行（之前无换行符）——↑ 触发历史切换的判定条件
-function isCaretAtFirstLine() {
-  const input = document.getElementById('input');
-  return input.value.slice(0, input.selectionStart).indexOf('\n') === -1;
-}
-// 光标是否位于输入框最后一行（之后无换行符）——↓ 触发历史切换的判定条件
-function isCaretAtLastLine() {
-  const input = document.getElementById('input');
-  return input.value.slice(input.selectionEnd).indexOf('\n') === -1;
-}
-
-function onInputKeydown(e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); return false; }
-  if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); toggleMode(); return false; }
-  if (e.key === 'ArrowUp' && !e.shiftKey) {
-    // ↑ 仅在第一行或已进入历史浏览时接管为历史切换；多行中间位置让浏览器默认移动光标
-    if (histIdx >= 0 || isCaretAtFirstLine()) { e.preventDefault(); historyUp(); return false; }
-  }
-  if (e.key === 'ArrowDown' && !e.shiftKey) {
-    // ↓ 仅在最后一行或已进入历史浏览时接管为历史切换；多行中间位置让浏览器默认移动光标
-    if (histIdx >= 0 || isCaretAtLastLine()) { e.preventDefault(); historyDown(); return false; }
-  }
-  return true;   // 其余按键（含 Shift+Enter 换行、Shift+↑/↓ 选择）交给浏览器默认行为
-}
-
-function connect() {
-  if (ws) ws.close();
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host + BASE + 'ws');
-  ws.onopen = () => {
-    reconnectDelay = 1000;    // 连接成功 → 重置退避
-    addMsg('system', '🟢 Connected');
-    // P0 修复：断线期间积压的普通消息重连后自动 flush（不丢失用户输入）
-    if (pendingQueue.length) {
-      const q = pendingQueue.slice();
-      pendingQueue = [];
-      q.forEach(t => ws.send(JSON.stringify({type:'chat', text:t})));
-      addMsg('info', '📤 已自动重发 ' + q.length + ' 条离线消息');
-    }
-    fetchStatus().then(() => {
-      // P0 修复：重连路径保留当前视图（不清空、不滚底），仅增量补新
-      if (currentSession) loadSessionMessages(currentSession, {preserveView:true});
-    });
-    fetchSessions();  // FIX: 连接建立即加载 sessions 列表（问题1：初始为空）
-  };
-  ws.onclose = () => {
-    // P2: 指数退避重连（1s→30s 上限），避免频繁失败时消息刷屏
-    addMsg('system', '🔴 连接断开（' + Math.round(reconnectDelay/1000) + 's 后重试）');
-    var d = reconnectDelay;
-    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
-    setTimeout(connect, d);
-  };
-  ws.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      handleWsMsg(msg);
-    } catch(err) {}
-  };
-}
-
-function handleWsMsg(msg) {
-  const type = msg.type;
-  if (type === 'text') {
-    isStreaming = true;
-    setStopBtnVisible(true);
-    collapseLastToolResult();   // 2026-08-10: 文本开始 → 折叠上一个 tool_result 框
-    clearThinkingWait();        // 思考阶段结束（或无需等待提示）
-    appendStreaming(msg.data);
-  } else if (type === 'thinking') {
-    // 重构：thinking 显示为可折叠框（无内容时仅占位）
-    // P1-1: thinking 即回合开始，置 isStreaming 拦截重复发送（对齐后端 busy）
-    isStreaming = true;
-    setStopBtnVisible(true);
-    collapseLastToolResult();   // 2026-08-10: 新一轮思考开始 → 折叠上一个 tool_result 框
-    ensureThinkingEl();
-    startThinkingWait();        // 2026-08-10: 思考等待心跳——卡顿可见
-  } else if (type === 'thinking_content') {
-    // 重构：思考链内容实时追加到折叠框
-    clearThinkingWait();        // 2026-08-10: 有内容 → 移除等待占位
-    appendThinking(msg.data);
-    startThinkingWait();        // 2026-08-10: 重置 15s 窗口，思考流中停顿仍可见
-  } else if (type === 'clear_thinking') {
-    // 重构：思考完成 → 封板保留折叠框（可展开回顾），不删除
-    finalizeThinking();
-  } else if (type === 'tool_call') {
-    // 重构：tool 调用独立折叠框（tool_call 到达时封板当前文本段，防止顶出）
-    collapseLastToolResult();   // 2026-08-10: 工具开始 → 折叠上一个 tool_result 框
-    clearThinkingWait();
-    appendToolBox('tool_call', msg.data);
-  } else if (type === 'tool_progress') {
-    // 方案2: 工具执行进度实时追加到当前 tool 折叠框
-    appendToolProgress(msg.data);
-  } else if (type === 'tool_result') {
-    // 重构：tool 结果独立折叠框
-    appendToolBox('tool_result', msg.data);
-  } else if (type === 'stats') {
-    // 对齐 repl：显示本轮（单次 LLM 调用）token 用量，不再取会话累积值
-    hasWsStats = true;   // v2: 已收到当前轮 stats -> 后续 updateStats 不回退上一轮
-    updateStatsFrom(msg.data || {});
-  } else if (type === 'done') {
-    // 重构：done → 封板 thinking 与文本段（thinking 保留可展开）
-    collapseLastToolResult();   // 2026-08-10: 回合结束 → 折叠最后一个 tool_result 框
-    clearThinkingWait();
-    finalizeThinking();
-    var _lastAsst = lastAssistantEl;  // finalizeTextEl 末尾置 null，先保存引用
-    // 2026-08-10: 实时回合结束，给 assistant 头部补耗时提示（距上条 user 消息）
-    if (_lastAsst && lastUserMsgTs) {
-      var latHead = _lastAsst.querySelector('.msg-head');
-      var latStr2 = formatLatency(lastUserMsgTs, new Date().toISOString());
-      if (latHead && latStr2 && !latHead.querySelector('.msg-latency')) {
-        var latSpan2 = document.createElement('span');
-        latSpan2.className = 'msg-latency';
-        latSpan2.textContent = '⏱ ' + latStr2;
-        latHead.appendChild(latSpan2);
-      }
-    }
-    finalizeTextEl();
-    isStreaming = false;
-    setStopBtnVisible(false);
-    updateStats();
-    scrollToBottomIfSticky();   // 2026-08-12: done 后贴底才补滚（markdown 高度变化）；用户上卷不打扰
-    fetchSessions();  // 需求1：回合完成即时刷新列表（状态→idle，忙标记清除）
-    // A+B: 回合完成 → 静默增量记账（推进 lastId/ids），防止后续增量拉取重渲本回合已实时渲染的消息
-    if (currentSession) syncCacheAfterDone(currentSession);
-  } else if (type === 'skill_select_changed') {
-    updateSkillSelectUI(msg.data);
-  } else if (type === 'mode_changed') {
-    setMode(msg.data);
-  } else if (type === 'lock_status_changed') {
-    // T7: 观察者模式锁状态 → 更新工具栏 ⏳/🔒 标签
-    updateLockTag(msg.data);
-  } else if (type === 'session_switched') {
-    // P2: 切换 session 后重置流式状态（旧回合可能被取消且未发 done，
-    // 若不清除 isStreaming 将导致前端无法再发送新消息）
-    clearThinkingWait();
-    collapseLastToolResult();
-    finalizeThinking();
-    finalizeTextEl();
-    isStreaming = !!msg.data.busy;   // 目标 session 正在执行 → 输入框显示 Stop（问题1修复）
-    setStopBtnVisible(isStreaming);
-    currentSession = msg.data.session;
-    document.getElementById('session-name').textContent = currentSession;
-    delete pendingSessions[currentSession];  // 已进入该会话：清除待查看标记
-    touchRecent(currentSession);  // 需求2：ws 路径同步 MRU（与 switchSession 对齐）
-    hasWsStats = false;  // v2: 切 session 重置——新会话未收到 stats 前显示其上一轮(db last_*)
-    loadSessionMessages(currentSession);
-    fetchSessions();
-    fetchStatus();  // FIX: 切 session 后刷新 mode 标签（显示新 session 真实 mode）
-  } else if (type === 'command_result') {
-    if (msg.data) { addMsg("tool", "💻 " + msg.data); }
-  } else if (type === 'error') {
-    // 重构：error → 封板 thinking 与文本段
-    collapseLastToolResult();   // 2026-08-10: 错误 → 折叠 tool_result 框
-    clearThinkingWait();
-    finalizeThinking();
-    finalizeTextEl();
-    isStreaming = false;
-    setStopBtnVisible(false);
-    addMsg('error', '❌ ' + msg.data);
-  } else if (type === 'system') {
-    addMsg('system', msg.data);
-  } else if (type === 'info') {
-    // P1: 非错误提示（如 busy / 离线排队 / 处理中）— 浅色样式而非红色 ❌
-    addMsg('info', msg.data);
-  }
-}
-
-let lastAssistantEl = null;   // 当前活跃的文本段（无全局累积框，每轮 LLM 输出一段）
-let thinkingEl = null;        // 当前活跃的 thinking 折叠框
-
-// ── 2026-08-10: 实时追踪最新消息（需求1）──
-let lastToolCallDetails = null;    // 当前活跃的 tool_call 折叠框（tool_result 到达时折叠）
-let lastToolResultDetails = null;  // 当前活跃的 tool_result 折叠框（下一条消息到达时折叠）
-
-function collapseLastToolResult() {
-  // 当前 tool_result 消息结束（thinking/text/tool_call/done 到达）→ 折叠回去
-  if (lastToolResultDetails) {
-    lastToolResultDetails.open = false;
-    lastToolResultDetails = null;
-  }
-}
-
-// ── 思考等待心跳（需求2）：LLM 卡顿（无 chunk）时前端显示等待占位，避免"死寂"──
-let thinkingWaitTimer = null;
-let thinkingWaitEl = null;
-let thinkingWaitStart = 0;
-const THINKING_WAIT_THRESHOLD_MS = 15000;   // 15s 无内容 → 显示等待占位
-
-function startThinkingWait() {
-  clearThinkingWaitTimer();
-  thinkingWaitStart = Date.now();
-  thinkingWaitTimer = setTimeout(function tick() {
-    const el = ensureThinkingEl();
-    if (!el) return;
-    const pre = el.querySelector('pre.thinking-content');
-    if (!pre) return;
-    if (!thinkingWaitEl || !thinkingWaitEl.parentNode) {
-      thinkingWaitEl = document.createElement('div');
-      thinkingWaitEl.className = 'thinking-wait';
-      pre.appendChild(thinkingWaitEl);
-    }
-    const secs = Math.round((Date.now() - thinkingWaitStart) / 1000);
-    thinkingWaitEl.textContent = '⏳ 模型思考中…已等待 ' + secs + 's';
-    scrollToBottomIfSticky();
-    thinkingWaitTimer = setTimeout(tick, 1000);   // 每秒刷新秒数
-  }, THINKING_WAIT_THRESHOLD_MS);
-}
-function clearThinkingWaitTimer() {
-  if (thinkingWaitTimer) { clearTimeout(thinkingWaitTimer); thinkingWaitTimer = null; }
-}
-function clearThinkingWait() {
-  clearThinkingWaitTimer();
-  if (thinkingWaitEl && thinkingWaitEl.parentNode) {
-    thinkingWaitEl.parentNode.removeChild(thinkingWaitEl);
-  }
-  thinkingWaitEl = null;
-}
-
-// ── Thinking 折叠框（重构：像 tool 一样可折叠展示）──
-function ensureThinkingEl() {
-  // 不存在或已封板 → 新建 thinking 折叠框
-  if (!thinkingEl || thinkingEl.dataset.finalized === 'true') {
-    finalizeTextEl();  // thinking 是新一轮的开始，先封板上一段文本
-    const chat = document.getElementById('chat');
-    thinkingEl = document.createElement('div');
-    thinkingEl.className = 'msg thinking-box';
-    thinkingEl.dataset.finalized = 'false';
-    const details = document.createElement('details');
-    details.open = true;  // 2026-08-10: 实时渲染——思考进行中自动展开，结束后 finalizeThinking 折叠
-    const summary = document.createElement('summary');
-    summary.textContent = '🧠 Thinking' + fmtTimeSuffix();
-    const pre = document.createElement('pre');
-    pre.className = 'thinking-content';
-    pre.textContent = '';
-    details.appendChild(summary);
-    details.appendChild(pre);
-    thinkingEl.appendChild(details);
-    chat.appendChild(thinkingEl);
-    appendAnchor(thinkingEl);
-  }
-  return thinkingEl;
-}
-
-function appendThinking(text) {
-  const el = ensureThinkingEl();
-  const pre = el.querySelector('pre.thinking-content');
-  // P2 性能优化：appendChild 追加文本节点，避免 += 每次重建整个 text node（长思考链卡顿）
-  pre.appendChild(document.createTextNode(text));
-  scrollToBottomIfSticky();   // 2026-08-12: 贴底才跟随，用户上卷不打扰
-}
-
-function finalizeThinking() {
-  if (thinkingEl) {
-    // P2-2: 无思考链内容时显示占位文案（模型无 reasoning_content 时避免空框）
-    const pre = thinkingEl.querySelector('pre.thinking-content');
-    if (pre && !pre.textContent) pre.textContent = '(no thinking content)';
-    // 2026-08-10: 思考结束（clear_thinking/done/error）→ 折叠回去，保留可展开回顾
-    const det = thinkingEl.querySelector('details');
-    if (det) det.open = false;
-    // A+B: thinking 封板 → 完整思考链记账（增量去重；前端占位文本不记）
-    var _tfinal = pre ? (pre.textContent || '') : '';
-    if (_tfinal && _tfinal !== '(no thinking content)') trackRendered('thinking', _tfinal);
-    thinkingEl.dataset.finalized = 'true';  // 保留框，可展开回顾
-    thinkingEl = null;
-    clearThinkingWait();
-  }
-}
-// ── Markdown 渲染（内联轻量渲染器，零依赖；先 escape 防 XSS，URL 协议白名单）──
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-function mdInline(t) {
-  // 行内：code → bold → italic → strikethrough → link（顺序保证 code 内不被二次处理）
-  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
-  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  t = t.replace(/__([^_]+)__/g, '<strong>$1</strong>');
-  t = t.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
-  t = t.replace(/(^|[^_])_([^_\n]+)_/g, '$1<em>$2</em>');
-  t = t.replace(/~~([^~]+)~~/g, '<del>$1</del>');
-  t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+|mailto:[^)\s]+|#[^\s)]*)\)/g,
-                '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  return t;
-}
-function mdBlock(raw) {
-  // 逐块解析：代码围栏 / 表格 / 标题 / 引用 / 列表 / 分隔线 / 段落
-  const lines = String(raw).replace(/\r\n/g, '\n').split('\n');
-  let html = '', i = 0, listStack = [];
-  const closeLists = (to) => { while (listStack.length > to) { html += '</' + listStack.pop() + '>'; } };
-  const esc = escapeHtml;
-  while (i < lines.length) {
-    const line = lines[i];
-    const fence = line.match(/^```(\w*)\s*$/);
-    if (fence) {
-      closeLists(0);
-      const lang = fence[1];
-      const buf = [];
-      i++;
-      while (i < lines.length && !/^```\s*$/.test(lines[i])) { buf.push(lines[i]); i++; }
-      i++;
-      const cls = lang ? ' class="lang-' + esc(lang) + '"' : '';
-      html += '<pre' + cls + '><code>' + esc(buf.join('\n')) + '</code></pre>\n';
-      continue;
-    }
-    if (i + 1 < lines.length && /^\|.*\|$/.test(line) && /^\|[\s:|-]+\|$/.test(lines[i + 1])) {
-      closeLists(0);
-      const headers = line.split('|').slice(1, -1).map(s => s.trim());
-      const aligns = lines[i + 1].split('|').slice(1, -1).map(s =>
-        s.includes(':') ? (s.startsWith(':') && s.endsWith(':') ? ' style="text-align:center"' :
-                           (s.startsWith(':') ? ' style="text-align:left"' : ' style="text-align:right"')) : '');
-      html += '<table><thead><tr>';
-      headers.forEach((h, idx) => { html += '<th' + aligns[idx] + '>' + mdInline(esc(h)) + '</th>'; });
-      html += '</tr></thead><tbody>';
-      i += 2;
-      while (i < lines.length && /^\|.*\|$/.test(lines[i])) {
-        const cells = lines[i].split('|').slice(1, -1).map(s => s.trim());
-        html += '<tr>';
-        cells.forEach((c, idx) => { html += '<td' + (aligns[idx] || '') + '>' + mdInline(esc(c)) + '</td>'; });
-        html += '</tr>';
-        i++;
-      }
-      html += '</tbody></table>\n';
-      continue;
-    }
-    const h = line.match(/^(#{1,3})\s+(.*)$/);
-    if (h) { closeLists(0); html += '<h' + h[1].length + '>' + mdInline(esc(h[2])) + '</h' + h[1].length + '>\n'; i++; continue; }
-    if (/^>\s?/.test(line)) {
-      closeLists(0);
-      const buf = [];
-      while (i < lines.length && /^>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^>\s?/, '')); i++; }
-      html += '<blockquote>' + mdInline(esc(buf.join(' '))) + '</blockquote>\n';
-      continue;
-    }
-    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
-    const ol = line.match(/^\s*\d+\.\s+(.*)$/);
-    if (ul || ol) {
-      const tag = ul ? 'ul' : 'ol';
-      if (listStack[listStack.length - 1] !== tag) { closeLists(0); html += '<' + tag + '>'; listStack.push(tag); }
-      html += '<li>' + mdInline(esc((ul || ol)[1])) + '</li>\n';
-      i++;
-      continue;
-    }
-    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) { closeLists(0); html += '<hr>\n'; i++; continue; }
-    if (!line.trim()) { closeLists(0); html += '\n'; i++; continue; }
-    closeLists(0);
-    const buf = [line];
-    i++;
-    while (i < lines.length && lines[i].trim() && !/^```/.test(lines[i]) && !/^\|.*\|$/.test(lines[i]) &&
-           !/^(#{1,3})\s/.test(lines[i]) && !/^>\s?/.test(lines[i]) &&
-           !/^\s*[-*+]\s+/.test(lines[i]) && !/^\s*\d+\.\s+/.test(lines[i])) {
-      buf.push(lines[i]); i++;
-    }
-    html += '<p>' + mdInline(esc(buf.join(' '))) + '</p>\n';
-  }
-  closeLists(0);
-  return html;
-}
-function mdToHtml(raw) { return mdBlock(raw); }
-// ── 路径链接化：将回复中的项目路径/文件名转为可点击链接（新标签打开）──
-// 三档匹配：绝对(项目根前缀) / 相对(含目录分隔) / 裸文件名(后缀白名单)
-// 设计：DOM 后处理（TreeWalker 文本节点），零侵入 mdToHtml；
-//       跳过 code/pre/a 内部，避免破坏代码块与已有链接；href 仅指向自家 /api/files/open。
-const FILE_EXT_SET = 'markdown|ipynb|webp|yaml|json|html|docx|jpeg|conf|toml|java|tsx|jsx|txt|tex|rst|log|css|htm|xml|sql|ini|cfg|png|jpg|gif|svg|bmp|ico|pdf|csv|yml|php|cpp|md|py|js|ts|go|rs|rb|sh|c|h';
-const BARE_FILE_RE = new RegExp('[\\p{L}\\p{N}_.-]+\\.(?:' + FILE_EXT_SET + ')(?![\\p{L}\\p{N}_])', 'giu');
-const REL_PATH_RE = /(?:\.{0,2}\/)?[\p{L}\p{N}_.-]+\/[\p{L}\p{N}_.\/-]*/gu;
-// URL 禁区：https?:// 或 // 起头的连续非空白段（防止 URL 端口/路径被误链为本地文件）
-// 只链文件：路径必须以白名单扩展名结尾（目录/无扩展名不链）。
-const FILE_TAIL_RE = new RegExp('\\.(?:' + FILE_EXT_SET + ')$', 'i');
-const URL_SPAN_RE = /(?:https?:\/\/|\/\/)[^\s，。；、）)\]'"`]+/gi;
-
-function collectPathMatches(text) {
-  const cands = [];
-  // 0) URL 禁区：匹配 https?:// 或 // 起头的连续段，候选与其重叠则丢弃
-  const urlSpans = [];
-  let um;
-  while ((um = URL_SPAN_RE.exec(text))) urlSpans.push([um.index, um.index + um[0].length]);
-  const inUrlSpan = (s, e) => urlSpans.some(([us, ue]) => s < ue && e > us);
-  // 左边界：前一字符为 ASCII 文件名字符（字母/数字/_/./-）→ 视为粘连，丢弃
-  const hasLB = (s) => s <= 0 || !/[A-Za-z0-9_.\/-]/.test(text[s - 1]);
-  // 1) 绝对路径：项目根前缀（最精确，避免误链任意 /xxx）
-  if (currentWorkdir) {
-    const esc = currentWorkdir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const absRe = new RegExp(esc + '[\\p{L}\\p{N}._\\/-]*', 'gu');   // * 允许 workdir 本身匹配
-    let m;
-    while ((m = absRe.exec(text))) {
-      if (!inUrlSpan(m.index, m.index + m[0].length)) {
-        if (FILE_TAIL_RE.test(trimPathTail(m[0]))) cands.push({s: m.index, e: m.index + m[0].length, p: m[0]});
-      }
-    }
-  }
-  // 2) 相对路径：至少含一个目录分隔符；排除 / 开头的本地API路径（/api/...）
-  let m;
-  while ((m = REL_PATH_RE.exec(text))) {
-    if (m[0].startsWith('/')) continue;  // /xxx 形式（非项目根前缀）不链
-    if (hasLB(m.index) && !inUrlSpan(m.index, m.index + m[0].length)) {
-      if (FILE_TAIL_RE.test(trimPathTail(m[0]))) cands.push({s: m.index, e: m.index + m[0].length, p: m[0]});
-    }
-  }
-  // 3) 裸文件名：文本/代码/图片等常见后缀白名单
-  while ((m = BARE_FILE_RE.exec(text))) {
-    if (hasLB(m.index) && !inUrlSpan(m.index, m.index + m[0].length)) {
-      cands.push({s: m.index, e: m.index + m[0].length, p: m[0]});
-    }
-  }
-  // 排序 + 重叠去重（保留最长匹配，避免绝对/相对/裸名互相覆盖）
-  cands.sort((a, b) => a.s - b.s || (b.e - b.s) - (a.e - a.s));
-  const merged = [];
-  for (const c of cands) {
-    const last = merged[merged.length - 1];
-    if (last && c.s < last.e) {
-      if (c.e > last.e) { last.e = c.e; last.p = c.p; }
-      continue;
-    }
-    merged.push(c);
-  }
-  return merged;
-}
-
-function trimPathTail(p) {
-  // 0) 剥离中文连接词前缀（和manager.py → manager.py；说明文档.md 不受影响：
-  //    仅当中文后紧跟 ASCII 字母数字时才剥离，中文文件名后是 . 则不剥离）
-  p = p.replace(/^[\u4e00-\u9fff]+(?=[A-Za-z0-9_])/u, '');
-  // 1) 截断到第一个白名单扩展名：处理中文/连字符/句号粘连（如 web.py和x.py → web.py）。
-  const re = new RegExp('[\\p{L}\\p{N}_.-]+?\\.(?:' + FILE_EXT_SET + ')', 'u');   // 非贪婪：截到第一个扩展名
-  const m = p.match(re);
-  if (m) return p.slice(0, m.index + m[0].length);
-  return p;
-}
-
-function linkifyTextNode(node) {
-  const text = node.nodeValue || '';
-  const parent = node.parentElement;
-  if (!text || !parent) return;
-  // 跳过代码块/行内代码/已有链接内部（避免破坏 markdown 渲染结构）
-  if (parent.closest('pre, a')) return;  // 跳过代码块/已有链接；行内 code 内的路径也链接（LLM 惯用反引号包裹路径）
-  const frag = document.createDocumentFragment();
-  let rest = text;
-  let done = 0;
-  // 循环：截断粘连后剩余文本重新匹配（web.py和manager.py → 两个链接）
-  while (rest.length) {
-    const matches = collectPathMatches(rest);
-    if (!matches.length) break;
-    const mt = matches[0];               // 最左匹配（去重后有序）
-    mt.p = trimPathTail(mt.p);           // 截断粘连（web.py和x.py → web.py）
-    if (!mt.p.length) { frag.appendChild(document.createTextNode(rest)); done += rest.length; break; }
-    mt.e = mt.s + mt.p.length;
-    if (mt.s > 0) frag.appendChild(document.createTextNode(rest.slice(0, mt.s)));
-    const a = document.createElement('a');
-    a.className = 'file-link';
-    a.href = BASE + 'api/files/open?path=' + encodeURIComponent(mt.p);
-    a.target = '_blank';
-    a.rel = 'noopener';
-    a.textContent = mt.p;
-    frag.appendChild(a);
-    done += mt.e;
-    rest = rest.slice(mt.e);
-  }
-  if (done < text.length) frag.appendChild(document.createTextNode(text.slice(done)));
-  parent.replaceChild(frag, node);
-}
-
-function linkifyFilePaths(container) {
-  if (!container) return;
-  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-  const nodes = [];
-  while (walker.nextNode()) nodes.push(walker.currentNode);
-  nodes.forEach(linkifyTextNode);
-}
-
-// ── 文本段（每轮 LLM 输出独立成框，打字机效果）──
-function ensureTextEl() {
-  if (!lastAssistantEl || lastAssistantEl.dataset.finalized === 'true') {
-    const chat = document.getElementById('chat');
-    lastAssistantEl = document.createElement('div');
-    lastAssistantEl.className = 'msg assistant';
-    lastAssistantEl.dataset.finalized = 'false';
-    // markdown 渲染：dataset 保存原文与当前视图（text=markdown / code=原文）
-    lastAssistantEl.dataset.raw = '';
-    lastAssistantEl.dataset.mode = getDefaultViewMode();
-    const head = document.createElement('div');
-    head.className = 'msg-head';
-    const btn = document.createElement('button');
-    btn.className = 'view-toggle';
-    btn.type = 'button';
-    btn.textContent = lastAssistantEl.dataset.mode === 'text' ? 'TXT' : 'CODE';
-    btn.onclick = function() { toggleMsgView(lastAssistantEl); };
-    head.appendChild(btn);
-    const tspan = document.createElement('span');
-    tspan.className = 'msg-time';
-    tspan.textContent = new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'});
-    head.appendChild(tspan);
-    lastAssistantEl.appendChild(head);
-    const body = document.createElement('div');
-    body.className = lastAssistantEl.dataset.mode === 'text' ? 'md-body' : 'code-body';
-    lastAssistantEl.appendChild(body);
-    chat.appendChild(lastAssistantEl);
-    appendAnchor(lastAssistantEl);
-  }
-  return lastAssistantEl;
-}
-
-function appendStreaming(text) {
-  const el = ensureTextEl();
-  el.dataset.raw += text;   // 原文累积，done 后统一渲染
-  const body = el.querySelector('.md-body, .code-body');
-  if (body) {
-    if (el.dataset.mode === 'text') {
-      // 流式阶段以纯文本打字机展示；done 时 finalizeTextEl 统一 markdown 渲染
-      body.appendChild(document.createTextNode(text));
-    } else {
-      body.textContent = el.dataset.raw;
-    }
-  }
-  scrollToBottomIfSticky();   // 2026-08-12: 文本流式贴底才跟随（8-10 force 过度修复已撤销）
-}
-
-function finalizeTextEl() {
-  if (lastAssistantEl) {
-    // markdown 渲染：text 模式在收尾时把累积原文渲染为 HTML
-    if (lastAssistantEl.dataset.mode === 'text') {
-      const body = lastAssistantEl.querySelector('.md-body');
-      const raw = lastAssistantEl.dataset.raw;
-      const el = lastAssistantEl;
-      const render = function() {
-        if (body) body.innerHTML = mdToHtml(raw);
-        if (body) linkifyFilePaths(body);   // 路径链接化（done 后）
-      };
-      // P2 性能优化：超长消息（>8KB）延迟到 rAF 渲染，避免 markdown 解析阻塞主线程导致卡顿
-      if (raw.length > 8192 && window.requestAnimationFrame) {
-        requestAnimationFrame(render);
-      } else {
-        render();
-      }
-    }
-    // A+B: assistant 封板 → 完整文本记账（增量内容级去重）
-    if (lastAssistantEl.dataset.raw) trackRendered('assistant', lastAssistantEl.dataset.raw);
-    lastAssistantEl.dataset.finalized = 'true';
-    lastAssistantEl = null;
-  }
-}
-
-// ── TXT/CODE 视图切换（TXT=markdown 渲染，CODE=原文；偏好存 localStorage）──
-function getDefaultViewMode() {
-  try { return (localStorage.getItem('mdViewMode') || 'text') === 'code' ? 'code' : 'text'; } catch(e) { return 'text'; }
-}
-function toggleMsgView(el) {
-  const isText = el.dataset.mode === 'text';
-  el.dataset.mode = isText ? 'code' : 'text';
-  try { localStorage.setItem('mdViewMode', el.dataset.mode); } catch(e) {}
-  const btn = el.querySelector('.view-toggle');
-  if (btn) btn.textContent = el.dataset.mode === 'text' ? 'TXT' : 'CODE';
-  const body = el.querySelector('.md-body, .code-body');
-  if (!body) return;
-  if (el.dataset.mode === 'text') {
-    body.className = 'md-body';
-    body.innerHTML = mdToHtml(el.dataset.raw);
-    linkifyFilePaths(body);   // 切回 TXT 时路径链接化
-  } else {
-    body.className = 'code-body';
-    body.textContent = el.dataset.raw;
-  }
-}
-
-// ── 方案2: 工具执行进度渲染（rAF 节流批量追加，行数上限防卡）──
-var lastToolBoxProgressEl = null;
-var pendingProgressLines = [];
-var progressRafScheduled = false;
-var TOOL_PROGRESS_MAX_LINES = 500;   // 行数上限：超限丢弃后续行（进度尽力而为）
-
-// ── 2026-08-11: 工具参数 markdown 模板渲染（替代裸 JSON.stringify）──
-// 设计：args 逐参数转 markdown 模板，复用 mdToHtml 渲染：
-//   标量 → **key**: 值；长文本/代码 → **key**: + ```lang 代码块（不截断）；
-//   对象/数组 → **key**: + ```json 代码块
-function mdCodeBlock(text, lang) {
-  // 防围栏冲突：行首 ``` 加零宽空格拆开，避免提前闭合代码块
-  var safe = String(text).replace(/^```/gm, '`\u200b``');
-  return '```' + (lang || '') + '\n' + safe + '\n```';
-}
-function toolArgsToMarkdown(name, args, fileContent) {
-  if (!args || typeof args !== 'object') {
-    return mdCodeBlock(args === undefined ? '' : String(args), 'json');
-  }
-  var parts = [];
-  var keys = Object.keys(args);
-  for (var i = 0; i < keys.length; i++) {
-    var k = keys[i];
-    var v = args[k];
-    var label = '**' + k + '**:';
-    if (v === null || v === undefined) { parts.push(label + ' ' + v); continue; }
-    if (typeof v === 'string') {
-      // pythonrt + .py 文件 → 优先用后端预读内容
-      if (k === 'code_or_filepath' && name === 'pythonrt' && v.trim().endsWith('.py') && fileContent) {
-        parts.push(label + '\n' + mdCodeBlock(fileContent, 'python'));
-        continue;
-      }
-      if (v.indexOf('\n') !== -1 || v.length > 120) {
-        parts.push(label + '\n' + mdCodeBlock(v, k === 'code_or_filepath' ? 'python' : ''));
-      } else {
-        parts.push(label + ' `' + v + '`');
-      }
-      continue;
-    }
-    if (typeof v === 'object') {
-      parts.push(label + '\n' + mdCodeBlock(JSON.stringify(v, null, 2), 'json'));
-      continue;
-    }
-    parts.push(label + ' ' + v);
-  }
-  return parts.join('\n\n');
-}
-
-function summaryBodyFromOutput(output) {
-  if (!output) return '';
-  return String(output).split('\n').filter(function(line) {
-    return !/^📌/.test(line) && !/^✅ 已持久化/.test(line) && !/^📄/.test(line) && !/^🏷️/.test(line);
-  }).join('\n').trim();
-}
-
-function appendToolProgress(data) {
-  if (!data || !data.line) return;
-  pendingProgressLines.push(data.line);
-  if (!progressRafScheduled) {
-    progressRafScheduled = true;
-    if (window.requestAnimationFrame) requestAnimationFrame(flushProgressLines);
-    else flushProgressLines();
-  }
-}
-
-function flushProgressLines() {
-  progressRafScheduled = false;
-  if (!lastToolBoxProgressEl) { pendingProgressLines = []; return; }
-  var pre = lastToolBoxProgressEl;
-  if (pendingProgressLines.length > 0 && pre.style.display === 'none') {
-    pre.style.display = '';   // 首次有进度时显示进度区
-  }
-  for (var i = 0; i < pendingProgressLines.length; i++) {
-    if (pre.childElementCount >= TOOL_PROGRESS_MAX_LINES) break;
-    var div = document.createElement('div');
-    div.className = 'progress-line';
-    div.textContent = pendingProgressLines[i];
-    pre.appendChild(div);
-  }
-  pendingProgressLines = [];
-  scrollToBottomIfSticky();   // 2026-08-12: 进度贴底才跟随，用户上卷不打扰
-}
-
-function appendToolBox(kind, data) {
-  // tool_call 到达时先封板当前文本段（finalizeTextEl），保证每轮 LLM 输出独立成框，
-  // 文本框按序排列、不会被 tool 框顶出视口。
-  if (kind === 'tool_call') finalizeTextEl();
-  const chat = document.getElementById('chat');
-  const el = document.createElement('div');
-  el.className = 'msg tool';
-  const details = document.createElement('details');
-  details.open = (kind === 'tool_call' || kind === 'tool_result'); // 2026-08-10: 实时渲染自动展开，结束后折叠
-  const summary = document.createElement('summary');
-  if (kind === 'tool_call') {
-    var stepStr = (data.total && data.total > 1) ? ' (' + ((data.index || 0) + 1) + '/' + data.total + ')' : '';
-    var modeTag = data.mode ? ' [' + data.mode + ']' : '';
-    summary.textContent = '🔧 ' + (data.name || 'tool') + stepStr + modeTag + fmtTimeSuffix();
-    details.appendChild(summary);
-    if (data.args) {
-      // 2026-08-11: markdown 模板渲染（复用 mdToHtml），替代裸 JSON.stringify
-      var mdDiv = document.createElement('div');
-      mdDiv.className = 'tool-args-md';
-      mdDiv.innerHTML = mdToHtml(toolArgsToMarkdown(data.name, data.args, data.file_content));
-      details.appendChild(mdDiv);
-    }
-    // 方案2: 进度区（初始隐藏，tool_progress 事件逐行填充，实时可见执行中输出）
-    var progPre = document.createElement('pre');
-    progPre.className = 'tool-progress';
-    progPre.style.display = 'none';
-    details.appendChild(progPre);
-    lastToolBoxProgressEl = progPre;
-    lastToolCallDetails = details;   // 2026-08-10: 记录当前 tool_call 框（tool_result 到达时折叠）
-  } else {  // tool_result
-    var elapsedStr = (data.elapsed !== undefined) ? ' (' + data.elapsed.toFixed(2) + 's)' : '';
-    summary.textContent = '💻 Exit: ' + (data.exit_code !== undefined ? data.exit_code : '?') + elapsedStr + fmtTimeSuffix();
-    details.appendChild(summary);
-    var pre = document.createElement('pre');
-    var out = data.stdout || '(no output)';
-    if (data.stderr) out += '\n[stderr]\n' + data.stderr;
-    if (data.error) out += '\n[error] ' + data.error;
-    pre.textContent = out;
-    details.appendChild(pre);
-    // 2026-08-10: 工具执行结束 → 折叠 tool_call 框（含进度区），结果框展开
-    if (lastToolCallDetails) { lastToolCallDetails.open = false; lastToolCallDetails = null; }
-    // 2026-08-11: summary/exit 是收尾结果 → 不参与"下一条消息到达时折叠"（保持展开可见）
-    var isTerminal = (data.name === 'summary' || data.name === 'exit');
-    if (!isTerminal) { lastToolResultDetails = details; }   // 记录结果框，下一条消息到达时折叠
-    // 2026-08-12: summary 正文渲染——在折叠框后追加类似 assistant 的正文块，直接显示 content
-    // stdout 格式: 📌key / ✅已持久化 / 📄title / content / 🏷️tags，按行过滤提取正文
-    var _content = '';
-    var _cdiv = null;
-    if (data.name === 'summary' && data.stdout) {
-      _content = summaryBodyFromOutput(data.stdout);
-      if (_content) {
-        _cdiv = document.createElement('div');
-        _cdiv.className = 'msg assistant summary-content';   // 复用正文样式
-        var _cbody = document.createElement('div');
-        _cbody.className = 'md-body';
-        _cbody.innerHTML = mdToHtml(_content);   // markdown 渲染（与正文一致）
-        linkifyFilePaths(_cbody);               // 路径链接化
-        _cdiv.appendChild(_cbody);
-      }
-    }
-  }
-  el.appendChild(details);
-  // 2026-08-12: 折叠框追加后再追加 summary 正文块（顺序：details 在前，正文在后）
-  if (_cdiv) el.appendChild(_cdiv);
-  chat.appendChild(el);
-  appendAnchor(el);
-  scrollToBottomIfSticky();   // 2026-08-12: 工具框贴底才跟随，用户上卷不打扰
-}
-
-function addMsg(role, text) {
-  const chat = document.getElementById('chat');
-  const el = document.createElement('div');
-  el.className = 'msg ' + role;
-  el.textContent = text;
-  // A+B: user 实时回显记账（供增量拉取内容级去重，消除双渲染）
-  if (role === 'user') { el.dataset.raw = text; trackRendered('user', text); }
-  // P2: 时间戳 — system/error/info/tool 消息显示 HH:MM（用户友好度）
-  if (role === 'system' || role === 'error' || role === 'info' || role === 'tool') {
-    const t = document.createElement('span');
-    t.className = 'msg-time';
-    t.textContent = new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'});
-    el.appendChild(t);
-  }
-  chat.appendChild(el);
-  appendAnchor(el);
-  scrollToBottomIfSticky();
-  return el;   // 修复：返回节点供调用方操作（loading 提示/移除等；原实现返回 undefined 导致 loadingEl 崩溃）
-}
-
-// ── 智能滚动：仅贴底时自动跟随；用户上卷(距底>40px)后流式内容不再强拉到底部 ──
-function scrollToBottomIfSticky(force) {
-  // 2026-08-12: force 参数已无调用方（实时路径全部改贴底跟随），保留作防御性接口
-  if (force) stickToBottom = true;
-  if (!stickToBottom) return;
-  const chat = document.getElementById('chat');
-  if (!chat) return;
-  // 2026-08-10 修复: force 时同步立即滚底（读 scrollHeight 强制 reflow，值必然准确）
-  // + rAF 补滚（覆盖异步布局/图片加载后的偏移）——原实现仅单次 rAF，
-  // 高频流式 chunk 下 rAF 可能被合并/跳过导致滚动丢失（"强制滚底没起作用"根因之一）。
-  chat.scrollTop = chat.scrollHeight;
-  if (window.requestAnimationFrame) {
-    requestAnimationFrame(function() { chat.scrollTop = chat.scrollHeight; });
-  }
-}
-// F4a: 强制滚底（同步立即 + rAF 补滚）。用于历史加载完成后——append 后 DOM 已更新，
-// 同步赋值 scrollHeight 必然准确；rAF 仅作保险，即使 rAF 失败同步滚动也已生效。
-// 不依赖 stickToBottom（加载历史后无条件滚底显示最新消息）。
-function forceScrollToBottom() {
-  const chat = document.getElementById('chat');
-  if (!chat) return;
-  // 首次同步立即无条件滚底（DOM 刚更新，scrollHeight 必然准确）。
-  // 修复: 原实现 doScroll() 首次调用就被 F8（距底>40px→return）拦截，
-  // 因 clearChat 后 scrollTop=0，加载新消息后 scrollHeight-clientHeight 必然>40，
-  // 导致切换 session 后消息停在顶部不滚底。
-  chat.scrollTop = chat.scrollHeight;
-  // F7b: 后续补滚 try-catch——scrollTop 赋值永不抛异常，
-  // 保证后续 rAF/setTimeout 补滚必然注册（否则异常会短路整条补滚链）
-  const doScroll = function() {
-    try {
-      // F8: 用户已上卷（距底>40px）→ 停止补滚，尊重用户操作（场景N修复）。
-      // 仅 rAF/setTimeout 补滚阶段执行此判断——首次同步已在上方无条件完成。
-      if (chat.scrollHeight - chat.scrollTop - chat.clientHeight > 40) return;
-      chat.scrollTop = chat.scrollHeight;
-    } catch(e) { /* 忽略：任何异常都不允许中断补滚链 */ }
-  };
-  // ②同步补滚（首次已在上方执行）
-  if (window.requestAnimationFrame) {
-    requestAnimationFrame(doScroll);   // ②rAF 补滚（下一帧，布局稳定后）
-  }
-  // F7c: ③-⑧六级递进补滚——覆盖字体/图片/异步资源/浏览器 scroll restoration 任意时机。
-  // F7a: 已移除 scrollIntoView（其可能在 fetch 微任务回调抛异常短路补滚链）。
-  setTimeout(doScroll, 50);
-  setTimeout(doScroll, 200);
-  setTimeout(doScroll, 500);
-  setTimeout(doScroll, 1000);
-  setTimeout(doScroll, 1500);
-  setTimeout(doScroll, 2000);
-}
-function onChatScroll() {
-  const chat = document.getElementById('chat');
-  const dist = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
-  stickToBottom = dist < 40;
-  // 滚到顶 → 触发历史消息补渲染（olderTriggered 防抖：只在上次未触发过时执行一次）
-  if (chat.scrollTop <= 2 && !olderTriggered) {
-    olderTriggered = true;
-    renderOlderBatch(currentSession);
-  } else if (chat.scrollTop > 2) {
-    olderTriggered = false;
-  }
-  updateAnchorHighlight();
-  const btn = document.getElementById('back-to-bottom');
-  if (btn) btn.classList.toggle('show', dist > 300);
-}
-function clearChat() {
-  const chat = document.getElementById('chat');
-  chat.innerHTML = '';
-  chat.scrollTop = 0;   // F4b: 重置滚动位置，杜绝浏览器恢复旧位置（刷新后停在顶部）
-  resetAnchors();
-  lastAssistantEl = null;
-  thinkingEl = null;
-}
-
-function sendStop() {
-  if (ws && ws.readyState === WebSocket.OPEN)
-    ws.send(JSON.stringify({type: 'interrupt'}));
-}
-
-
-// ── 右侧定位锚点：每条消息一个 dot，点击跳转；滚动时高亮当前消息 ──
-let anchorCounter = 0;
-const MAX_ANCHORS = 50;
-function appendAnchor(el) {
-  if (!el || !el.classList || !el.classList.contains('msg')) return;
-  if (!el.classList.contains('user')) return;   // 只给 user 消息建锚点
-  const anchors = document.getElementById('msg-anchors');
-  if (!anchors) return;
-  const idx = anchorCounter++;
-  el.dataset.anchorIdx = idx;
-  const dot = document.createElement('div');
-  dot.className = 'anchor-dot' + (el.classList.contains('user') ? ' user' : '');
-  dot.dataset.idx = idx;   // 修复：dot 记录稳定标识，与 el.dataset.anchorIdx 对应（updateAnchorHighlight 精确匹配）
-  dot.title = (el.classList.contains('user') ? '👤 历史输入 ' : '') + '跳到消息 ' + (idx + 1);
-  dot.onclick = function() {
-    el.scrollIntoView({block: 'start', behavior: 'smooth'});
-  };
-  anchors.appendChild(dot);
-  // 上限：超出的移除最旧锚点，避免长会话锚点条过密
-  while (anchors.children.length > MAX_ANCHORS) {
-    anchors.removeChild(anchors.firstChild);
-  }
-}
-function jumpToLastUserMsg() {
-  const chat = document.getElementById('chat');
-  if (!chat) return;
-  const users = chat.querySelectorAll('.msg.user');
-  if (users.length) {
-    users[users.length - 1].scrollIntoView({block: 'start', behavior: 'smooth'});
-  }
-}
-function resetAnchors() {
-  anchorCounter = 0;
-  const anchors = document.getElementById('msg-anchors');
-  if (anchors) anchors.innerHTML = '';
-}
-function updateAnchorHighlight() {
-  const chat = document.getElementById('chat');
-  const anchors = document.getElementById('msg-anchors');
-  if (!chat || !anchors) return;
-  const dots = anchors.querySelectorAll('.anchor-dot');
-  const msgs = chat.querySelectorAll('.msg.user');
-  const st = chat.scrollTop;
-  let activeIdx = null;   // 修复：稳定标识——视口内最后一条 user 消息的 anchorIdx
-  let activePos = 0;      // 位置退化：旧节点无 anchorIdx 时按位置对齐（容错）
-  for (let i = 0; i < msgs.length; i++) {
-    if (msgs[i].offsetTop - chat.offsetTop <= st + 80) {
-      activePos = i;
-      if (msgs[i].dataset.anchorIdx != null) activeIdx = msgs[i].dataset.anchorIdx;
-    }
-  }
-  dots.forEach(function(d, i) {
-    const hit = activeIdx != null ? (d.dataset.idx === activeIdx) : (i === activePos);
-    d.classList.toggle('active', hit);
-  });
-}
-function scrollToBottomForce() {
-  const chat = document.getElementById('chat');
-  if (chat) chat.scrollTop = chat.scrollHeight;
-  const btn = document.getElementById('back-to-bottom');
-  if (btn) btn.classList.remove('show');
-  stickToBottom = true;
-}
-
-function setStopBtnVisible(show) {
-  const sendBtn = document.getElementById('send-btn');
-  if (sendBtn) {
-    sendBtn.textContent = show ? '⏹' : 'Send';
-    sendBtn.title = show ? '停止生成' : '发送';
-    sendBtn.onclick = show ? sendStop : send;
-  }
-}
-
-function send() {
-  const input = document.getElementById('input');
-  const text = input.value.trim();
-  if (!text || isStreaming) {
-    // 2026-08-12 方案③: 被 busy 拦截时给出可见提示（此前静默丢弃，用户误以为无反馈）
-    if (text && isStreaming) {
-      addMsg('info', '⏳ 正在处理中，请稍候再发送（当前回合未结束）');
-      input.focus();
-    }
-    return;
-  }
-  input.value = '';
-
-  // ── 输入历史：内存入队（末尾去重，对齐 repl._add_history）+ 异步写回后端 ──
-  if (text && (inputHistory.length === 0 || inputHistory[inputHistory.length - 1] !== text)) {
-    inputHistory.push(text);
-  }
-  histIdx = -1;    // 提交后重置浏览游标（对齐 repl: 新输入从最新历史重新开始）
-  histDraft = '';
-  fetch(BASE + 'api/history', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({text: text})
-  }).catch(() => {});   // 写回失败不阻塞发送（历史仅尽力持久化）
-  input.style.height = 'auto';
-
-  stickToBottom = true;   // 用户主动发送 → 恢复贴底跟随
-  addMsg('user', text);
-  lastUserMsgTs = new Date().toISOString();   // 2026-08-10: 记录实时发送时间（耗时提示基准）
-  finalizeTextEl();
-
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    if (text.startsWith('!') || text.startsWith('/')) {
-      ws.send(JSON.stringify({type: 'command', cmd: text}));
-    } else {
-      ws.send(JSON.stringify({type: 'chat', text: text}));
-    }
-  } else {
-    // P0 修复：断线时普通消息入队（重连后自动 flush），命令消息提示暂不可用
-    if (text.startsWith('!') || text.startsWith('/')) {
-      addMsg('error', '❌ 离线中，命令暂不可用（重连后重试）');
-    } else {
-      pendingQueue.push(text);
-      addMsg('info', '⏳ 离线中，消息已排队，重连后自动发送');
-    }
-    connect();
-  }
-  input.focus();               // 4B: 发送后自动聚焦
-}
-// ── 文件上传：上传到 .xkagent/files/，返回路径并插入输入框 ──
-const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.ico'];
-function formatSize(n) {
-  if (n < 1024) return n + ' B';
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-  return (n / 1024 / 1024).toFixed(1) + ' MB';
-}
-async function uploadFiles(input) {
-  const files = input.files;
-  if (!files || files.length === 0) return;
-  for (let i = 0; i < files.length; i++) {
-    const fd = new FormData();
-    fd.append('file', files[i]);
-    addMsg('info', '⏳ 上传中: ' + files[i].name);
-    try {
-      const resp = await fetch(BASE + 'api/upload', {method: 'POST', body: fd});
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok || !data.ok) {
-        addMsg('error', '❌ 上传失败: ' + (data.detail || data.error || ('HTTP ' + resp.status)));
-        continue;
-      }
-      const inputEl = document.getElementById('input');
-      const sep = (inputEl.value && !inputEl.value.endsWith(' ')) ? ' ' : '';
-      inputEl.value += sep + data.path;
-      inputEl.style.height = 'auto';
-      const msgEl = addMsg('tool', '📎 已上传: ' + data.path + ' (' + formatSize(data.size) + (data.is_image ? ', 图片' : '') + ')');
-      const link = document.createElement('a');
-      link.href = BASE + data.url;
-      link.target = '_blank';
-      link.textContent = ' 打开';
-      link.style.marginLeft = '8px';
-      msgEl.appendChild(link);
-      if (data.is_image) {
-        const img = document.createElement('img');
-        img.src = BASE + data.url;
-        img.style.maxWidth = '180px'; img.style.maxHeight = '120px';
-        img.style.borderRadius = '8px'; img.style.marginTop = '4px';
-        img.style.cursor = 'pointer';
-        img.onclick = function() { window.open(BASE + data.url); };
-        msgEl.appendChild(img);
-      }
-    } catch (e) {
-      addMsg('error', '❌ 上传异常: ' + e.message);
-    }
-  }
-  input.value = '';
-}
-
-
-
-
-function toggleTheme() {
-  const root = document.documentElement;
-  const isDark = root.dataset.theme === 'dark';
-  if (isDark) { delete root.dataset.theme; } else { root.dataset.theme = 'dark'; }
-  try { localStorage.setItem('theme', isDark ? 'light' : 'dark'); } catch(e) {}
-  updateThemeButton(!isDark);
-}
-function updateThemeButton(isDark) {
-  const btn = document.getElementById('btn-theme');
-  if (btn) btn.textContent = isDark ? '🌙 dark' : '☀️ light';
-}
-function initTheme() {
-  let saved = null;
-  try { saved = localStorage.getItem('theme'); } catch(e) {}
-  let isDark = false;
-  if (saved === 'dark') isDark = true;
-  else if (saved === 'light') isDark = false;
-  else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) isDark = true;
-  if (isDark) {
-    document.documentElement.dataset.theme = 'dark';
-    updateThemeButton(true);
-  } else {
-    updateThemeButton(false);
-  }
-}
-function toggleSkillSelect() {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({type: 'skill_select_toggle'}));
-  }
-}
-function toggleMode() {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({type: 'mode_toggle'}));
-  }
-}
-
-
-function updateSkillSelectUI(enabled) {
-  curSkillEnabled = !!enabled;
-  updateSkillIndicator();
-}
-function modeLabel(mode) {
-  const icons = {plan: '📐 plan', build: '🔧 build', 'build-unsafe': '🔥 build-unsafe'};
-  return icons[mode] || mode;
-}
-function setMode(mode) {
-  curMode = modeLabel(mode);
-  updateModeIndicator();
-}
-
-function toggleSidebar() {
-  const body = document.body;
-  const collapsed = body.classList.toggle('sidebar-collapsed');
-  try { localStorage.setItem('sidebarCollapsed', collapsed ? '1' : '0'); } catch(e) {}
-  if (!collapsed) fetchSessions();
-}
-function initSidebar() {
-  let collapsed = window.innerWidth < 768;
-  try {
-    const saved = localStorage.getItem('sidebarCollapsed');
-    if (saved !== null) collapsed = saved === '1';
-  } catch(e) {}
-  if (collapsed) document.body.classList.add('sidebar-collapsed');
-}
-
-let sessionPrevBusy = {};   // session -> 上一轮是否忙（llm/in_tool），用于忙→闲检测
-let pendingSessions = {};   // session -> true：回合已完成、等待用户查看
-let lastSessionsSig = '';   // 上次渲染签名（防轮询闪烁）
-let lastUserMsgTs = null;    // 最后一条 user 消息时间（assistant 耗时提示基准）
-let recentOrder = [];       // MRU：最近选中的 session 在前（running 块按此排序，需求2）
-
-function touchRecent(name) {
-  // MRU 置顶：name 移到数组头部，其余保持原顺序（V8 稳定）
-  recentOrder = [name, ...recentOrder.filter(x => x !== name)];
-}
-
-function fetchSessions() {
-  fetch(BASE + 'api/sessions').then(r => r.json()).then(data => {
-    // 忙→闲检测：非当前 session 回合完成 → 标记待查看
-    // busy = llm 处理中 或 tool 执行中（starting 初始化不算回合执行，避免误标）
-    const isBusy = s => {
-      const ag = data.agents && data.agents[s];
-      // 回合级判定（2026-08-10）：phase 在技能选择/tool 间隙临时复位 idle 会
-      // 误判回合完成；turn_active 仅回合真正结束才复位，是权威忙闲信号。
-      return !!ag && ag.status === 'running' && ag.turn_active === true;
-    };
-    data.sessions.forEach(s => {
-      const ag = data.agents && data.agents[s];
-      const busy = isBusy(s);
-      const idleNow = !!ag && ag.status === 'running' && !busy;  // 仍在运行但已空闲 = 回合完成（基于 turn_active）
-      if (sessionPrevBusy[s] === true && idleNow && s !== data.current) {
-        pendingSessions[s] = true;   // 忙→闲 且非当前 → 待查看
-      }
-      sessionPrevBusy[s] = busy;
-    });
-    // 首次加载：用后端顺序初始化 MRU（current 置前），避免 recentOrder 为空
-    if (recentOrder.length === 0 && data.sessions.length > 0) {
-      recentOrder = [data.current, ...data.sessions.filter(s => s !== data.current)];
-    }
-    // 兜底校准（2026-08-12）：每次轮询响应都先同步 Send/Stop 按钮状态（口径与后端
-    // _session_busy 一致：status==='running' && turn_active）。必须在 sig 短路之前执行——
-    // 切走/刷新/断线后 done 丢失导致 isStreaming 卡 True，即使 agents 数据未变
-    // （回合完成后 turn_active 复位为 false 但被 10s 低频轮询拖慢），按钮也要尽快恢复。
-    if (data.current) {
-      const agB = data.agents && data.agents[data.current];
-      const busyNow = !!(agB && agB.status === 'running' && agB.turn_active);
-      if (busyNow !== isStreaming) {
-        isStreaming = busyNow;
-        setStopBtnVisible(busyNow);
-      }
-    }
-    // 当前会话不在流式执行时，每轮轮询都补拉 DB 增量；不能被侧边栏签名短路。
-    var pollSession = data.current || currentSession;
-    var pollCache = sessionCache[pollSession];
-    var pollAgent = data.agents && data.agents[pollSession];
-    if (pollCache && pollCache.ids && pollCache.ids.size && (!pollAgent || pollAgent.turn_active !== true)) {
-      fetchIncremental(pollSession, pollCache, loadToken, null);
-    }
-    // 签名比较：sessions/current/agents/lock_tags/pending/recentOrder 均未变则跳过重渲染（防轮询闪烁）
-    const sig = JSON.stringify([data.sessions, data.current, data.agents, data.lock_tags, pendingSessions, recentOrder]);
-    if (sig === lastSessionsSig) return;
-    lastSessionsSig = sig;
-    const list = document.getElementById('session-list');
-    list.innerHTML = '';
-    // 对齐 repl /sessions：running 置顶，其余用分隔标题隔开
-    const isRunning = s => data.agents && data.agents[s] && data.agents[s].status === 'running';
-    const running = data.sessions.filter(isRunning);
-    // 需求2：running 块按 MRU（最近选中）排序——当前选中第 1，上一次选中的第 2，以此类推
-    // recentOrder 前端实时维护，不受后端 2s TTL 缓存影响；未在 MRU 的 session 稳定排序兜底置后
-    const mruIdx = s => { const i = recentOrder.indexOf(s); return i === -1 ? 999 : i; };
-    running.sort((a, b) => mruIdx(a) - mruIdx(b));
-    const others = data.sessions.filter(s => !isRunning(s));
-    const renderItem = s => {
-      const el = document.createElement('div');
-      el.className = 'session-item' + (s === data.current ? ' active' : '');
-      // 对齐 repl /sessions 的 [running] 标记：running 会话前加绿色圆点
-      if (isRunning(s)) {
-        const dot = document.createElement('span');
-        dot.className = 'session-status-dot';
-        dot.textContent = '●';
-        el.appendChild(dot);
-      }
-      // 会话名（独立 span，避免后续 textContent 清空徽标导致样式丢失）
-      const nameSpan = document.createElement('span');
-      nameSpan.className = 'session-name-text';
-      nameSpan.textContent = s;
-      el.appendChild(nameSpan);
-      // 对齐 repl /sessions 的 🔒：他进程持锁时追加锁标记
-      const lockTag = data.lock_tags && data.lock_tags[s];
-      if (lockTag) {
-        const lockSpan = document.createElement('span');
-        lockSpan.className = 'session-lock-tag';
-        lockSpan.textContent = ' ' + lockTag;
-        el.appendChild(lockSpan);
-      }
-
-      // 对齐 repl /sessions 的 phase/in_tool 徽标：llm处理中⏳ / tool执行中🔧 / 初始化⏳starting（空闲不加）
-      const ag = data.agents && data.agents[s];
-      if (ag) {
-        let phaseTag = "";
-        if (ag.in_tool) phaseTag = "🔧tool";
-        else if (ag.phase === "llm") phaseTag = "⏳llm";
-        else if (ag.phase === "starting") phaseTag = "⏳starting";
-        if (phaseTag) {
-          const phaseSpan = document.createElement("span");
-          phaseSpan.className = "session-phase-tag";
-          phaseSpan.textContent = " " + phaseTag;
-          el.appendChild(phaseSpan);
-        }
-        // 运行中会话显示 mode 徽标（复用输入框 modeLabel；仅 running 展示，空闲不占位）
-        if (isRunning(s) && ag.mode) {
-          const modeSpan = document.createElement("span");
-          modeSpan.className = "session-mode-tag";
-          modeSpan.textContent = " " + modeLabel(ag.mode);
-          el.appendChild(modeSpan);
-        }
-      }
-      // 崩溃符号：crashed 状态或 crash_notices 未 ack（崩溃过）都显示
-      const cn = data.crash_notices && data.crash_notices[s];
-      if ((ag && ag.status === 'crashed') || cn) {
-        const crashSpan = document.createElement('span');
-        crashSpan.className = 'session-crash-tag';
-        crashSpan.textContent = ' 🔴crashed';
-        crashSpan.title = '崩溃时间: ' + (cn ? cn.time : '') + '\n' + (cn ? (cn.error || '') : (ag && ag.error ? ag.error : ''));
-        el.appendChild(crashSpan);
-      }
-      // 需求1：🔔 待查看 徽标（非当前 session 回合完成后提示用户查看）
-      if (pendingSessions[s]) {
-        const pendSpan = document.createElement('span');
-        pendSpan.className = 'session-pending-tag';
-        pendSpan.textContent = ' 🔔待查看';
-        el.appendChild(pendSpan);
-      }
-      el.onclick = () => switchSession(s);
-      // 面板 stop 按钮：停止运行会话的 agent 线程（保留数据，切换时自动恢复）。
-      // 所有 running 会话（含当前）均显示；当前会话停止后自动切换到列表最靠前的
-      // 其他会话（后端已切 focus 并返回 switched_to，避免 focus 置空失焦）。
-      // 他进程持锁的会话不在本进程 agents 中 → isRunning=false → 天然不显示，
-      // 不会误停他人持有的会话。
-      // ── fork 快捷按钮：复制该会话为副本（所有 session 显示，hover 可见）──
-      const forkBtn = document.createElement('button');
-      forkBtn.className = 'session-fork';
-      forkBtn.textContent = '\u29c9';
-      forkBtn.title = '复制会话（fork）';
-      forkBtn.onclick = function(ev) {
-        ev.stopPropagation();
-        const target = prompt('复制会话 "' + s + '" 为新会话名:', s + '_copy');
-        if (!target) return;
-        fetch(BASE + 'api/sessions/' + encodeURIComponent(s) + '/fork', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({target: target})
-        })
-          .then(function(r) { return r.json().then(function(d) { return {ok: r.ok, data: d}; }); })
-          .then(function(res) {
-            if (!res.ok) { alert('Fork 失败: ' + ((res.data && res.data.detail) || res.status)); return; }
-            fetchSessions();   // 刷新列表，新 session 出现
-          })
-          .catch(function(e) { alert('Fork 失败: ' + e.message); });
-      };
-      el.appendChild(forkBtn);
-      if (isRunning(s)) {
-        const stopBtn = document.createElement('button');
-        stopBtn.className = 'session-stop';
-        stopBtn.textContent = '⏹';
-        stopBtn.title = (s === data.current)
-          ? '停止当前会话（保留数据，自动切换到下一个会话）'
-          : '停止会话（保留数据，切换时自动恢复）';
-        stopBtn.onclick = function(ev) {
-          ev.stopPropagation();
-          fetch(BASE + 'api/sessions/' + encodeURIComponent(s) + '/stop', {method: 'POST'})
-            .then(function(r) { return r.json().then(function(d) { return {ok: r.ok, data: d}; }); })
-            .then(function(res) {
-              if (!res.ok) { alert('停止失败: ' + res.status); return; }
-              if (s === currentSession) {
-                // 停止的是当前会话
-                if (res.data && res.data.switched_to) {
-                  switchSession(res.data.switched_to);   // WS 幂等重切 + 乐观高亮 + session_switched 刷新
-                } else {
-                  // 无其他会话可切：线程已停不会再有 done，复位流式状态
-                  isStreaming = false;
-                  setStopBtnVisible(false);
-                  fetchSessions();
-                }
-              } else {
-                fetchSessions();
-              }
-            })
-            .catch(function(e) { alert('停止失败: ' + e.message); });
-        };
-        el.appendChild(stopBtn);
-      }
-      list.appendChild(el);
-    };
-    running.forEach(renderItem);
-    if (others.length) {
-      const sep = document.createElement('div');
-      sep.className = 'session-divider';
-      sep.textContent = 'Other sessions (not running)';
-      list.appendChild(sep);
-      others.forEach(renderItem);
-    }
-    if (data.current) {
-      currentSession = data.current;
-      document.getElementById('session-name').textContent = currentSession;
-    }
-  }).catch(function(err) {
-    // 会话列表加载失败不阻塞页面：仅记录，避免未捕获异常中断后续初始化
-    console.error('fetchSessions error:', err);
-  });
-}
-
-function switchSession(name) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({type: 'switch_session', session: name}));
-  } else {
-    fetchSessions();  // 离线：WS 不可用时仅靠 2s 轮询刷新（权威切换需 WS 往返）
-  }
-  delete pendingSessions[name];  // 用户已查看该会话：清除待查看标记
-  // ── 崩溃通知自动 ack：切换到该 session 即视为已查看 → 徽标消失（对齐待查看模式） ──
-  // 仅清理前端侧边栏徽标（_crash_notices.acked=true），不影响 agent 运行状态。
-  fetch(BASE + 'api/sessions/' + encodeURIComponent(name) + '/crash/ack', {method: 'POST'}).catch(function(){});
-  touchRecent(name);  // 需求2：更新 MRU 顺序（当前选中置顶，上次选中排第 2）
-  // ── 乐观高亮：立即更新 current 与标题，不等 WS 往返（面板即时响应，问题2修复）──
-  currentSession = name;
-  document.getElementById('session-name').textContent = name;
-  document.querySelectorAll('.session-item').forEach(function(el) {
-    const n = el.querySelector('.session-name-text');
-    el.classList.toggle('active', !!n && n.textContent === name);
-  });
-  // 移动端切会话后收起边栏
-  if (window.innerWidth < 768) document.body.classList.add('sidebar-collapsed');
-  // 移除立即 fetchSessions：WS 已连接时权威刷新由后端 session_switched 分支完成
-  // （后端已清 sessions 缓存，返回最新 current）；此处立即请求会命中 stale 缓存并覆盖乐观高亮
-}
-function showSessionError(msg) {
-  const panel = document.getElementById('sidebar');
-  let err = document.getElementById('session-create-error');
-  if (!msg) {
-    if (err) err.remove();
-    return;
-  }
-  if (!err) {
-    err = document.createElement('div');
-    err.id = 'session-create-error';
-    err.style.cssText = 'color:var(--err);font-size:12px;margin:0 0 8px 0;';
-    const row = panel.querySelector('.session-input-row');
-    panel.insertBefore(err, row);
-  }
-  err.textContent = msg;
-}
-
-function createSession() {
-  const name = document.getElementById('new-session-name').value.trim();
-  if (!name) {
-    showSessionError('请输入 session 名称');
-    return;
-  }
-  fetch(BASE + 'api/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})})
-    .then(r => {
-      if (!r.ok) {
-        return r.json().then(data => { throw new Error(data.detail || '创建失败'); });
-      }
-      return r.json();
-    })
-    .then(() => {
-      showSessionError('');
-      document.getElementById('new-session-name').value = '';
-      if (window.innerWidth < 768) document.body.classList.add('sidebar-collapsed');
-      touchRecent(name);  // 需求2：新创建的 session 置顶
-      fetchSessions();  // 刷新列表 + current 标签（后端已把新 session 设为 current）
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({type: 'switch_session', session: name}));
-      }
-    })
-    .catch(err => showSessionError('❌ ' + err.message));
-}
-
-
- document.getElementById('new-session-name').addEventListener('input', () => showSessionError(''));
-function loadSkills() {
-  fetch(BASE + 'api/skills').then(r => r.json()).then(data => {
-    if (data.skills && data.skills.length) {
-      addMsg('tool', '📦 Skills: ' + data.skills.join(', '));
-    } else {
-      addMsg('tool', '📦 No skills available');
-    }
-  });
-}
-
-const RENDER_TAIL_COUNT = 20;   // P2: 10→20 条，首屏上下文更充足（现代浏览器渲染成本可控）   // 历史加载只渲染最新 N 条"可见"消息（正文+tool/command，2026-08-05），更早的通过顶部按钮按需补渲染
-
-// 2026-08-05: 用户要求历史渲染包含 tool 执行/结果及 /xxx、!xxx 命令与结果。
-// 后端已过滤 git/compact/drop 内部角色，到前端的消息全部需要渲染，恒返回 true。
-// 保留函数签名：后续如需按类型选择性渲染，仅需在此调整。
-function isVisibleMsg(m) {
-  return true;
-}
-
-// 从 msgs（按 id 升序）取最新 n 条可见消息，保持原顺序（旧→新）返回。
-// 设计：历史消息可能上千条，全量渲染代价高；只取尾部最新 n 条保证首屏秒开，
-// 更早的由用户点击"加载更早"再补渲染（renderOlderBatch）。
-function lastVisibleTail(msgs, n) {
-  var tail = [];
-  for (var i = msgs.length - 1; i >= 0 && tail.length < n; i--) {
-    if (isVisibleMsg(msgs[i])) tail.unshift(msgs[i]);
-  }
-  return tail;
-}
-
-// 顶部"加载更早"按钮：历史只渲染最新 RENDER_TAIL_COUNT 条正文，点击补渲染更早的一批
-function ensureOlderButton() {
-  var btn = document.getElementById('older-btn');
-  if (!btn) {
-    btn = document.createElement('button');
-    btn.id = 'older-btn';
-    btn.type = 'button';
-    btn.textContent = '⬆ 加载更早的消息';
-    btn.onclick = function() { renderOlderBatch(currentSession); };
-  }
-  var chat = document.getElementById('chat');
-  if (btn.parentNode !== chat) chat.insertBefore(btn, chat.firstChild);
-  updateOlderButton();
-  return btn;
-}
-function updateOlderButton() {
-  var btn = document.getElementById('older-btn');
-  if (!btn) return;
-  var cached = sessionCache[currentSession];
-  if (cached && cached.messages && cached.renderedIds) {
-    // P2: 显示剩余未渲染数量，用户对"还有多少历史"有预期
-    var unrendered = cached.messages.filter(function(m) {
-      return isVisibleMsg(m) && !cached.renderedIds.has(m._id);
-    });
-    if (unrendered.length) {
-      btn.textContent = '⬆ 加载更早的消息（还有 ' + unrendered.length + ' 条）';
-      btn.style.display = '';
-    } else {
-      btn.style.display = 'none';
-    }
-  } else {
-    btn.style.display = 'none';
-  }
-}
-
-// 历史消息中的 tool_call / tool_result / command 折叠框渲染（2026-08-05 新增）。
-// 设计：历史数据的字段结构（displayType + toolCalls/content/result）与流式
-// appendToolBox 的 data 结构（{name,args,index,total}/{exit_code,stdout,stderr}）
-// 不同，故独立实现，不复用 appendToolBox，避免字段错位。
-// 渲染风格与流式保持一致（.msg.tool 折叠框），默认收起、点开看详情。
-function renderToolHistory(msg, chat) {
-  var produced = [];
-  var dt = msg.displayType;
-
-  if (dt === 'tool_call') {
-    var el = document.createElement('div');
-    el.className = 'msg tool';
-    var details = document.createElement('details');
-    details.open = false; // 默认收起，点开看详情
-    var summary = document.createElement('summary');
-    summary.textContent = '🔧 ' + (msg.content || 'tool') + fmtTimeSuffix(msg.created_at);
-    details.appendChild(summary);
-    if (msg.toolCalls && msg.toolCalls.length) {
-      // 2026-08-11: markdown 模板渲染；历史 args 为 JSON 字符串 → parse（失败 json 兜底）；
-      // pythonrt .py 文件 → fetch 补读文件内容（历史消息未存 file_content）
-      msg.toolCalls.forEach(function(tc) {
-        var argsObj = {};
-        try { argsObj = JSON.parse(tc.args || '{}'); } catch(e) { argsObj = { raw: tc.args }; }
-        var mdDiv = document.createElement('div');
-        mdDiv.className = 'tool-args-md';
-        mdDiv.innerHTML = mdToHtml(toolArgsToMarkdown(tc.name, argsObj, null));
-        details.appendChild(mdDiv);
-        if (tc.name === 'pythonrt' && argsObj && typeof argsObj === 'object') {
-          var fp = String(argsObj.code_or_filepath || '').trim();
-          if (fp.endsWith('.py')) {
-            fetch(BASE + 'api/files/download?path=' + encodeURIComponent(fp))
-              .then(function(r) { return r.ok ? r.text() : null; })
-              .then(function(txt) { if (txt) mdDiv.innerHTML = mdToHtml(toolArgsToMarkdown(tc.name, argsObj, txt)); })
-              .catch(function() {});
-          }
-        }
-      });
-    }
-    el.appendChild(details);
-    chat.appendChild(el);
-    produced.push(el);
-    return produced;
-  }
-
-  if (dt === 'tool_result') {
-    var el2 = document.createElement('div');
-    el2.className = 'msg tool';
-    var details2 = document.createElement('details');
-    // 2026-08-11: summary/exit 历史结果默认展开（exec_summary/exec_exit stdout 前缀特征），其余折叠
-    var isTerminal = /^(📌|🔚|✅ 已持久化|\[exit requested)/.test(msg.content || '');
-    details2.open = isTerminal; // summary/exit 默认展开，其余收起
-    var summary2 = document.createElement('summary');
-    summary2.textContent = '💻 Tool Result' + fmtTimeSuffix(msg.created_at);
-    details2.appendChild(summary2);
-    var pre2 = document.createElement('pre');
-    pre2.textContent = msg.content || '(no output)';
-    details2.appendChild(pre2);
-    el2.appendChild(details2);
-    var historySummary = /^(📌|✅ 已持久化|📄)/.test(msg.content || '') ? summaryBodyFromOutput(msg.content) : '';
-    if (historySummary) {
-      var historySummaryBody = document.createElement('div');
-      historySummaryBody.className = 'msg assistant summary-content';
-      var historySummaryMd = document.createElement('div');
-      historySummaryMd.className = 'md-body';
-      historySummaryMd.innerHTML = mdToHtml(historySummary);
-      linkifyFilePaths(historySummaryMd);
-      historySummaryBody.appendChild(historySummaryMd);
-      el2.appendChild(historySummaryBody);
-    }
-    chat.appendChild(el2);
-    produced.push(el2);
-    return produced;
-  }
-
-  if (dt === 'thinking') {
-    // 历史 thinking（思考链）：折叠框，与实时 ensureThinkingEl 同构
-    var tel = document.createElement('div');
-    tel.className = 'msg thinking-box';
-    var tdetails = document.createElement('details');
-    tdetails.open = false; // 默认收起，点开看思考链
-    var tsummary = document.createElement('summary');
-    tsummary.textContent = '🧠 Thinking' + fmtTimeSuffix(msg.created_at);
-    tdetails.appendChild(tsummary);
-    var tpre = document.createElement('pre');
-    tpre.className = 'thinking-content';
-    tpre.textContent = msg.content || '(no thinking content)';
-    tdetails.appendChild(tpre);
-    tel.appendChild(tdetails);
-    chat.appendChild(tel);
-    produced.push(tel);
-    return produced;
-  }
-
-  // command: /xxx 或 !xxx —— 拆成两个节点（与实时路径一致）：
-  //   ① 命令原文 → .msg.user（user 输入，参与锚点）
-  //   ② 命令结果 → .msg.tool 折叠框（有 result 时才渲染）
-  var userEl = document.createElement('div');
-  userEl.className = 'msg user';
-  var contentDiv = document.createElement('div');
-  contentDiv.textContent = msg.content || '';
-  userEl.appendChild(contentDiv);
-    userEl.dataset.raw = msg.content || '';
-  var tSpan = document.createElement('span');
-  tSpan.className = 'msg-time';
-  tSpan.textContent = fmtTimeSuffix(msg.created_at);
-  userEl.appendChild(tSpan);
-  chat.appendChild(userEl);
-  appendAnchor(userEl);   // 修复：历史命令原文是 user 输入，补建锚点（与实时 addMsg('user') 一致）
-  produced.push(userEl);
-
-  var tag = msg.kind === 'bang' ? '💻' : '🔧';
-  var status = '';
-  if (msg.ok === false) status = ' ❌';
-  else if (msg.exit_code !== undefined && msg.exit_code !== null && msg.exit_code !== 0) status = ' (exit=' + msg.exit_code + ')';
-  if (msg.result) {
-    var el3 = document.createElement('div');
-    el3.className = 'msg tool';
-    var details3 = document.createElement('details');
-    details3.open = false; // 默认收起，点开看详情
-    var summary3 = document.createElement('summary');
-    summary3.textContent = tag + ' 命令结果' + status + fmtTimeSuffix(msg.created_at);
-    details3.appendChild(summary3);
-    var pre3 = document.createElement('pre');
-    pre3.textContent = msg.result;
-    details3.appendChild(pre3);
-    el3.appendChild(details3);
-    chat.appendChild(el3);
-    produced.push(el3);
-  }
-  return produced;
-}
-
-function renderMessage(msg, container) {
-  // 单条消息渲染。全量渲染：user/assistant/其他正文 + tool_call/tool_result/command 折叠框
-  // （2026-08-05 用户要求历史包含 tool 与命令及其结果）。
-  // container 传入时（批量渲染/增量渲染）节点挂到容器（DocumentFragment），
-  // 由调用方统一一次性 append 到 #chat；单条渲染时直接 append 并按需滚动。
-  // 返回本消息产生的顶层节点数组（user 消息可能产生 meta + el 两个节点），
-  // 供 DOM 缓存复用（sessionCache[session].nodes）。
-  var dt = msg.displayType || msg.role;
-  if (dt === 'tool_call' || dt === 'tool_result' || dt === 'command' || dt === 'thinking') {
-    // 历史 tool_call/tool_result/command/thinking → 折叠框渲染（独立结构，不复用流式 appendToolBox）
-    return renderToolHistory(msg, container || document.getElementById('chat'));
-  }
-  var chat = container || document.getElementById('chat');
-  var el;
-  var produced = [];
-  var afterNodes = [];
-
-  if (dt === 'user') {
-    if (msg.timestamp || msg.mode) {
-      var meta = document.createElement('div');
-      meta.className = 'msg-meta-outside';
-      meta.textContent = (msg.timestamp || '') + (msg.mode ? '  │  ' + msg.mode : '');
-      chat.appendChild(meta);
-      produced.push(meta);
-    }
-    el = document.createElement('div');
-    el.className = 'msg user';
-    var contentDiv = document.createElement('div');
-    contentDiv.textContent = msg.content || '';
-    el.appendChild(contentDiv);
-    el.dataset.raw = msg.content || '';
-    // 2026-08-10: 记录最后 user 消息时间（供 assistant 耗时提示），优先用 DB created_at / 解析的 timestamp
-    lastUserMsgTs = msg.created_at || msg.timestamp || lastUserMsgTs;
-    appendAnchor(el);   // 修复：历史 user 消息也建锚点（与实时 addMsg('user') 一致）
-    // 2026-08-11: 系统信息渲染到 user 消息之后（与实时 addMsg('system') 顺序同构）
-    if (msg.sysLines && msg.sysLines.length) {
-      msg.sysLines.forEach(function(line) {
-        var sysEl = document.createElement('div');
-        sysEl.className = 'msg system';   // 2026-08-07: 统一左对齐（基础样式已左对齐）
-        sysEl.textContent = line;
-        var t = document.createElement('span');
-        t.className = 'msg-time';
-        t.textContent = new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'});
-        sysEl.appendChild(t);
-        afterNodes.push(sysEl);
-      });
-    }
-
-  } else if (dt === 'assistant') {
-    // assistant：markdown 渲染 + TXT/CODE 切换（历史消息复用流式同构框）
-    el = document.createElement('div');
-    el.className = 'msg assistant';
-    el.dataset.raw = msg.content || '';
-    el.dataset.mode = getDefaultViewMode();
-    const head = document.createElement('div');
-    head.className = 'msg-head';
-    const btn = document.createElement('button');
-    btn.className = 'view-toggle';
-    btn.type = 'button';
-    btn.textContent = el.dataset.mode === 'text' ? 'TXT' : 'CODE';
-    btn.onclick = function() { toggleMsgView(el); };
-    head.appendChild(btn);
-    // P2: assistant 消息头部显示时间戳 + 距上条用户消息耗时（2026-08-10 增强）
-    const tspan = document.createElement('span');
-    tspan.className = 'msg-time';
-    tspan.textContent = formatClockTs(msg.created_at) || new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'});
-    head.appendChild(tspan);
-    // 耗时提示：距上条 user 消息 X分Y秒
-    const latStr = formatLatency(lastUserMsgTs, msg.created_at || new Date().toISOString());
-    if (latStr) {
-      const latSpan = document.createElement('span');
-      latSpan.className = 'msg-latency';
-      latSpan.textContent = '⏱ ' + latStr;
-      head.appendChild(latSpan);
-    }
-    el.appendChild(head);
-    const body = document.createElement('div');
-    body.className = el.dataset.mode === 'text' ? 'md-body' : 'code-body';
-    if (el.dataset.mode === 'text') {
-      body.innerHTML = mdToHtml(el.dataset.raw);
-      linkifyFilePaths(body);   // 历史消息路径链接化
-    } else {
-      body.textContent = el.dataset.raw;
-    }
-    el.appendChild(body);
-
-  } else {
-    el = document.createElement('div');
-    el.className = 'msg ' + (msg.role || '');
-    el.textContent = msg.content || '';
-  }
-
-  chat.appendChild(el);
-  produced.push(el);
-  afterNodes.forEach(function(node) { chat.appendChild(node); produced.push(node); });
-  if (!container) scrollToBottomIfSticky();
-  return produced;
-}
-
-// ── A+B 双渲染去重（2026-08-12）：实时渲染记账 + 增量内容级去重 ──
-// 根因：实时渲染（addMsg/appendStreaming/appendToolBox）不回写 sessionCache，
-// 增量拉取（fetchIncremental）按 cached.ids 过滤时把已实时渲染的消息判为 fresh 重渲。
-// 方案：
-//   B - syncCacheAfterDone：回合 done 后静默增量记账（推进 lastId/ids），
-//       后续轮询/重连按已推进的 lastId 只拉真正新增，机制上消除重拉。
-//   A - trackRendered/rebuildRenderedContent + fetchIncremental 过滤：
-//       实时渲染的 user/assistant/thinking 按 role+正文 计数记账，增量拉取按计数跳过，
-//       兜底 B 失效（done 前刷新/时序错位）的残留重复。
-function trackRendered(role, content) {
-  if (!currentSession) return;
-  var c = sessionCache[currentSession];
-  if (!c) return;
-  if (!c.renderedContent) c.renderedContent = new Map();
-  var key = role + '\u0001' + (content || '');
-  c.renderedContent.set(key, (c.renderedContent.get(key) || 0) + 1);
-}
-
-// 重建内容记账：以当前 #chat DOM 实际渲染为准（切换会话/复用 DOM 节点后调用）
-function rebuildRenderedContent() {
-  if (!currentSession) return;
-  var c = sessionCache[currentSession];
-  if (!c) return;
-  var map = new Map();
-  var chat = document.getElementById('chat');
-  var bump = function(role, content) {
-    if (!content) return;
-    var key = role + '\u0001' + content;
-    map.set(key, (map.get(key) || 0) + 1);
-  };
-  if (chat) {
-    chat.querySelectorAll('.msg.user').forEach(function(el) { bump('user', el.dataset.raw || ''); });
-    chat.querySelectorAll('.msg.assistant').forEach(function(el) { bump('assistant', el.dataset.raw || ''); });
-    chat.querySelectorAll('.msg.thinking-box').forEach(function(el) {
-      var pre = el.querySelector('pre.thinking-content');
-      var t = pre ? (pre.textContent || '') : '';
-      if (t && t !== '(no thinking content)') bump('thinking', t);
-    });
-  }
-  c.renderedContent = map;
-}
-
-// B: 回合完成 → 静默增量记账（只推进缓存水位，不渲染——实时已渲染）
-function syncCacheAfterDone(session) {
-  var c = sessionCache[session];
-  if (!c || !c.ids || c.ids.size === 0) return;
-  fetch(BASE + 'api/sessions/' + encodeURIComponent(session) + '/messages?after_id=' + c.lastId)
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (!data || !data.messages || !data.messages.length) return;
-      var cur = sessionCache[session];
-      if (!cur) return;
-      var freshAll = data.messages.filter(function(m) { return !cur.ids.has(m._id); });
-      if (freshAll.length) {
-        cur.messages = cur.messages.concat(freshAll);
-        freshAll.forEach(function(m) { cur.ids.add(m._id); });
-      }
-      cur.lastId = data.last_id || cur.lastId;
-    })
-    .catch(function() {});
-}
-
-// 增量拉取：after_id=lastId → 去重 → 渲染新增消息（正文 + tool/command），数据缓存全部更新
-function fetchIncremental(session, cached, token, loadingEl) {
-  fetch(BASE + 'api/sessions/' + encodeURIComponent(session) + '/messages?after_id=' + cached.lastId)
-    .then(r => r.json()).then(function(data) {
-      if (token !== loadToken) { updateCacheOnly(session, data); return; }  // 已切走：仅更新缓存，不渲染
-      renderCrashNotice(session, data.crash_notice);   // 崩溃通知：崩溃自动重启后提示用户
-      var freshAll = (data.messages || []).filter(function(m) { return !cached.ids.has(m._id); });
-      // A: 内容级去重——实时渲染已覆盖的 user/assistant/thinking 不再重复渲染（按计数消耗），
-      // 但仍计入数据缓存（freshAll），避免下次增量重复拉取。
-      var fresh = freshAll.filter(function(m) {
-        if (!cached.renderedContent || (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'thinking')) return true;
-        var content = m.content || '';
-        if (m.role === 'user') {
-          // DB 存完整前缀（时间/模式/建议技能/正文），实时渲染的是正文 → 提取正文做 key
-          var m2 = /正文:\n([\s\S]*)$/.exec(content);
-          if (m2) content = m2[1];
-        }
-        var key = m.role + '\u0001' + content;
-        var n = cached.renderedContent.get(key) || 0;
-        if (n > 0) { cached.renderedContent.set(key, n - 1); return false; }
-        return true;
-      });
-      var visFresh = fresh.filter(isVisibleMsg);   // 全部渲染（含 tool/command）
-      if (loadingEl) loadingEl.textContent = visFresh.length
-        ? '✅ 已加载 ' + visFresh.length + ' 条新消息'
-        : '✅ 已是最新（' + cached.renderedIds.size + ' 条正文）';
-      if (visFresh.length) {
-        var frag = document.createDocumentFragment();
-        visFresh.forEach(function(m) {
-          var produced = renderMessage(m, frag);
-          if (cached.nodes) cached.nodes.push.apply(cached.nodes, produced);
-          if (cached.renderedIds) cached.renderedIds.add(m._id);
-        });
-        document.getElementById('chat').appendChild(frag);
-      }
-      if (freshAll.length) {   // 数据缓存：全部 freshAll（含 tool/result 与被内容去重跳过的）
-        cached.messages = cached.messages.concat(freshAll);
-        freshAll.forEach(function(m) { cached.ids.add(m._id); });
-        cached.lastId = data.last_id || cached.lastId;
-      }
-      if (data.session) document.getElementById('session-name').textContent = data.session;
-      if (loadingEl) loadingEl.remove();   // F9: 移除 loading 提示条（分支1/2 残留）
-      // F4c 修订（2026-08-10）：仅在"确实渲染了新消息"时滚底——fetchSessions
-      // 2s 轮询会频繁调用本函数（无新消息），无条件滚底会把用户阅读中的历史
-      // 拉回底部；preserveView 重连路径（用户正在阅读）也受益，不再被强制滚底。
-      // 2026-08-12: 尊重 stickToBottom——正常加载路径 L4275 已置 true 行为不变；
-      // preserveView 重连路径（用户正在阅读历史）不再被强制拉回底部。
-      if (visFresh.length && stickToBottom) scrollToBottomIfSticky();
-    }).catch(function(err) {
-      console.error('incremental load error:', err);
-      // P2: catch 分支补 remove——原实现只改文案不移除，loading 条残留
-      if (loadingEl) {
-        loadingEl.textContent = '⚠️ 增量加载失败（已显示缓存）';
-        setTimeout(function() { loadingEl.remove(); }, 2000);
-      }
-    });
-}
-
-// 骨架屏：加载中占位（3 条 shimmer 线条），优于孤立文本提示（用户友好度）
-// 崩溃通知横幅：agent 崩溃并自动重启后，在消息区顶部提示用户（含错误与时间）
-function renderCrashNotice(session, notice) {
-  if (!notice) return;
-  var chat = document.getElementById('chat');
-  var existing = document.querySelector('.crash-notice[data-session="' + session + '"]');
-  if (existing) return;   // 已展示过，不重复
-  var el = document.createElement('div');
-  el.className = 'crash-notice';
-  el.setAttribute('data-session', session);
-  var ts = notice.time || '';
-  var err = notice.error || 'unknown';
-  var txt = document.createElement('span');
-  txt.textContent = '⚠️ Agent 崩溃并已自动重启（' + ts + '｜' + err + '）。崩溃期间发送的消息可能丢失，请重发。';
-  var ackBtn = document.createElement('button');
-  ackBtn.className = 'crash-ack';
-  ackBtn.textContent = '知道了';
-  ackBtn.onclick = function() {
-    fetch(BASE + 'api/sessions/' + encodeURIComponent(session) + '/crash/ack', {method: 'POST'})
-      .then(function(r) { return r.json(); })
-      .then(function() { if (el.parentNode) el.parentNode.removeChild(el); })
-      .catch(function() { if (el.parentNode) el.parentNode.removeChild(el); });
-  };
-  el.appendChild(txt);
-  el.appendChild(ackBtn);
-  chat.insertBefore(el, chat.firstChild);
-}
-
-function makeLoadingSkeleton() {
-  var el = document.createElement('div');
-  el.className = 'loading-skeleton';
-  el.innerHTML = '<div class="sk-line"></div><div class="sk-line mid"></div><div class="sk-line short"></div>';
-  return el;
-}
-
-// LRU 缓存写入：超出 MAX_CACHED_SESSIONS 时淘汰最早未使用的 session 缓存。
-// 被淘汰的 session 切回时会重新拉取（数据仍在后端），仅释放前端内存，可接受。
-function cacheSession(session, entry) {
-  delete sessionCache[session];   // 先删后插 → 更新为"最近使用"
-  sessionCache[session] = entry;
-  var keys = Object.keys(sessionCache);
-  while (keys.length > MAX_CACHED_SESSIONS) {
-    var victim = keys.shift();
-    delete sessionCache[victim];
-  }
-}
-
-function loadSessionMessages(session, opts) {
-  // 方案A++：per-session 数据缓存 + DOM 节点缓存 + 增量拉取 + 仅渲染最新 RENDER_TAIL_COUNT 条消息。
-  // - 全量渲染（user/assistant/正文 + tool_call/tool_result/command 折叠框，2026-08-05）
-  // - 从最新开始，先渲染最新 RENDER_TAIL_COUNT 条可见消息；更早的通过顶部按钮补渲染
-  // - loadToken 防竞态：切走/切回并发时，仅当前会话的响应允许渲染 DOM
-  // - cached.ids（Set）：全部消息 _id 去重（数据层）；cached.renderedIds（Set）：已渲染正文 _id 去重（渲染层）
-  // - cached.nodes（Array）：已渲染正文的顶层 DOM 节点数组，切回直接复用（零重渲染）
-  // - opts.preserveView=true（P0 重连路径）：不清空现有 DOM、不强制滚底，仅增量补新，
-  //   避免断线重连时用户正在阅读的历史被清空/拉回底部
-  opts = opts || {};
-  var cached = sessionCache[session];
-  if (opts.preserveView && cached && cached.nodes && cached.nodes.length) {
-    // ── 重连 + 已有缓存：保留视图，仅增量拉取补新（不清空、不滚底）──
-    var lEl = makeLoadingSkeleton();
-    document.getElementById('chat').appendChild(lEl);
-    fetchIncremental(session, cached, ++loadToken, lEl);
-    return;
-  }
-  clearChat();
-  stickToBottom = true;   // 加载历史后强制滚底显示最新消息
-  var token = ++loadToken;
-  var loadingEl = makeLoadingSkeleton();
-  document.getElementById('chat').appendChild(loadingEl);
-  ensureOlderButton();   // 顶部"加载更早"按钮（先于消息插入）
-
-  if (cached && cached.nodes && cached.nodes.length) {
-    // ── 分支1：DOM 节点缓存命中 → 零重渲染直接复用 + 增量拉取 ──
-    var frag = document.createDocumentFragment();
-    cached.nodes.forEach(function(n) { frag.appendChild(n); });
-    document.getElementById('chat').appendChild(frag);
-    // 修复：缓存复用路径 —— clearChat→resetAnchors 已清空锚点条，
-    // 为历史 user 消息逐个补建锚点（cached.nodes 顺序 = 消息顺序（旧→新），append 顺序一致）
-    cached.nodes.forEach(function(n) {
-      if (n.classList && n.classList.contains('msg') && n.classList.contains('user')) {
-        appendAnchor(n);
-      }
-    });
-    updateOlderButton();
-    forceScrollToBottom();   // F4c: 节点插入后立即滚底（同步+rAF 双保险）
-    rebuildRenderedContent();   // A+B: DOM 恢复后重建内容记账（增量内容级去重基准）
-    fetchIncremental(session, cached, token, loadingEl);
-  } else if (cached) {
-    // ── 分支2：旧格式缓存（无 nodes/renderedIds）→ 渲染最新 RENDER_TAIL_COUNT 条消息并补齐缓存 ──
-    cached.nodes = [];
-    cached.renderedIds = cached.renderedIds || new Set();
-    cached.renderedContent = cached.renderedContent || new Map();
-    var tail2 = lastVisibleTail(cached.messages, RENDER_TAIL_COUNT);
-    var frag2 = document.createDocumentFragment();
-    tail2.forEach(function(m) {
-      var produced = renderMessage(m, frag2);
-      cached.nodes.push.apply(cached.nodes, produced);
-      cached.renderedIds.add(m._id);
-    });
-    document.getElementById('chat').appendChild(frag2);
-    updateOlderButton();
-    forceScrollToBottom();   // F4c: 节点插入后立即滚底（同步+rAF 双保险）
-    rebuildRenderedContent();   // A+B: DOM 恢复后重建内容记账（增量内容级去重基准）
-    fetchIncremental(session, cached, token, loadingEl);
-  } else {
-    // ── 分支3：无缓存 → 分页全量拉取（limit=100，P1 后端分页）→ 渲染最新 RENDER_TAIL_COUNT 条正文并写入缓存 ──
-    fetch(BASE + 'api/sessions/' + encodeURIComponent(session) + '/messages?limit=100').then(r => r.json()).then(function(data) {
-      if (token !== loadToken) { updateCacheOnly(session, data); return; }  // 已切走：仅更新缓存，不渲染
-      renderCrashNotice(session, data.crash_notice);   // 崩溃通知：崩溃自动重启后提示用户
-      var msgs = data.messages || [];
-      var nodes = [];
-      var renderedIds = new Set();
-      var tail = lastVisibleTail(msgs, RENDER_TAIL_COUNT);
-      var frag = document.createDocumentFragment();
-      tail.forEach(function(m) {
-        var produced = renderMessage(m, frag);
-        nodes.push.apply(nodes, produced);
-        renderedIds.add(m._id);
-      });
-      cacheSession(session, {
-        lastId: data.last_id || 0,
-        messages: msgs.slice(),
-        ids: new Set(msgs.map(function(m) { return m._id; })),
-        nodes: nodes,
-        renderedIds: renderedIds,
-        renderedContent: new Map(),
-      });
-      document.getElementById('chat').appendChild(frag);
-      if (data.session) document.getElementById('session-name').textContent = data.session;
-      // P1: 展示总数与已渲染条数（后端 total 字段）——用户友好度
-      if (data.total !== undefined) {
-        loadingEl.textContent = '✅ 共 ' + data.total + ' 条消息，已显示最新 ' + tail.length + ' 条';
-      } else {
-        loadingEl.textContent = '✅ 已渲染最新 ' + tail.length + ' 条';
-      }
-      updateOlderButton();
-      loadingEl.remove();   // F4d: 先移除 loading 条，消除 scrollHeight 计算干扰
-      forceScrollToBottom();   // F4c: 历史加载完成 → 强制滚底（同步+rAF 双保险）
-      rebuildRenderedContent();   // A+B: 初始渲染后重建内容记账
-    }).catch(function(err) {
-      console.error('loadSessionMessages error:', err);
-      if (loadingEl) loadingEl.remove();
-      // P1: 失败提示带重试按钮（用户友好度）
-      var errMsg = addMsg('error', '❌ 加载会话消息失败 ');
-      var retryBtn = document.createElement('button');
-      retryBtn.textContent = '重试';
-      retryBtn.style.cssText = 'margin-left:6px;padding:1px 10px;border:none;border-radius:8px;background:#fff;color:#dc2626;cursor:pointer;font-size:11px;';
-      retryBtn.onclick = function() { loadSessionMessages(session); };
-      errMsg.appendChild(retryBtn);
-    });
-  }
-}
-
-// 点击"加载更早"：补渲染紧邻已渲染区间的更早 RENDER_TAIL_COUNT 条正文，
-// 插入到消息顶部并保持滚动视口位置（不跳动）
-function renderOlderBatch(session) {
-  var cached = sessionCache[session];
-  if (!cached || !cached.messages) return;
-  var unrendered = cached.messages.filter(function(m) {
-    return isVisibleMsg(m) && !cached.renderedIds.has(m._id);
-  });
-  if (!unrendered.length) { updateOlderButton(); return; }
-  var batch = unrendered.slice(-RENDER_TAIL_COUNT);   // 紧邻已渲染区间的上一批（旧→新）
-  var frag = document.createDocumentFragment();
-  var producedAll = [];
-  var anchorsStart = anchorCounter;   // 修复：记录渲染前锚点计数器，用于定位本批新增 dot
-  batch.forEach(function(m) {
-    producedAll.push.apply(producedAll, renderMessage(m, frag));
-    cached.renderedIds.add(m._id);
-  });
-  var chat = document.getElementById('chat');
-  var btn = ensureOlderButton();
-  var distToBottom = chat.scrollHeight - chat.scrollTop;   // 加载前距底距离（用于恢复视口）
-  chat.insertBefore(frag, btn.nextSibling);
-  if (producedAll.length) cached.nodes = producedAll.concat(cached.nodes);  // 更早节点插到 nodes 前部
-  // 修复：本批新增 dot（idx >= anchorsStart）整体前移到锚点条头部，
-  // 保持 dot 顺序与消息顺序一致（旧→新），避免 updateAnchorHighlight 高亮错位
-  var anchors = document.getElementById('msg-anchors');
-  if (anchors) {
-    var newDots = [];
-    for (var ai = 0; ai < anchors.children.length; ai++) {
-      var ad = anchors.children[ai];
-      if (ad.classList && ad.classList.contains('anchor-dot') && ad.dataset.idx !== undefined && parseInt(ad.dataset.idx, 10) >= anchorsStart) {
-        newDots.push(ad);
-      }
-    }
-    if (newDots.length) {
-      newDots.forEach(function(d) { anchors.removeChild(d); });
-      var ref = anchors.firstChild;   // 原有最旧 dot
-      if (ref) {
-        newDots.forEach(function(d) { anchors.insertBefore(d, ref); });   // 依次插到 ref 前 → 保持旧→新
-      } else {
-        newDots.forEach(function(d) { anchors.appendChild(d); });
-      }
-    }
-  }
-  chat.scrollTop = chat.scrollHeight - distToBottom;       // 恢复视口，避免跳动
-  updateOlderButton();
-}
-
-// 竞态兜底：请求返回时已切到其他 session → 只更新数据缓存不渲染 DOM，
-// 避免旧会话消息污染当前视图；下次切回直接命中缓存（按 _id 去重）
-function updateCacheOnly(session, data) {
-  if (!data || !data.messages) return;
-  var c = sessionCache[session];
-  if (c) {
-    var fresh = data.messages.filter(function(m) { return !c.ids.has(m._id); });
-    c.messages = c.messages.concat(fresh);
-    fresh.forEach(function(m) { c.ids.add(m._id); });
-    c.lastId = data.last_id || c.lastId;
-  } else {
-    sessionCache[session] = {
-      lastId: data.last_id || 0,
-      messages: data.messages.slice(),
-      ids: new Set(data.messages.map(function(m) { return m._id; })),
-      nodes: [],
-      renderedIds: new Set(),
-      renderedContent: new Map(),
-    };
-  }
-}
-
-function updateLockTag(data) {
-  const observing = data && data.observing;
-  if (observing) {
-    // T7: 观察者模式 → 显示 ⏳ 持有者（对齐 repl 的 [⏳pid:tid]）
-    const holder = data.holder || {};
-    const name = holder.holder || holder.holder_name || '未知进程';
-    curLockMsg = '⏳ ' + name;
-  } else {
-    curLockMsg = null;
-  }
-  updateLockIndicator();
-}
-
-function openModelTestModal() {
-  // 关闭已存在的弹窗
-  closeModelTestModal();
-  var overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.id = 'model-test-overlay';
-  overlay.innerHTML =
-    '<div class="modal-box">' +
-    '  <div class="modal-head"><span class="modal-title">⚡ 模型联通性测试</span>' +
-    '    <button class="modal-close" onclick="closeModelTestModal()">✕</button></div>' +
-    '  <div class="modal-body"><div id="model-test-content" style="color:var(--text-muted,#888)">⏳ 测试中（每个模型约需数秒）...</div></div>' +
-    '</div>';
-  overlay.addEventListener('click', function(e) { if (e.target === overlay) closeModelTestModal(); });
-  document.body.appendChild(overlay);
-  fetch(BASE + 'api/model/test', {method: 'POST'}).then(function(r) { return r.json(); }).then(function(data) {
-    var content = document.getElementById('model-test-content');
-    if (!content) return;
-    if (!data.ok) { content.textContent = '❌ 测试失败: ' + (data.error || 'unknown'); return; }
-    var results = data.results || [];
-    // 排序：成功项按延迟从小到大（升序），失败项排最后（保持原顺序）
-    var okList = results.filter(function(r) { return r.ok; })
-      .sort(function(a, b) { return (a.latency_ms || 0) - (b.latency_ms || 0); });
-    var failList = results.filter(function(r) { return !r.ok; });
-    var ordered = okList.concat(failList);
-    var okN = okList.length;
-    var html = '<table class="model-test-table"><tr><th>Provider.Model</th><th>状态</th><th>延迟</th></tr>';
-    ordered.forEach(function(r) {
-      var name = (r.provider || '?') + '.' + (r.model || '?');
-      var status = r.ok
-        ? '<span class="mt-ok">✅</span>'
-        : '<span class="mt-fail">❌ ' + escapeHtml(String(r.error || 'failed').slice(0, 40)) + '</span>';
-      var lat = r.ok ? (r.latency_ms + 'ms') : '-';
-      html += '<tr><td>' + escapeHtml(name) + '</td><td>' + status + '</td><td>' + lat + '</td></tr>';
-    });
-    html += '</table><div style="margin-top:8px;font-size:12px;color:var(--text-muted,#888)">' +
-      okN + '/' + results.length + ' 可用，总耗时 ' + (data.elapsed || 0).toFixed(1) + 's</div>';
-    content.innerHTML = html;
-  }).catch(function(err) {
-    var content = document.getElementById('model-test-content');
-    if (content) content.textContent = '❌ 请求失败: ' + err;
-  });
-}
-
-function closeModelTestModal() {
-  var overlay = document.getElementById('model-test-overlay');
-  if (overlay) overlay.remove();
-}
-
-function setSessionModel(provider, model, scope) {
-  var body = {model: model, scope: scope};
-  if (provider) body.provider = provider;
-  fetch(BASE + 'api/model/set', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body)
-  }).then(function(r) { return r.json(); }).then(function(data) {
-    var msg = data.ok
-      ? (scope === 'current'
-          ? '✅ 当前 session 已设为 ' + (provider ? provider + ' · ' : '') + model
-          : '✅ 已设置 ' + data.ok_count + '/' + data.total + ' 个 session')
-      : '❌ 设置失败: ' + (data.error || 'unknown');
-    alert(msg);
-    if (data.ok) {
-      closeModelTestModal();
-      fetchStatus();      // 刷新顶部 provider-model 显示
-      fetchSessions();    // 刷新 session 列表（模式/状态可能变化）
-    }
-  }).catch(function(err) { alert('❌ 请求失败: ' + err); });
-}
-
-function formatClockTs(ts) {
-  // 解析 DB created_at "YYYY-MM-DD HH:MM:SS" → HH:MM
-  if (!ts) return '';
-  var d = new Date(ts);
-  if (isNaN(d.getTime())) return '';
-  return d.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'});
-}
-
-function fmtTimeSuffix(ts) {
-  // 折叠框 summary 时间后缀：有 created_at 用真实消息时间，否则用本地当前时间（与实时路径一致）
-  var t = formatClockTs(ts) || new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'});
-  return t ? '  ' + t : '';
-}
-
-function formatLatency(userTs, msgTs) {
-  // 计算 msgTs 距 userTs 的 X分Y秒
-  if (!userTs || !msgTs) return '';
-  var u = new Date(userTs), m = new Date(msgTs);
-  if (isNaN(u.getTime()) || isNaN(m.getTime())) return '';
-  var diff = Math.max(0, (m.getTime() - u.getTime()) / 1000);
-  if (diff < 1) return '';
-  var min = Math.floor(diff / 60), sec = Math.floor(diff % 60);
-  return (min > 0 ? min + ' 分 ' : '') + sec + ' 秒';
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function fetchStatus() {
-  return fetch(BASE + 'api/session/stats').then(r => r.json()).then(data => {
-    // P0 防御：响应 session 与前端当前 session 不一致（切换竞态/缓存残留）时不覆盖标题与 currentSession
-    if (currentSession && data.session && data.session !== currentSession) {
-      return;
-    }
-    currentWorkdir = data.workdir || '';   // 路径链接：项目根
-    document.getElementById('session-name').textContent = data.session || '-';
-    setMode(data.mode);
-    updateLockTag(data);   // T9: 初始化/轮询渲染锁标签
-    updateStatsFrom(data, false); // 3: 初始加载不显示累计值（token 仅由 WS stats 单轮值驱动）
-    currentSession = data.session;
-  });
-}
-
-function updateStatsFrom(data, showTokens) {
-  // v2 方案A(完善)：token 区优先由 WS stats 事件(当前轮单轮值)驱动；
-  // showTokens=false(fetchStatus/updateStats 的会话累计值)时：
-  //   - 已收到过当前轮 stats(hasWsStats=true) -> 不覆盖(保持当前轮显示, done 后一致)
-  //   - 未收到(刚进入 session) -> 显示 db 持久化的最近一轮单轮值 last_*("上一轮")
-  // 累计值 prompt_tokens/completion_tokens 始终不用于显示(避免大太多)。
-  const el = document.getElementById('token-stats');
-  if (showTokens !== false) {
-    const total = (data.prompt_tokens || 0) + (data.completion_tokens || 0);
-    if (el) el.textContent = '📊 ' + total.toLocaleString() + ' tokens';
-  } else if (!hasWsStats) {
-    const lastTotal = (data.last_prompt_tokens || 0) + (data.last_completion_tokens || 0);
-    if (lastTotal > 0 && el) el.textContent = '📊 上轮 ' + lastTotal.toLocaleString() + ' tokens';
-    // lastTotal===0：新 session 无历史 -> 不动(保持空白)
-  }
-  updateProviderModel(data);
-}
-function updateProviderModel(data) {
-  const el = document.getElementById('provider-model');
-  if (!el) return;
-  const hasP = data.provider !== undefined && data.provider !== null;
-  const hasM = data.model !== undefined && data.model !== null;
-  if (!hasP && !hasM) return;  // ws stats 事件无此字段，保持现状不覆盖
-  const prov = hasP ? String(data.provider).trim() : '';
-  const model = hasM ? String(data.model).trim() : '';
-  el.textContent = (prov || model) ? (prov + (model ? ' · ' : '') + model) : '';
-}
-function updateStats() {
-  fetch(BASE + 'api/session/stats').then(r => r.json()).then(data => updateStatsFrom(data, false)).catch(function(){});
-}
-
-// Auto-resize textarea
-document.getElementById('input').addEventListener('input', function() {
-  this.style.height = 'auto';
-  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
-});
-
-// Keyboard shortcut: Ctrl+Enter for newline
-document.addEventListener('keydown', function(e) {
-  if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
-    // Already handled by textarea onkeydown
-  }
-  // 4G: Esc 收起侧边栏
-  if (e.key === 'Escape' && !document.body.classList.contains('sidebar-collapsed')) {
-    document.body.classList.add('sidebar-collapsed');
-    try { localStorage.setItem('sidebarCollapsed', '1'); } catch(_) {}
-  }
-});
-
-// F5c: 禁用浏览器滚动位置恢复（刷新后不再自动回到顶部/旧位置，让滚底生效）
-if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
-// F5c/F6b: window load 兜底——浏览器 scroll restoration 之后强制滚底（最终保险）。
-// F6b: 多级延迟补滚（load + 300/800/1500ms）——覆盖浏览器 restoration 任意时机，
-// 且 currentSession 可能在 load 后才被 fetchStatus 赋值，延迟补滚保证最终命中。
-window.addEventListener('load', function() {
-  forceScrollToBottom();
-  setTimeout(forceScrollToBottom, 300);
-  setTimeout(forceScrollToBottom, 800);
-  setTimeout(forceScrollToBottom, 1500);
-});
-initTheme();
-initSidebar();
-fetchSessions();  // FIX: 页面初始化即加载 sessions 列表（问题1：初始为空）
-setInterval(fetchSessions, 2000);  // 需求1：每 2s 轮询刷新 session 列表（与后端 /api/sessions 2s TTL 匹配；切走/刷新/断线场景 done 丢失需轮询兜底恢复按钮）
-updateModeIndicator();
-updateSkillIndicator();
-updateLockIndicator();
-loadInputHistory();   // 页面加载即拉取共享历史（失败静默降级）
-document.getElementById('chat').addEventListener('scroll', onChatScroll);
-connect();
-</script>
-</body>
-</html>
-"""
+# ── Static HTML pages (web_static/*.html, loaded via load_page) ──
 
 
 @app.get("/login")
 async def login_page():
     """Serve the login page."""
-    return HTMLResponse(LOGIN_PAGE)
+    return HTMLResponse(load_page("login.html"))
 
 
 @app.get("/files")
 async def files_page():
     """FTP 风格文件浏览器页面（新标签页打开，auth 保护）。"""
-    return HTMLResponse(FILES_PAGE)
+    return HTMLResponse(load_page("files.html"))
+
+@app.get("/viewer.html")
+async def viewer_page():
+    """统一文件预览页（md 渲染 / pdf·html 嵌入 / 图片 / 文本，auth 保护）。"""
+    return HTMLResponse(load_page("viewer.html"))
+
+
 @app.get("/")
 async def root():
     """Serve the single-page web interface."""
-    return HTMLResponse(HTML_PAGE)
+    return HTMLResponse(load_page("index.html"))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -5044,23 +3211,21 @@ def close_web_server():
 def run_web(args):
     logger.info("Web 服务启动")
 
-    global _workdir, _hashed_password, _auth_username
-    _workdir = args.workdir
+    global _hashed_password, _auth_username
     _auth_username = args.user
     if args.password:
-        from hashlib import sha256
-        _hashed_password = sha256(args.password.encode()).hexdigest()
+        _hashed_password = _hash_password(args.password)
         print(f"  🔒 Auth enabled: user={_auth_username}, password=***")
     else:
+        if args.host not in ("127.0.0.1", "::1", "localhost"):
+            raise ValueError("Binding Web UI to a non-loopback host requires --password")
         print(f"  🔓 Auth disabled (no --password set)")
 
     # ── 默认 session：以最新 session 作为默认（对齐 repl --resume，问题1修复）──
-    global _current_session
-    _current_session = _agent_manager.resolve_session()
-    if _current_session:
-        print(f"  💬 Default session: {_current_session}")
-        # ── 后台预热默认 session 的 agent，避免首请求初始化阻塞（问题2修复）──
-        _agent_manager.prewarm(_current_session)
+    _set_current_session(_agent_manager.resolve_session())
+    if _get_current_session():
+        print(f"  💬 Default session: {_get_current_session()}")
+        _agent_manager.prewarm(_get_current_session())
 
     import uvicorn
     print(f"  ⚡ XKAgent Web — http://{args.host}:{args.port}")

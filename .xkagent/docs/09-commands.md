@@ -11,10 +11,10 @@ In both the CLI and Web interface, plain text is passed to the Agent, input begi
 `/clear`, `/drop`, and `/compact` may look similar, but they serve different purposes:
 
 - `/clear` deletes the current session's messages and resets token statistics.
-- `/drop` clears the context currently used by the Agent while retaining old messages in the database and writing a boundary marker.
-- `/compact` asks the model to summarize the current conversation, retains old database messages, uses the summary as subsequent context, and writes the summary to `.xkagent/docs/<session>/`.
+- `/drop` clears the context currently used by the Agent while retaining old messages in the session store and writing a boundary marker.
+- `/compact` asks the model to summarize the current conversation, retains old messages in the session store, uses the summary as subsequent context, and writes the summary to `.xkagent/docs/<session>/`.
 
-If the context has simply grown too long, use `/compact`. To continue with an empty context while preserving the database record, use `/drop`. Use `/clear` only when you are sure the current session's messages are no longer needed.
+If the context has simply grown too long, use `/compact`. To continue with an empty context while preserving the stored records, use `/drop`. Use `/clear` only when you are sure the current session's messages are no longer needed.
 
 ## Inspecting Runtime State
 
@@ -35,14 +35,25 @@ If the context has simply grown too long, use `/compact`. To continue with an em
 ```
 
 - `/session <name>`: Switch sessions. An exact name takes precedence; a unique fuzzy match is also accepted.
-- `/session add <name> [--no-switch]`: Create a session and switch to it by default.
-- `/session fork <name>`: Copy the current session and its database state.
+- `/session add <name> [--workdir <path>] [--no-switch] [--title <text>]`: Create a session (switched to by default).
+- `/session title [--session <name>] <text>` (with `--clear` to clear): Set or clear a session's display title (display only; does not affect addressing).
+- `/session fork <name>`: Copy the current session and its stored state.
 - `/session rename <name>`: Rename the current session.
 - `/session remove <name>`: Delete a session other than the current one.
 - `/session stop <name>`: Stop the session's Agent while preserving its data.
-- `/session sync [name]`: Run a SQLite WAL checkpoint.
+- `/session sync [name]`: Force-flush the session store to disk (msgz flush; equivalent to the old WAL checkpoint semantics).
 
 The CLI can request interactive confirmation when deleting or renaming a session, or when a fuzzy match produces multiple results. Because Web cannot offer terminal-style multi-selection, it returns the candidate names instead. If another process holds a session, the current instance enters read-only observer mode and rejects chat input and state-changing commands.
+
+## Mail Bus
+
+- `/mail list [n] [--state s]`: Show the n most recent mails (default 10).
+- `/mail get <mid>`: Show one mail's details (send fields plus the per-recipient status chain).
+- `/mail pending`: List candidates that are awaiting delivery, scheduled for later, or being retried.
+- `/mail cancel <mid>`: Cancel an undelivered or retrying mail (in-flight mails cannot be cancelled).
+- `/mail send <to[,to2]> <msg> [--reply-to X] [--delay seconds] [--at timestamp] [--priority N] [--provider P] [--need-reply]`: Compose a mail manually (the carrier delivers within ~1s).
+
+For the bus design and the `callagent` tool, see [11 · Multi-Agent Communication](11-multi-agent-communication.md).
 
 ## Models and Execution Modes
 
@@ -63,10 +74,8 @@ These modes constrain the Agent's `pythonrt` execution path; they do not restric
 - `/skills`, `/showskills`: List loadable Skills.
 - `/validate [names]`: Validate all Skills or the specified Skills.
 - `/skill <name>`: Read a Skill and add it to the current Agent's active Skill list.
-- `/turnonskill`, `/skillson`: Enable automatic Skill selection.
-- `/turnoffskill`, `/skillsoff`: Disable automatic Skill selection.
 
-At present, `/skill` does not mean “force this Skill to run on the next turn.” Candidate retrieval, automatic selection, and content injection for ordinary messages are still handled by the turn workflow. See [Skills](07-skills.md) for details.
+At present, `/skill` does not mean “force this Skill to run on the next turn.” Candidate retrieval and `selectskill` loading for ordinary messages are handled by the turn workflow. See [Skills](07-skills.md) for details.
 
 ## Search and Images
 
@@ -82,6 +91,14 @@ At present, `/skill` does not mean “force this Skill to run on the next turn.�
 
 Each image is limited to 10 MB, and its path is stored in the current session. The attachment list is cleared automatically after the images are injected into the next user message. By default, the vector index is not updated incrementally. `/updateembedding` may also prepare a local model, so its run time depends on the environment.
 
+## Status Info
+
+- `/addinfo <key> <value>`: Write or update one Status Info entry (same key overwrites; the value is a single line of up to 200 characters).
+- `/listinfo`: List all Status Info entries for this session.
+- `/rminfo <key>`: Remove one entry (soft delete; the store keeps an archive).
+
+Status Info is a session-level, per-turn-injected key-value board (attached to the head of user messages when non-empty). The Agent maintains the same data through the `addinfo` / `listinfo` / `rminfo` tools, and it remains effective after `/compact`. Use `summary` for long-form notes and conclusions; see [08 · Search and Memory](08-search-and-memory.md).
+
 ## Mounting Paths
 
 - `/mount <path> [ro|rw|ro/rw] [--force]`: Dynamically mount a path for the current session.
@@ -90,10 +107,11 @@ Each image is limited to 10 MB, and its path is stored in the current session. T
 - `/mount refresh`: Reload `permission.txt`.
 - `/unmount <path>`: Remove a dynamic mount from the current session.
 
-Dynamic mounts are saved in the session database and restored after restart. `/mount save` converts them into global configuration. In `plan` mode, all mounts are treated as read-only. Dangerous paths require confirmation: the CLI prompts the user, while Web requires the command to be explicitly resubmitted with `--force`. Mounts and the sandbox are soft boundaries that reduce the risk of accidental operations; they are not security containers.
+Dynamic mounts are saved in the current session's store and restored after restart. `/mount save` converts them into global configuration. In `plan` mode, all mounts are treated as read-only. Dangerous paths require confirmation: the CLI prompts the user, while Web requires the command to be explicitly resubmitted with `--force`. Mounts and the sandbox are soft boundaries that reduce the risk of accidental operations; they are not security containers.
 
 ## Compaction, Restart, and Exit
 
+- `/autocompactlimit [-1|N]`: View or set the auto-compaction threshold (-1 disables; default 600000; when the context exceeds N tokens it is pruned/compacted first).
 - `/compact`: Summarize the session in a dedicated model turn and reset the context used from that point forward.
 - `/restart [overrides]`: Stop the current Agent and restart the process, optionally overriding startup arguments such as `--mode`, `-s`, `--port`, `--resume`, and `--workdir`.
 - `/exit`: Exit the CLI; in Web, shut down the server.

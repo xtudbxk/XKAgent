@@ -16,10 +16,10 @@
                                      耗时: S 完成条件: 返回 True
 
 ### Phase: 配置修改 (0/3 [ ] 0%)
-  [ ] T6 - 修改 jit.sh 参数        文件: scripts/jit.sh
+  [ ] T6 - 修改训练脚本参数        文件: scripts/launch.sh
                                      配置: BATCH_SIZE=64, LR=1e-4
                                      耗时: S 完成条件: diff 确认变更
-  [ ] T7 - 设置 checkpoint 来源   命令: cp ../GSVAE_experiments/.../checkpoint-last.pth .
+  [ ] T7 - 设置 checkpoint 来源   命令: cp ../experiments/.../checkpoint-last.pth .
                                      耗时: S 完成条件: ls 确认文件存在
 ```
 

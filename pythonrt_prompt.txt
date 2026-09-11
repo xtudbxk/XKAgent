@@ -1,0 +1,93 @@
+════════════════════════════════════════════
+ pythonrt 脚本编写规范（写脚本前对照执行；auto-fix 是兜底不是依赖）
+════════════════════════════════════════════
+
+【0】工具面 vs 脚本内能力（先分清在哪用什么）
+· 工具面 = 你在对话中直接调用的工具；pythonrt 脚本内部不可调用它们：
+  pythonrt（唯一执行器）｜agent（语义理解/图片识别/独立子任务，JSON 回传；
+  脚本产出过大先摘要再传）｜searchskill（搜技能）｜summary（持久化结论，
+  调用后本轮立即终止）｜exit（死循环/不可恢复时最后手段）
+· 脚本内可直接 import 的特殊库（无需接入）：sqlite3(受控读写) dulwich(git)
+  requests/urllib3/certifi/idna/charset_normalizer/h11(网络)
+  mmap(fd级) socket/ssl/urllib/http/ftplib/smtplib/email/asyncio(网络族)
+· 脚本内不可用：exec/eval/compile（builtins 屏蔽）、subprocess 执行（可 import
+  执行被拒）、numpy 等第三方（默认拒绝）；shutil/pathlib 已由系统注入
+  stdlib 等价 stub（仍建议优先 os.path）
+
+【1】调用参数与提交方式
+  pythonrt(workdir=必填, code_or_filepath=必填, timeout=毫秒默认30000)
+· timeout 选择：普通读写解析 30000｜批量解析/多文件改写 60000｜
+  网络请求/模块重载/全量扫描 120000
+· 相互独立任务 → 一次回复数组提交多个调用（引擎串行执行、结果一起返回）；
+  有依赖步骤 → 写进同一脚本顺序执行；禁止“一次调用只做一件事”的线性小步探查
+· 提交前核对 user msg「路径访问权限」段；越界 → 请求用户 /mount 或切模式，勿反复硬试
+
+【2】脚本骨架（五段式，照此结构写）
+# 1) import 区：全部显式、顶部写全（沙箱每次全新进程，无隐式可用名）
+import os, json, time, ast
+# 2) 常量区：路径/阈值集中定义
+TARGET = 'data/config.json'
+TS = time.strftime('%Y%m%d_%H%M%S')
+# 3) 函数区：逻辑封装成函数
+def load(path):
+    with open(path, encoding='utf-8', errors='replace') as f:
+        return json.load(f)
+# 4) 执行区：main() 包裹 + 关键节点打印进度
+def main():
+    data = load(TARGET)
+    print('loaded %d items' % len(data))
+main()
+# 5) 输出区：末尾一行 JSON 摘要
+print(json.dumps({'ok': True, 'items': 0}, ensure_ascii=False))
+
+【3】硬规则（❌ 禁止 → ✅ 正确）
+3.1 import：用到但没 import → NameError（第一大失败源）。顶部一次写全。
+    ❌ numpy 等第三方｜❌ shutil/pathlib 直接依赖（已有 stub 兜底，仍建议 os.path）
+    ✅ json/csv/re/zlib/sqlite3/ast 等标准库直接用；复制备份用 open 二进制
+3.2 动态执行：❌ exec/eval/compile/input/breakpoint/globals/locals/vars/memoryview
+    ✅ 语法校验唯一正解 ast.parse(src, filename=path)
+3.3 推导式：体内只引用自身循环变量/字面量/模块级常量；引用函数局部变量的
+    复杂逻辑 → 普通 for 循环或封装函数（❌ [x*f for x in items]，f 为局部变量）
+3.4 路径文件：✅ 相对 workdir 或挂载路径（先核对权限）；❌ 绝对路径/ ../（越界 [vfs] 拦截）
+    ❌ open(glob(...))（传 list → [vfs] 非法路径类型）→ ✅ for p in glob(...) 逐个取
+    ✅ 读文件必带 encoding='utf-8', errors='replace'
+    ❌ os.remove 直接删 → ✅ 移入 .trash/（os.makedirs('.trash', exist_ok=True) 后 rename）
+    ❌ 写 .xkagent/（全模式只读）→ ✅ 临时产物写 /tmp/（不持久化）
+3.5 进程：❌ os.system/popen/fork/kill/pipe、subprocess 执行
+    → 确需命令：请求用户 !cmd 或切 build-unsafe，勿反复尝试
+    ✅ os.getcwd/listdir/path.*/rename/makedirs
+3.6 输出：❌ 大文件一次性 print → ✅ 先 print 大小/行数再按区间分块读；
+    大批量结果落盘后 print 路径；末尾一行 JSON 摘要
+3.7 写文件标准四步（所有写操作必经，一个脚本内完成）：
+    ① 备份 raw=open(T,'rb').read(); open(T+'.bak.'+TS,'wb').write(raw)
+    ② 读 src=open(T,encoding='utf-8',errors='replace').read()
+    ③ 改 assert src.count(ANCHOR)==1; src=src.replace(ANCHOR,NEW)（锚点唯一；多处修改攒齐一次写回）
+    ④ 写回+读回校验+print JSON 摘要
+
+【4】任务模板速查（copy-paste 改参数）
+A 探查: os.walk('.') 跳隐藏目录 → print(path, size)
+B 单文件修改: 四步全流程（见 3.7）
+C 多文件批量: for name,pairs in EDITS.items(): 四步 + ast.parse 校验后写回
+D 数据解析: json.loads(open(...).read())｜msgz: json.loads(zlib.decompress(open(...,'rb').read()))
+E 网络请求: requests.get(url, timeout=30)（请求级超时必填）→ raise_for_status → 落盘不全量 print
+F 轮询等待: deadline=time.time()+60; while time.time()<deadline: if os.path.exists(M): break; sleep(2)
+else: print('TIMEOUT')
+G sqlite 只读: sqlite3.connect('file:x.db?mode=ro', uri=True)
+
+【5】失败第一反应（先读 stderr 归因再对症修改；盲目重试成功率仅 41%）
+NameError → 漏 import/推导式（§3.1/3.3）｜第三方模块被拒 → §0 三条出路：
+stdlib 重实现→build-unsafe→pythonrt_utils 接入｜[vfs] → §3.4｜
+exit_code=124 超时 → §3.6+§1 timeout 表｜AssertionError → 锚点不唯一（§3.7）｜
+其他 traceback → 脚本 bug，修逻辑勿重试
+
+【6】模式差异（写前核对当前模式）
+            plan          build            build-unsafe
+读          workdir+挂载   同左             任意
+写          ✗(仅/tmp)     workdir+rw挂载+/tmp  任意(.xkagent 仍只读)
+import      stdlib 白名单  同左             任意
+subprocess  ✗             ✗                ✓
+网络        受控放行       受控放行          ✓
+
+【7】[auto-fix] 输出说明
+stdout 头部 [auto-fix] 行 = 系统已自动修复你的脚本（补 import/注入 stub/
+open 补编码/删除改移 .trash）。阅读修复项，下次主动写对——它是兜底不是依赖。

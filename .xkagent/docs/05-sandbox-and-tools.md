@@ -6,14 +6,15 @@ XKAgent follows a **code over tools** approach: instead of selecting a dedicated
 
 ## A Deliberately Small Tool Surface
 
-The main Agent currently exposes six tools to the model:
+The main Agent currently exposes eleven tools to the model:
 
 - `pythonrt`: Executes Python and serves as the primary entry point for file operations, data processing, and multi-step logic.
-- `searchskill`: Continues searching the skill library when the currently recommended Skill is not suitable.
-- `searchinfo`: Searches for file excerpts within specified, authorized directories.
-- `summary`: Writes information worth retaining across sessions to `.xkagent/docs/<session>/`; a successful call ends the current turn.
-- `exit`: Ends the current turn when the Agent encounters an infinite loop, an unrecoverable error, or a task it cannot complete.
 - `agent`: Runs a short-lived sub-Agent loop in a separate subprocess.
+- `searchskill` / `searchinfo` / `selectskill`: Retrieve Skills, search file excerpts, and load the full text of a selected Skill.
+- `summary`: Writes information worth retaining across sessions to `.xkagent/docs/<session>/`; a successful call ends the current turn.
+- `callagent`: Sends fully asynchronous mail to other sessions (cross-session collaboration, scheduled wake-ups, long-running tasks); see [11 · Multi-Agent Communication](11-multi-agent-communication.md).
+- `addinfo` / `listinfo` / `rminfo`: Maintain the session's Status Info KV (injected every turn); see [06 · Agent Engine](06-agent-engine.md).
+- `exit`: Ends the current turn when the Agent encounters an infinite loop, an unrecoverable error, or a task it cannot complete.
 
 `agent` reuses the same Provider, model, and sandbox permissions while completing delegated work in an independent context. See [06 · Agent Engine](06-agent-engine.md) for tool filtering, nesting controls, and the result format.
 
@@ -47,7 +48,7 @@ Restricted modes merge accessible roots from three sources:
 2. `permission.txt`: `ro` is always read-only; `ro/rw` is read-only in `plan` and writable in `build`.
 3. `/mount`: adds dynamic mounts for the current session under the same rules.
 
-`/tmp` is always writable. Dynamic mounts are stored in the session database and restored after restart. `/mount save` synchronizes them to `permission.txt`; it is not required to persist dynamic mounts.
+`/tmp` is always writable. Dynamic mounts are stored in the current session's store and restored after restart. `/mount save` synchronizes them to `permission.txt`; it is not required to persist dynamic mounts.
 
 The sandbox resolves each path with `realpath`, then applies the permission of the longest matching root. This blocks ordinary `..` and symlink escapes while allowing a more specific read-only child directory to override a writable parent. `<workdir>/.xkagent` contains configuration, secrets, history, and state and is intended to remain read-only in every mode. Restricted modes provide relatively complete protection, while `build-unsafe` only wraps some Python write entry points and must not be treated as impossible to bypass.
 

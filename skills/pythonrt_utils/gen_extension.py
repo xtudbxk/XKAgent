@@ -1,3 +1,4 @@
+# deps: stdlib only
 """gen_extension.py — 生成 pythonrt 库接入骨架（register_extension 五种接入点）。
 
 功能：根据库名与判定结果，生成可直接粘贴到 codes/sandbox.py 的接入代码。

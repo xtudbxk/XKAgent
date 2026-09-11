@@ -39,10 +39,12 @@ import json
 import logging
 import threading
 import time
+import uuid
 from typing import Generator, Optional
 
 import requests
 
+from codes import config as _config
 from codes import provider_config
 from codes._log import logger
 
@@ -52,6 +54,7 @@ from codes._log import logger
 
 # 价格单位为 USD / 1M tokens；集中维护，避免 REPL 与 Agent 价格表漂移。
 MODEL_PRICING = {
+    "deepseek-flash": {"input": 0.5, "output": 2.0},  # 2026-09-10：官方统一名 deepseek-flash（旧名 deepseek-v4-flash 已下线），沿用 Flash 价
     "deepseek-v4-flash": {"input": 0.5, "output": 2.0},
     "deepseek-v4-pro": {"input": 2.0, "output": 8.0},
     "gpt-5.4": {"input": 10.0, "output": 30.0},
@@ -165,24 +168,99 @@ def _get_session() -> requests.Session:
 # 基础工具
 # ────────────────────────────────────────────────────────────────
 
+# ────────────────────────────────────────────────────────────────
+# OpenCode Go 兼容：x-opencode-session / User-Agent
+# ────────────────────────────────────────────────────────────────
+_OPENCODE_GO_MARK = "opencode.ai"
+
+# 进程级 fallback session id：无会话上下文时使用（进程内稳定）。
+_FALLBACK_SESSION_ID = "xkagent-" + uuid.uuid4().hex[:16]
+
+
+def _opencode_session_id() -> str:
+    """当前会话的稳定 session id（供 OpenCode Go 的 x-opencode-session 头）。
+
+    优先取激活的会话上下文名（SessionContext.name，会话级稳定）；
+    无会话上下文（如启动自检）时回退到进程级 fallback。
+    """
+    ctx = _config.get_active_session_context()
+    if ctx is not None and getattr(ctx, "name", None):
+        return str(ctx.name)
+    return _FALLBACK_SESSION_ID
+
+
+def _opencode_extra_headers(base_url: str) -> dict:
+    """OpenCode Go 要求的附加请求头（base_url 含 opencode.ai 时）。
+
+    官方文档要求（opencode.ai/docs/go/#where-can-i-use-it）：
+      1. 使用自定义 User-Agent（而非通用 HTTP 库名）
+      2. 每个会话发送稳定 x-opencode-session 头
+    缺失 x-opencode-session 时服务端拒绝请求（400 MissingSessionID）。
+    """
+    if not base_url or _OPENCODE_GO_MARK not in base_url:
+        return {}
+    return {
+        "User-Agent": "xkagent/1.0",
+        "x-opencode-session": _opencode_session_id(),
+    }
+
+
 def _resolve_provider(provider: str) -> dict:
     """解析 provider 配置：配置文件 > 环境变量 > 内置默认。"""
     return provider_config.get_provider(provider)
 
 
 def _serialize_usage(usage) -> dict:
-    """统一 usage 序列化（OpenAI 解析后为 dict，防御性兼容对象）。"""
+    """统一 usage 序列化（OpenAI 解析后为 dict，防御性兼容对象）。
+
+    除 prompt/completion/total 外，额外提取 reasoning_tokens（思考 token）：
+      - OpenAI 兼容格式：usage.reasoning_tokens 或 usage.completion_tokens_details.reasoning_tokens
+      - Anthropic 等无该字段的模型返回 0（由上层走"长度比估算"降级）
+    """
+    def _reasoning(d):
+        rt = d.get("reasoning_tokens", 0) or 0
+        if not rt:
+            _det = d.get("completion_tokens_details") or {}
+            rt = (_det.get("reasoning_tokens", 0) if isinstance(_det, dict) else 0) or 0
+        return rt
+
     if isinstance(usage, dict):
         return {
             "prompt_tokens": usage.get("prompt_tokens", 0),
             "completion_tokens": usage.get("completion_tokens", 0),
             "total_tokens": usage.get("total_tokens", 0),
+            "reasoning_tokens": _reasoning(usage),
         }
+    _rt = getattr(usage, "reasoning_tokens", 0) or 0
+    if not _rt:
+        _det = getattr(usage, "completion_tokens_details", None) or {}
+        _rt = (_det.get("reasoning_tokens", 0) if isinstance(_det, dict) else 0) or 0
     return {
         "prompt_tokens": getattr(usage, "prompt_tokens", 0),
         "completion_tokens": getattr(usage, "completion_tokens", 0),
         "total_tokens": getattr(usage, "total_tokens", 0),
+        "reasoning_tokens": _rt,
     }
+
+
+def split_reasoning_tokens(usage: dict, reasoning_len: int = 0, content_len: int = 0) -> tuple:
+    """拆分 thinking（reasoning）token，返回 (reasoning_tokens, content_tokens)。
+
+    双轨策略（对齐 opencode）：
+      轨道 A：服务器返回了 reasoning_tokens → 直接采用（精确）。
+      轨道 B：服务器未返回（DeepSeek/Anthropic 等）→ 用 reasoning 与正文的
+             字符长度比估算：reasoning_tokens ≈ completion × len(reasoning)/(len(reasoning)+len(content))。
+    约束：reasoning_tokens ∈ [0, completion_tokens]，content_tokens = completion - reasoning。
+    """
+    completion = usage.get("completion_tokens", 0) or 0
+    rt = usage.get("reasoning_tokens", 0) or 0
+    if rt <= 0:
+        # 轨道 B：纯长度比估算
+        total_len = (reasoning_len or 0) + (content_len or 0)
+        if completion > 0 and total_len > 0:
+            rt = round(completion * (reasoning_len or 0) / total_len)
+    rt = max(0, min(rt, completion))
+    return rt, completion - rt
 
 
 def _get_stream_socket(resp: requests.Response):
@@ -204,6 +282,17 @@ def _get_stream_socket(resp: requests.Response):
     sock = getattr(conn, 'sock', None) if conn is not None else None
     if sock is not None and hasattr(sock, 'fileno'):
         return sock
+    # fallback: 取不到 connection.sock 时，尝试 raw.fileno() / raw._fp.fileno()
+    # （urllib3 2.x HTTPResponse.fileno -> _fp.fileno -> socket fd），保证 select 可用。
+    for _cand in (raw, getattr(raw, '_fp', None)):
+        if _cand is None:
+            continue
+        try:
+            _fd = _cand.fileno()
+        except Exception:
+            continue
+        if _fd is not None and _fd >= 0:
+            return _fd
     return None
 
 
@@ -230,6 +319,16 @@ def _iter_sse_lines(resp: requests.Response,
     start = time.monotonic()
     last_activity = start          # 上次收到数据的时间（空闲超时基准）
     sock = _get_stream_socket(resp)
+    # sock 取不到时退化为短读超时轮询：设底层 socket 短超时，让 resp.raw.read()
+    # 定期返回（ReadTimeoutError 在下文作为轮询点 continue），从而能及时检查
+    # interrupt_event，避免无限直读阻塞导致中止按钮/Ctrl+C 失效。
+    if sock is None:
+        try:
+            _fp = getattr(resp.raw, '_fp', None)
+            if _fp is not None and getattr(_fp, 'fp', None) is not None:
+                _fp.fp.settimeout(_POLL_INTERVAL)
+        except Exception:
+            pass
     buf = b""
     data_lines: list[str] = []   # 累积当前事件的 data 行（支持多行 data，W4）
     while True:
@@ -296,6 +395,24 @@ def _iter_sse_lines(resp: requests.Response,
 # OpenAI 兼容范式
 # ────────────────────────────────────────────────────────────────
 
+def _ensure_assistant_reasoning_content(messages: list[dict],
+                                        tools: Optional[list[dict]]) -> list[dict]:
+    """DeepSeek thinking+tools：history 里每条 assistant 必须带 reasoning_content 字段。
+
+    本地合成的 assistant（如技能注入）通常没有该字段，缺字段会在带 tools 的请求中 400。
+    无思维链时用空串占位；已有则原样保留。
+    """
+    if not tools:
+        return messages
+    out: list[dict] = []
+    for m in messages:
+        if m.get("role") == "assistant" and "reasoning_content" not in m:
+            out.append({**m, "reasoning_content": ""})
+        else:
+            out.append(m)
+    return out
+
+
 def _iter_openai_events(cfg: dict, provider: str, messages: list[dict],
                         model: Optional[str], temperature: float,
                         response_format: Optional[str],
@@ -314,10 +431,12 @@ def _iter_openai_events(cfg: dict, provider: str, messages: list[dict],
     }
     base = cfg.get("base_url") or _DEFAULT_ENDPOINTS["openai"]
     url = base.rstrip("/") + "/chat/completions"
+    headers.update(_opencode_extra_headers(base))
 
+    api_messages = _ensure_assistant_reasoning_content(messages, tools)
     body: dict = {
         "model": model or cfg["default_model"],
-        "messages": messages,
+        "messages": api_messages,
         "temperature": temperature,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -362,11 +481,18 @@ def _iter_openai_events(cfg: dict, provider: str, messages: list[dict],
         status = resp.status_code
         # 400 → drop_params：部分模型（如 gpt-5 系）不支持 temperature != 1，
         # 收到 400 且报错含 temperature 时去掉该参数重发（对齐 litellm drop_params）。
-        if status == 400 and attempt == 0 and "temperature" in (resp.text or "").lower():
-            logger.warning("LLM API 拒绝 temperature 参数，去掉后重试（drop_params 兼容）")
-            resp.close()
-            body.pop("temperature", None)
-            continue
+        if status == 400 and attempt == 0:
+            _err_text = (resp.text or "").lower()
+            if "temperature" in _err_text and "temperature" in body:
+                logger.warning("LLM API 拒绝 temperature 参数，去掉后重试（drop_params 兼容）")
+                resp.close()
+                body.pop("temperature", None)
+                continue
+            if "reasoning_effort" in _err_text and "reasoning_effort" in body:
+                logger.warning("LLM API 拒绝 reasoning_effort 参数（值域不支持），去掉后重试（drop_params 兼容）")
+                resp.close()
+                body.pop("reasoning_effort", None)
+                continue
         # 429/5xx → 自动重试（指数退避；此时尚未开始流式，无重复计费风险）
         if status in _RETRYABLE_STATUS and attempt < _MAX_HTTP_ATTEMPTS - 1:
             delay = _RETRY_BACKOFF * (2 ** attempt)
@@ -560,6 +686,7 @@ def _iter_anthropic_events(cfg: dict, provider: str, messages: list[dict],
     }
     base = cfg.get("base_url") or _DEFAULT_ENDPOINTS["anthropic"]
     url = base.rstrip("/") + "/messages"
+    headers.update(_opencode_extra_headers(base))
 
     system, anth_messages = _to_anthropic_messages(messages)
     body: dict = {
@@ -728,6 +855,8 @@ def _aggregate_stream(events: Generator[tuple, None, None],
                         merged["prompt_tokens"] = data["prompt_tokens"]
                     if data.get("completion_tokens"):
                         merged["completion_tokens"] = data["completion_tokens"]
+                    if data.get("reasoning_tokens"):
+                        merged["reasoning_tokens"] = data["reasoning_tokens"]
                     merged["total_tokens"] = merged["prompt_tokens"] + merged["completion_tokens"]
                     final_usage = merged
                 else:
@@ -759,6 +888,8 @@ def _aggregate_stream(events: Generator[tuple, None, None],
         }
         if accumulated_reasoning:
             extras["reasoning_content"] = accumulated_reasoning
+        extras["reasoning_len"] = len(accumulated_reasoning)
+        extras["content_len"] = len(accumulated_content)
         if final_usage:
             extras["usage"] = final_usage
         return accumulated_content, extras
@@ -785,9 +916,11 @@ def _aggregate_stream(events: Generator[tuple, None, None],
         "tool_calls": tool_calls_list,
     }
     if accumulated_reasoning:
-        # 与 complete() 语义对齐：reasoning_content 供 agent 落库/展示。
-        # agent 路径取用后只写 thinking 角色入库，不进入 LLM 上下文。
+        # 与 complete() 语义对齐：reasoning_content 供 agent 落库/展示，并挂回 assistant 供 LLM 回放。
         extras["reasoning_content"] = accumulated_reasoning
+    # 思考/正文字符长度（供无 reasoning_tokens 字段的模型做长度比估算）
+    extras["reasoning_len"] = len(accumulated_reasoning)
+    extras["content_len"] = len(accumulated_content)
     if final_usage:
         extras["usage"] = final_usage
     if invalid_tool_call_ids:
@@ -840,6 +973,12 @@ def complete_stream(
     # default_model 可能带 :effort 后缀（deepseek-v4-flash:max），剥离后才是真实 API 模型名。
     # 显式传入的 model 由 agent 层 set_model 时已剥离，此处统一处理兜底（对齐 test_connectivity）。
     eff_model = model or cfg.get("default_model") or ""
+    # 自愈：调用方未显式传 reasoning_effort 但 model 直接带 ":effort" 后缀时自动提取，
+    # 防止新调用方直传 model:effort 导致 effort 静默丢弃（agent 层已剥离，此兜底保底）。
+    if reasoning_effort is None and model:
+        _pure_m, _eff_m = provider_config.split_model_effort(model)
+        if _eff_m:
+            reasoning_effort = _eff_m
     eff_model = provider_config.split_model_effort(eff_model)[0]
 
     provider_type = cfg.get("type", "openai")
@@ -936,6 +1075,7 @@ def complete(
     )
 
     reasoning_parts: list[str] = []
+    content, extras = "", {}
     try:
         while True:
             chunk = next(gen)
@@ -1023,7 +1163,8 @@ def _test_fail_result(provider: str, error: str, model: str = "",
     }
 
 
-def _test_openai(cfg: dict, model: str, timeout: int) -> tuple[int, dict]:
+def _test_openai(cfg: dict, model: str, timeout: int,
+                 effort: Optional[str] = None) -> tuple[int, dict]:
     """OpenAI 兼容范式的联通性探测（非流式单请求）。
 
     兼容 drop_params：部分模型拒绝 temperature != 1（400）或要求更大
@@ -1036,6 +1177,7 @@ def _test_openai(cfg: dict, model: str, timeout: int) -> tuple[int, dict]:
     }
     base = cfg.get("base_url") or _DEFAULT_ENDPOINTS["openai"]
     url = base.rstrip("/") + "/chat/completions"
+    headers.update(_opencode_extra_headers(base))
     body: dict = {
         "model": model,
         "messages": [{"role": "user", "content": _TEST_PROMPT}],
@@ -1043,6 +1185,8 @@ def _test_openai(cfg: dict, model: str, timeout: int) -> tuple[int, dict]:
         "stream": False,
         "temperature": 0.0,
     }
+    if effort:
+        body["reasoning_effort"] = effort
     for _attempt in range(2):
         resp = requests.post(url, headers=headers, json=body, timeout=timeout)
         status = resp.status_code
@@ -1052,6 +1196,11 @@ def _test_openai(cfg: dict, model: str, timeout: int) -> tuple[int, dict]:
             if "temperature" in text and "temperature" in body:
                 resp.close()
                 body.pop("temperature", None)
+                continue
+            # reasoning_effort 值域不支持（如 qwen :max）→ 去掉重发
+            if "reasoning_effort" in text and "reasoning_effort" in body:
+                resp.close()
+                body.pop("reasoning_effort", None)
                 continue
             if body.get("max_tokens", 0) < _TEST_MAX_TOKENS_RETRY and (
                 "max_tokens" in text or ("completion" in text and "token" in text)
@@ -1077,6 +1226,7 @@ def _test_anthropic(cfg: dict, model: str, timeout: int) -> tuple[int, dict]:
     }
     base = cfg.get("base_url") or _DEFAULT_ENDPOINTS["anthropic"]
     url = base.rstrip("/") + "/messages"
+    headers.update(_opencode_extra_headers(base))
     body: dict = {
         "model": model,
         "messages": [{"role": "user", "content": _TEST_PROMPT}],
@@ -1120,9 +1270,13 @@ def test_connectivity(
             "", "无默认 provider：请先配置 provider.config 的 [default].provider")
     cfg = _resolve_provider(provider_name)
 
-    # 模型名可能带 :effort 后缀（deepseek-v4-flash:max），剥离后才是真实 API 模型名
+    # 模型名可能带 :effort 后缀（deepseek-v4-flash:max），剥离后才是真实 API 模型名。
+    # 测试携带 effort（显式 model 后缀 > 配置推导），让 /model test 覆盖 reasoning_effort
+    # 真实调用路径——否则 effort 值域错误的模型（如 :max 对 qwen）测试全绿、实际调用 400。
     eff_model = model or cfg.get("default_model") or ""
-    eff_model = provider_config.split_model_effort(eff_model)[0]
+    _pure_m, _eff_m = provider_config.split_model_effort(eff_model)
+    eff_model = _pure_m
+    effort = _eff_m or provider_config.get_model_effort(provider_name, eff_model)
     if not eff_model:
         return _test_fail_result(
             provider_name, f"provider '{provider_name}' 未配置 default_model")
@@ -1141,7 +1295,7 @@ def test_connectivity(
         if provider_type == "anthropic":
             status, data = _test_anthropic(cfg, eff_model, timeout)
         else:
-            status, data = _test_openai(cfg, eff_model, timeout)
+            status, data = _test_openai(cfg, eff_model, timeout, effort=effort)
     except requests.exceptions.Timeout:
         return _test_fail_result(
             provider_name,
@@ -1226,6 +1380,12 @@ def friendly_error_hint(error_text: str) -> str:
         return "💡 资源不存在：请检查 base_url 与模型名（/model 查看可用模型）"
     if "429" in low or "rate limit" in low:
         return "💡 请求过频：请稍后重试，或降低并发"
+    # ── 上下文超限（2026-09-11）：对齐自动修剪恢复机制的用户侧提示 ──
+    if ("context length" in low or "longer than" in low or "context window" in low
+            or "too many tokens" in low or "context_length" in low):
+        return "💡 上下文超限：系统已自动修剪超大工具输出并重试；若持续失败可 /compact 压缩历史"
+    if "invalidparameter" in low.replace(" ", "") or "invalid_request_error" in low:
+        return "💡 请求被拒（常见原因：上下文超限或参数不兼容）：系统已自动修剪重试；可 /compact 压缩历史"
     if "timeout" in low or "timed out" in low or "connection" in low:
         return "💡 网络/超时：请检查 base_url 与网络连接，或缩短上下文"
     return "💡 可尝试 /model test 检查联通性，或查看日志定位原因"

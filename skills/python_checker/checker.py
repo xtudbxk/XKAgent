@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# deps: stdlib only
 """python_checker — Python 脚本语法与逻辑检查核心脚本。
 
 纯标准库，零依赖，兼容 WASM Python 沙箱。

@@ -1,5 +1,8 @@
 # pythonrt_utils.examples — 实战示例
 
+> 📌 **内置化标注（2026-08-30）**：本文 sqlite3（`_sqlite_setup`，sandbox.py L807）与 dulwich（`_dulwich_setup`，L962）案例已内置进 sandbox.py，无需重复接入；本文保留作为 audit 判定方法与 stub 模式的教学参考。
+
+
 > 树节点：`pythonrt_utils` → `examples`（两个真实接入案例，含完整代码与验证）
 
 ## 4.1 sqlite3（路径级 C 扩展 → 入口 patch）

@@ -1,3 +1,4 @@
+# deps: stdlib only
 """history_parser — Session 发现与概览工具
 提供列出所有 sessions 及获取单个 session 详细信息的函数。
 所有函数返回 JSON 字符串，兼容 pythonrt（统一 Python 运行时）工具调用方式。
