@@ -66,17 +66,17 @@
 
 ### 10. 路径沙箱 · 渐进信任
 
-![08 路径沙箱 · 渐进信任](.xkagent/docs/rednote/08.png)
+![10 路径沙箱 · 渐进信任](.xkagent/docs/rednote/08.png)
 
 
 ### 11. Build Your Own XKAgent
 
-![09 Build Your Own XKAgent](.xkagent/docs/rednote/09.png)
+![11 Build Your Own XKAgent](.xkagent/docs/rednote/09.png)
 
 
 ### 12. 总结 · 欢迎 star & fork
 
-![10 总结 · 欢迎 star & fork](.xkagent/docs/rednote/10.png)
+![12 总结 · 欢迎 star & fork](.xkagent/docs/rednote/10.png)
 
 
 ---
