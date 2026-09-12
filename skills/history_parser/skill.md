@@ -18,6 +18,7 @@ triggers:
   - 提取消息
 requires: {}
 author: system
+open_source: true
 ---
 
 ## 概述

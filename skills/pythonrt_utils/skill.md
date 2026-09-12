@@ -17,6 +17,7 @@ triggers:
   - 库导入被拒
 requires: {}
 author: system
+open_source: true
 ---
 
 ## 概要

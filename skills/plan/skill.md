@@ -16,6 +16,7 @@ triggers:
   - 执行方案
 requires: {}
 author: system
+open_source: true
 ---
 
 ## 概要

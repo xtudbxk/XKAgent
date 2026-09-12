@@ -18,6 +18,7 @@ requires:
     - download_arxiv
     - web_search
 author: system
+open_source: true
 ---
 
 ## 概述

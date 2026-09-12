@@ -76,12 +76,24 @@
 | **B. 系统级** | `xkagent_v0902/skills/<name>/` | 全局所有会话 | 挂载 ro/rw 后 pythonrt 直接写 |
 
 > ⚠️ **禁止**默认落盘到工作目录 `skills/`（不在 `_skill_dirs`，不被技能系统索引，`searchskill` 搜不到）。
-> 记录选择为 `skill_location`，贯穿 Phase 5 落盘与 Phase 6 验证。
+> 记录选择为 `skill_location`，贯穿 Phase 5 落盘与 Phase 6 验证；若为 B 系统级，还须确认并记录开源属性 `open_source`（见 §7.1）。
+
+#### 7.1 开源属性（仅落盘位置 = B 系统级时必答）
+
+代码目录 `xkagent_v0902/skills/` 会随 XKAgent 公开仓库发布，因此系统级技能必须区分开源属性：
+
+| 选择 | 含义 | 标注（写入 skill.md frontmatter） |
+|------|------|----------------------------------|
+| **可开源** | 可随公开仓库发布 | `open_source: true` |
+| **不可开源** | 含内部信息，发布前须从公开提交中排除 | `open_source: false` + 建议 `open_source_note: <原因>` |
+
+> 📌 拿不准时按「不可开源」处理更安全（后续可再改）；规范化已有技能时：已标注则确认/更新，缺失则补问。
+> 记录为 `open_source`，由 Phase 5 写入 frontmatter，Phase 6 校验（缺失 → FAIL）。
 
 #### 影响范围
 
-- **Phase 5**：按落盘位置分支执行（用户级 → 宿主 `!cmd` 复制；系统级 → 挂载直写）
-- **Phase 6**：落盘后用 `searchskill` 验证新技能名可检索
+- **Phase 5**：按落盘位置分支执行（用户级 → 宿主 `!cmd` 复制；系统级 → 挂载直写 + 写入 `open_source` 标注）
+- **Phase 6**：落盘后用 `searchskill` 验证新技能名可检索；系统级技能校验 `open_source` 存在（缺失 → FAIL）
 
 ---
 
@@ -100,6 +112,7 @@
   --- 或 ---
   目标模式:    plan + build（多模式兼容）
   落盘位置:    [A 用户级 .xkagent/skills | B 系统级 xkagent_v0902/skills]
+  开源属性:    [可开源 open_source:true | 不可开源 open_source:false]（仅 B 系统级必填）
 
 以上是否正确？如有补充请说明。
 ```

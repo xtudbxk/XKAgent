@@ -35,11 +35,11 @@
 
 ## 五、其他改进（简述）
 
-- Web：会话标题与置顶、文件在线预览页、文件路径解析增强、访问日志完善；
+- Web：会话级消息队列、会话标题与置顶、文件在线预览页、文件路径解析增强、访问日志完善；
 - 上下文工程：自动压缩默认开启（默认阈值 60 万 tokens）、工具输出截断（100KB + 尾 2KB）、超限自动修剪重试；
 - 邮件修复：重投计数修正（防无限重投）、`mail_meta` 信封回信指引、`callagent` provider 指定；
 - 工程与文档：README 与主题文档更新、`.gitignore` 整理、`tests/` 补充（mail / 空闲回收）。
 
 ## English (brief)
 
-XKAgent 0.2.0 adds a multi-agent mail system (global `mail.jsonl` bus, MailPostman carrier, and the `callagent` tool), switches session storage to a single-file msgz format (zlib-compressed JSON, memory-first with atomic persistence; legacy SQLite files remain readable and can be migrated via `codes/msgz_migrate.py`), adds a session-level Status Info board (`addinfo` / `listinfo` / `rminfo`) injected on every turn and preserved across compaction, and expands built-in skills (`paper_collect`, `paper_discuss`, `pdfreader`, `playwright_web`, `callagent_workflows`, and more). Other changes include web session titles/pins and an online file preview page, context-engineering improvements (auto-compaction, tool-output truncation, overflow recovery), and mail fixes. See the docs for details.
+XKAgent 0.2.0 adds a multi-agent mail system (global `mail.jsonl` bus, MailPostman carrier, and the `callagent` tool), switches session storage to a single-file msgz format (zlib-compressed JSON, memory-first with atomic persistence; legacy SQLite files remain readable and can be migrated via `codes/msgz_migrate.py`), adds a session-level Status Info board (`addinfo` / `listinfo` / `rminfo`) injected on every turn and preserved across compaction, and expands built-in skills (`paper_collect`, `paper_discuss`, `pdfreader`, `playwright_web`, `callagent_workflows`, and more). Other changes include a session-level web message queue, session titles/pins, and an online file preview page, plus context-engineering improvements (auto-compaction, tool-output truncation, overflow recovery) and mail fixes. See the docs for details.

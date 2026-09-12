@@ -13,6 +13,7 @@ compatible_modes:
   - plan
 requires.pip: []
 requires.skills: []
+open_source: true
 ---
 
 # PDF Reader Skill

@@ -16,6 +16,7 @@ triggers:
   - 论文rebuttal
 requires: {}
 author: system
+open_source: true
 ---
 
 ## 概述

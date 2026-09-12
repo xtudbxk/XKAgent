@@ -54,17 +54,27 @@
 ![07 Feature 3 · Status Info](.xkagent/docs/rednote/07.png)
 
 
-### 8. 路径沙箱 · 渐进信任
+### 8. Feature 4 · 多 Agent 协作
+
+![08 Feature 4 · 多 Agent 协作](.xkagent/docs/rednote/11.png)
+
+
+### 9. Feature 5 · 长程任务
+
+![09 Feature 5 · 长程任务](.xkagent/docs/rednote/12.png)
+
+
+### 10. 路径沙箱 · 渐进信任
 
 ![08 路径沙箱 · 渐进信任](.xkagent/docs/rednote/08.png)
 
 
-### 9. Build Your Own XKAgent
+### 11. Build Your Own XKAgent
 
 ![09 Build Your Own XKAgent](.xkagent/docs/rednote/09.png)
 
 
-### 10. 总结 · 欢迎 star & fork
+### 12. 总结 · 欢迎 star & fork
 
 ![10 总结 · 欢迎 star & fork](.xkagent/docs/rednote/10.png)
 

@@ -23,6 +23,9 @@ content = (
     '  - <触发词1>\n'
     'requires: {}\n'
     'author: system\n'
+        # ↓ 系统级（B）技能按需插入（用户级省略）：
+        #   'open_source: true\n'    # 可开源
+        #   'open_source: false\n'   # 不可开源（建议再补 'open_source_note: <原因>\n'）
     '---\n\n'
     '## 概述\n\n主文件内容...\n'
 )
@@ -92,6 +95,7 @@ with open(src + '.bak', 'wb') as f:
 content = open(src, encoding='utf-8').read()  # ② 读取原 body
 body = content.split('---', 2)[2] if content.startswith('---') else content
 new_fm = '---\nname: <name>\nversion: 2.0.0\ndescription: ...\ncategory: ...\ncompatible_modes:\n  - plan\n  - build\ntriggers: [...]\nauthor: system\n---\n'
+# 系统级（B）技能：frontmatter 还须含 open_source（缺失则补，见 phase5 5.2）；不可开源补 open_source_note
 with open(src, 'w', encoding='utf-8') as f:   # ③ 写入新 frontmatter + body
     f.write(new_fm + '\n' + body)
 print('normalized', src)

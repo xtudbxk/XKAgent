@@ -1,9 +1,5 @@
 简体中文 | [English](README.md) | [📕 图文介绍](rednote.md)
 
-<p align="center">
-  <img src="./xkagent-hero.svg" alt="XKAgent — Code over Tools" width="100%">
-</p>
-
 <h1 align="center">XKAgent · eXtensible Kernel Agent</h1>
 
 <p align="center">
@@ -23,9 +19,18 @@
   <a href="#docs">文档地图</a>
 </p>
 
+<p align="center">
+  <img src="./xkagent-hero.svg" alt="XKAgent — Code over Tools" width="100%">
+</p>
+
 ---
 
 XKAgent 是一个在本地运行、可持续扩展的轻量 Agent Runtime。它不为每项能力堆叠专用 Tool，而是让模型通过 `pythonrt` 组合 Python 代码完成任务，并借助 Skills 和 Status 扩展能力与上下文。
+
+## 📜 更新日志
+
+- **0.2.0 — 2026-09-11**：多 Agent 通信（callagent）、msgz 存储、Status Info、Web 界面优化与技能扩充 —— 详见 [更新说明](docs/release_notes_0.2.0.md)。
+- **0.1.0 — 2026-08-14**：首个公开版本 —— pythonrt 代码内核与路径沙箱、可插拔技能、CLI 与 Web 同一内核。
 
 ## ✨ 为什么是 XKAgent
 
@@ -78,9 +83,14 @@ flowchart TB
     subgraph Sandbox["🛡️ Path Sandbox"]
         Pythonrt["⌨️ pythonrt · code kernel\n(call agent as sub-agent)"]
     end
+    subgraph Mail["📮 邮件总线 · mail.jsonl"]
+        Callagent["📨 callagent · 跨会话异步投递"]
+    end
     LLM --> Pythonrt
-    Status -.-> Future["🕒 Roadmap · Long-term Tasks + Memory"]
+    LLM --> Callagent
+    Callagent --> Peer["🗂 对端会话 · 同一内核"]
     Pythonrt --> User["👤 User (CLI / Web)"]
+    Status -.-> Future["🕒 Roadmap · Long-term Tasks + Memory"]
 ```
 
 每轮交互并非“模型逐个点击工具”，而是沿着“用户交互 → 上下文注入 → 模型规划 → Python 组合执行 → 返回用户”的路径完成。虚线 `Roadmap` 仅表示 Status 未来可以支撑长程任务与长期 Memory，并不代表这两项能力已经实现。更多细节请参阅 [架构总览](.xkagent/docs/codes_功能整理.md)。
@@ -230,20 +240,6 @@ pythonrt、Skills 和 Status 分别解决什么问题，它们之间如何协作
 ```
 
 这样即使没有预先通读全部文档，也可以从具体问题入手了解 XKAgent。涉及实现细节时，请以当前源码为准。
-
----
-
-## 📝 更新说明 · 0.2.0
-
-本版聚焦多 Agent 协作与更简单的存储层：
-
-- **📮 多 Agent 通信**：新增全局 `mail.jsonl` 邮件总线、轮次邮差 MailPostman 与 `callagent` 工具，支持跨会话异步消息（延迟/定点投递、优先级、回复链、广播、收件方 provider 覆盖）。
-- **💾 存储升级：SQLite → msgz**：会话改为单文件 `.msgz`（zlib 压缩、内存主数据、原子落盘）；旧 `*.db` 保持只读兼容，可用 `codes/msgz_migrate.py` 迁移。
-- **🧭 状态信息（Status Info）**：会话级 KV 状态板（`addinfo` / `listinfo` / `rminfo`），每回合注入、压缩后保留。
-- **🧩 内置技能扩充**：`paper_collect`、`paper_discuss`、`pdfreader`、`playwright_web`、`callagent_workflows` 等。
-- **⚙️ 其他改进**：Web 会话标题与置顶、文件在线预览页；长上下文自动压缩与工具输出截断。
-
-详细说明见 [0.2.0 更新说明](docs/release_notes_0.2.0.md)。
 
 ---
 

@@ -19,6 +19,7 @@ triggers:
   - cron
 requires: {}
 author: xtudbxk
+open_source: true
 ---
 
 ## 概述

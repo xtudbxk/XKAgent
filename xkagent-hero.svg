@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
   <title id="title">XKAgent Architecture</title>
-  <desc id="desc">Status-aware context feeds the LLM and pythonrt runtime. Skills extend capability, the LLM responds through CLI or Web, agent is callable as a sub-agent, and a path sandbox wraps execution. Long-term tasks and memory are on the roadmap.</desc>
+  <desc id="desc">Status-aware context feeds the LLM. pythonrt executes composed code inside the path sandbox, while callagent coordinates multi-agent collaboration and long-horizon tasks. Skills extend capability, and the LLM responds through CLI or Web.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f8fcff"/><stop offset="1" stop-color="#ebfaf4"/></linearGradient>
     <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#16b3a3"/><stop offset="1" stop-color="#4f8ff7"/></linearGradient>
@@ -8,44 +8,49 @@
     <marker id="arrow-cyan" markerWidth="6" markerHeight="6" refX="5.5" refY="3" orient="auto"><path d="M0 0L6 3L0 6Z" fill="#16b3a3"/></marker>
     <marker id="arrow-blue" markerWidth="6" markerHeight="6" refX="5.5" refY="3" orient="auto"><path d="M0 0L6 3L0 6Z" fill="#4f8ff7"/></marker>
   </defs>
-  <rect width="1200" height="675" rx="28" fill="url(#bg)"/>
-  <g opacity=".22" stroke="#94cbd3"><path d="M0 100h1200M0 200h1200M0 300h1200M0 400h1200M0 500h1200M0 600h1200"/><path d="M100 0v675M200 0v675M300 0v675M400 0v675M500 0v675M600 0v675M700 0v675M800 0v675M900 0v675M1000 0v675M1100 0v675"/></g>
+  <rect width="1200" height="620" rx="28" fill="url(#bg)"/>
+  <g opacity=".19" stroke="#94cbd3"><path d="M0 100h1200M0 200h1200M0 300h1200M0 400h1200M0 500h1200M0 600h1200"/><path d="M100 0v620M200 0v620M300 0v620M400 0v620M500 0v620M600 0v620M700 0v620M800 0v620M900 0v620M1000 0v620M1100 0v620"/></g>
   <g fill="none" stroke-width="3">
-    <path d="M600 135v45" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
-    <path d="M592 300v35" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
-    <path d="M608 335v-35" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
-    <path d="M285 250h170" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
-    <path d="M745 238h170" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
-    <path d="M915 262H745" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
-    <path d="M710 95h135" stroke="#16b3a3" stroke-dasharray="10 10" marker-end="url(#arrow-cyan)"/>
+    <path d="M600 135v42" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
+    <path d="M560 300 C560 344 340 322 340 336 V360" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
+    <path d="M640 300 C640 344 860 322 860 336 V360" stroke="#4f8ff7" marker-end="url(#arrow-blue)"/>
+    <path d="M285 250h167" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
+    <path d="M745 238h167" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
+    <path d="M915 262H748" stroke="#16b3a3" marker-end="url(#arrow-cyan)"/>
   </g>
   <g font-family="Segoe UI,Arial,sans-serif" text-anchor="middle">
     <rect x="490" y="55" width="220" height="80" rx="20" fill="#ffffff" stroke="#16b3a3" stroke-width="3"/>
-    <text x="600" y="95" fill="#087f78" font-size="27" font-weight="800" dominant-baseline="middle">STATUS</text>
+    <text x="600" y="83" fill="#087f78" font-size="27" font-weight="800" dominant-baseline="middle">STATUS</text>
+    <text x="600" y="112" fill="#457578" font-size="15" font-weight="600" dominant-baseline="middle">injected every turn</text>
 
-    <rect x="845" y="45" width="300" height="100" rx="22" fill="#f7fffc" stroke="#16b3a3" stroke-width="3" stroke-dasharray="8 7"/>
-    <text x="995" y="84" fill="#087f78" font-size="22" font-weight="800">LONG-TERM</text>
-    <text x="995" y="115" fill="#457578" font-size="19" font-weight="700">TASKS + MEMORY</text>
-    <text x="790" y="82" fill="#087f78" font-size="14" font-weight="700">ROADMAP</text>
-
-    <rect x="455" y="180" width="290" height="120" rx="24" fill="#f3f7ff" stroke="#4f8ff7" stroke-width="4"/>
-    <text x="600" y="250" fill="#17324d" font-size="48" font-weight="800">LLM</text>
-
-    <rect x="95" y="200" width="190" height="100" rx="22" fill="#ffffff" stroke="#4f8ff7" stroke-width="3"/>
-    <text x="190" y="250" fill="#315b9d" font-size="30" font-weight="800" dominant-baseline="middle">SKILLS</text>
-
-    <rect x="915" y="200" width="190" height="100" rx="22" fill="#ffffff" stroke="#4f8ff7" stroke-width="3"/>
-    <text x="1010" y="250" fill="#315b9d" font-size="28" font-weight="800" dominant-baseline="middle">CLI &amp; WEB</text>
-
-    <rect x="380" y="335" width="440" height="205" rx="34" fill="#f7fffc" stroke="#16b3a3" stroke-width="3" stroke-dasharray="10 8"/>
-    <text x="600" y="525" fill="#087f78" font-size="17" font-weight="700">PATH SANDBOX</text>
     <g filter="url(#glow)">
-      <rect x="415" y="365" width="370" height="135" rx="26" fill="#ffffff" stroke="url(#accent)" stroke-width="5"/>
-      <text x="600" y="410" fill="#17324d" font-size="38" font-weight="800">PYTHONRT</text>
-      <rect x="485" y="435" width="230" height="42" rx="21" fill="#eef4ff" stroke="#4f8ff7" stroke-width="2"/>
-      <text x="600" y="461" fill="#315b9d" font-size="16" font-weight="700">agent() -&gt; sub-agent</text>
+      <rect x="455" y="180" width="290" height="120" rx="24" fill="#f3f7ff" stroke="url(#accent)" stroke-width="5"/>
+      <text x="600" y="250" fill="#17324d" font-size="48" font-weight="800">LLM</text>
     </g>
 
-    <text x="600" y="610" fill="#17324d" font-size="68" font-weight="800" dominant-baseline="middle">XKAgent</text>
+    <rect x="95" y="200" width="190" height="100" rx="22" fill="#ffffff" stroke="#16b3a3" stroke-width="3"/>
+    <text x="190" y="238" fill="#087f78" font-size="30" font-weight="800" dominant-baseline="middle">SKILLS</text>
+    <text x="190" y="266" fill="#457578" font-size="15" font-weight="600" dominant-baseline="middle">plug &amp; play</text>
+
+    <rect x="915" y="200" width="190" height="100" rx="22" fill="#ffffff" stroke="#16b3a3" stroke-width="3"/>
+    <text x="1010" y="250" fill="#087f78" font-size="28" font-weight="800" dominant-baseline="middle">CLI &amp; WEB</text>
+
+    <rect x="120" y="365" width="440" height="205" rx="30" fill="#f7fffc" stroke="#16b3a3" stroke-width="3" stroke-dasharray="10 8"/>
+    <text x="340" y="552" fill="#087f78" font-size="17" font-weight="700">PATH SANDBOX</text>
+    <g filter="url(#glow)">
+      <rect x="155" y="395" width="370" height="135" rx="26" fill="#ffffff" stroke="url(#accent)" stroke-width="5"/>
+      <text x="340" y="440" fill="#17324d" font-size="38" font-weight="800">PYTHONRT</text>
+      <rect x="215" y="465" width="250" height="42" rx="21" fill="#eef4ff" stroke="#4f8ff7" stroke-width="2"/>
+      <text x="340" y="491" fill="#315b9d" font-size="16" font-weight="700">agent() -&gt; sub-agent</text>
+    </g>
+
+    <rect x="640" y="365" width="440" height="205" rx="30" fill="#f7fffc" stroke="#16b3a3" stroke-width="3" stroke-dasharray="10 8"/>
+    <text x="860" y="552" fill="#087f78" font-size="17" font-weight="700">MAIL BUS</text>
+    <g filter="url(#glow)">
+      <rect x="675" y="395" width="370" height="135" rx="26" fill="#ffffff" stroke="url(#accent)" stroke-width="5"/>
+      <text x="860" y="440" fill="#17324d" font-size="38" font-weight="800">CALLAGENT</text>
+      <rect x="735" y="465" width="250" height="42" rx="21" fill="#eef4ff" stroke="#4f8ff7" stroke-width="2"/>
+      <text x="860" y="491" fill="#315b9d" font-size="16" font-weight="700">multi-agent · long-horizon</text>
+    </g>
   </g>
 </svg>

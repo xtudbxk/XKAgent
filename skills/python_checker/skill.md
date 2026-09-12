@@ -17,6 +17,7 @@ triggers:
   - 错误检测
 requires: {}
 author: system
+open_source: true
 ---
 
 ## 概要

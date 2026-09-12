@@ -20,6 +20,7 @@ triggers:
   - 巡检
 requires: {}
 author: xtudbxk
+open_source: true
 ---
 
 ## 概述

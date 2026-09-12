@@ -2,6 +2,7 @@
 name: paper_collect
 description: 多agent收集arXiv论文并生成中英双语HTML清单
 version: 1.0.0
+open_source: true
 ---
 
 # paper_collect 论文收集与清单生成 v1.0.0

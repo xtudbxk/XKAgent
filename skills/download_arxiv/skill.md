@@ -14,6 +14,7 @@ triggers:
   - download_arxiv
   - download arxiv
 author: system
+open_source: true
 requires: {}
 ---
 

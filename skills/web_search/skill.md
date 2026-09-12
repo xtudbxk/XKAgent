@@ -25,6 +25,7 @@ triggers:
   - 调研
 requires: {}
 author: system
+open_source: true
 ---
 
 你已加载 **web_search (v2.2)** 技能。按以下**四步工作流**执行搜索任务。

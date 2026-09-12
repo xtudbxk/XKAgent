@@ -21,10 +21,11 @@
 | 选择 | 落盘路径 | 写入方式 |
 |------|---------|---------|
 | **A. 用户级** | `.xkagent/skills/<name>/` | `.xkagent` 全模式只读（[vfs] read-only）→ 先写工作目录草稿 `skills/<name>/`，再给出宿主命令 `!mkdir -p .xkagent/skills/<name> && !cp -r skills/<name>/* .xkagent/skills/<name>/` 由用户执行 |
-| **B. 系统级** | `xkagent_v0902/skills/<name>/` | 挂载 ro/rw 后 `os.makedirs` + 写入；不可写 → 提示 `/mount ../../xkagent_v0902 ro/rw --force` 或切 build-unsafe |
+| **B. 系统级** | `xkagent_v0902/skills/<name>/` | 挂载 ro/rw 后 `os.makedirs` + 写入；frontmatter 须含 `open_source` 标注（来自 Phase 1 §7.1）；不可写 → 提示 `/mount ../../xkagent_v0902 ro/rw --force` 或切 build-unsafe |
 
 > ⚠️ **禁止**将工作目录 `skills/` 作为最终落盘位置（不在 `_skill_dirs`，`selectskill`/`searchskill` 检索不到）。
 > 落盘后必须用 `searchskill` 验证新技能名可被检索（无论 A/B）。
+> 🔓 系统级技能：frontmatter 还须写入 `open_source`（`true`/`false`，来自 Phase 1 §7.1；不可开源建议附 `open_source_note`），Phase 6 校验缺失 → FAIL。
 
 
 ### 5.2 写入 skill.md
@@ -47,6 +48,7 @@ YAML frontmatter 字段规则：
 | `compatible_modes` | YAML list，如 `  - plan`、`  - build`（**必填**，来自 Phase 1） |
 | `requires.pip` | 只出现在有 pip 依赖时 |
 | `requires.skills` | 只出现在有技能依赖时 |
+| `open_source` | `true`/`false`，**仅系统级（B）技能必填**（来自 Phase 1 §7.1）；`false` 时建议补 `open_source_note`（不可开源原因，单行） |
 
 ### 5.3 写入工具脚本（按需生成）
 
@@ -179,6 +181,7 @@ pythonrt 读取 skills/makeskill/makeskill.templates.md
 分类: <workflow|tool>
 目标模式: <plan | build | build-unsafe | 多模式>
 落盘位置: <A 用户级 .xkagent/skills | B 系统级 xkagent_v0902/skills>
+开源属性: <可开源 open_source:true | 不可开源 open_source:false | —不适用（A 用户级）>
 工具: <是（N 个工具脚本） | 否>
 
 待生成文件:

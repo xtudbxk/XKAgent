@@ -7,17 +7,21 @@
 **① frontmatter/存在性检查**（skill.md）：
 
 ```python
-# pythonrt 自动验证：存在性 + frontmatter 首行
+# pythonrt 自动验证：存在性 + frontmatter 首行 + open_source（系统级）
 import os
 
 name = '<name>'
 base = f'skills/{name}'
+location = '<A|B>'  # 来自 Phase 1：A 用户级 / B 系统级
 checks = []
 sm = os.path.join(base, 'skill.md')
 if os.path.isfile(sm):
-    with open(sm, encoding='utf-8') as fh:
-        first = fh.readline().strip()
+    src = open(sm, encoding='utf-8').read()
+    first = src.splitlines()[0].strip() if src else ''
     checks.append('OK: skill.md' if first == '---' else 'FAIL: frontmatter 首行非 ---')
+    if location == 'B':  # 系统级必须含 open_source 标注（硬规则 19）
+        fm = src.split('---', 2)[1] if src.startswith('---') else ''
+        checks.append('OK: open_source 标注' if 'open_source:' in fm else 'FAIL: 系统级技能缺 open_source 标注')
 else:
     checks.append('FAIL: skill.md 缺失')
 print('\n'.join(checks))
@@ -35,7 +39,7 @@ spec.loader.exec_module(m)
 print(m.verify_skill(base, ['<script_name>.py', '<tool_script>.py']))
 ```
 
-判定：WARN 项须修复后重跑；FAIL 项禁止发布。
+判定：WARN 项须修复后重跑；FAIL 项禁止发布（系统级缺 open_source 标注按 FAIL 处理）。
 
 ### 6.2 推荐运行 /validate
 
@@ -50,6 +54,7 @@ print(m.verify_skill(base, ['<script_name>.py', '<tool_script>.py']))
 
 主类型:  workflow
 工具:    是（1 个工具脚本）
+开源属性: <可开源 open_source:true | 不可开源 open_source:false | —不适用（用户级）>
 
 文件:
   ✅ skills/code_review/skill.md

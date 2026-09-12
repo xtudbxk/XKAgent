@@ -17,6 +17,7 @@ triggers:
   - 审计
 requires: {}
 author: system
+open_source: true
 ---
 
 ## 概要

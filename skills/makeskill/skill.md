@@ -1,6 +1,6 @@
 ---
 name: makeskill
-version: 3.2.0
+version: 3.3.0
 description: 创建/规范化/结构化技能，生成 skill.md 并支持拆分
 category: workflow
 compatible_modes:
@@ -20,6 +20,7 @@ triggers:
   - 太大
 requires: {}
 author: system
+open_source: true
 ---
 
 ## 概要
@@ -85,8 +86,11 @@ makeskill 是一个**元技能**——它不解决具体业务问题，而是生
 
 18. **技能落盘位置（生成前必问）** — 生成新技能前**必须询问用户落盘位置**：
     - **用户级** `.xkagent/skills/<name>/`：仅当前项目可见，`list_skills` 优先加载；`.xkagent` 全模式只读，需宿主 `!cmd` 复制写入
-    - **系统级** `xkagent_v0902/skills/<name>/`：全局所有会话可见，挂载 ro/rw 后可直接写入
+    - **系统级** `xkagent_v0902/skills/<name>/`：全局所有会话可见，挂载 ro/rw 后可直接写入；**还须确认开源属性（可开源/不可开源）并写入 skill.md（硬规则 19）**
     **禁止**默认落盘到工作目录 `skills/`（不在 `_skill_dirs`，不被 `list_skills`/`selectskill`/`searchskill` 索引，等于不可发现）；按用户选择执行落盘，落盘后用 `searchskill` 验证新技能名可被检索
+19. **系统级技能必备开源标注** — 落盘到系统级（代码目录）的技能，skill.md frontmatter **必须注明开源属性**：
+    - `open_source: true`（可开源，可随公开仓库发布）/ `open_source: false`（不可开源，发布前须排除）；`false` 时建议附 `open_source_note: <原因>`（单行）
+    - 用途：代码目录随 XKAgent 公开仓库发布，该标注供发布前核对；Phase 6 校验缺失 → FAIL
 > 📎 脚本细节规则（大小阈值、网络请求、沙箱兼容等）见 `makeskill.rules_detail.md`。
 
 ---

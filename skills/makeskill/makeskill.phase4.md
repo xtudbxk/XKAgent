@@ -16,8 +16,10 @@
 | requires.skills | 否 | 依赖的其他技能 | [] |
 | author | 否 | 作者名 | system 或用户名 |
 | prompt_sink | 否 | 该技能承接的 system_prompt 段落说明（提示哪些易变细节应从 prompt 下沉到本技能） | "pythonrt 高频失败模式表" |
+| open_source | 仅系统级 | 开源属性（来自 Phase 1 §7.1）：true=可开源 / false=不可开源（建议附 open_source_note） | true |
 
 > `compatible_modes` 字段将写入生成的 skill.md 的 frontmatter 中，供其他技能/系统识别该技能的运行模式兼容性。
+> `open_source` 仅系统级（B）技能填写，用于公开仓库发布前核对（见 Phase 1 §7.1）。
 
 ### 4.2 技能逻辑收集
 

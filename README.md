@@ -1,9 +1,5 @@
 [简体中文](README.zh-CN.md) | English | [📕 图文介绍](rednote.md)
 
-<p align="center">
-  <img src="./xkagent-hero.svg" alt="XKAgent — Code over Tools" width="100%">
-</p>
-
 <h1 align="center">XKAgent · eXtensible Kernel Agent</h1>
 
 <p align="center">
@@ -23,9 +19,18 @@
   <a href="#docs">Documentation</a>
 </p>
 
+<p align="center">
+  <img src="./xkagent-hero.svg" alt="XKAgent — Code over Tools" width="100%">
+</p>
+
 ---
 
 XKAgent is a lightweight, locally run agent runtime designed for continuous extension. Instead of adding a dedicated Tool for every capability, it lets the model compose Python code through `pythonrt`, with Skills and Status providing extensibility and context.
+
+## 📜 Changelog
+
+- **0.2.0 — 2026-09-11**: multi-agent communication (`callagent`), msgz session storage, Status Info, web UI improvements, and expanded skills — see [release notes](docs/release_notes_0.2.0.md).
+- **0.1.0 — 2026-08-14**: first public release — `pythonrt` code kernel with path sandbox, pluggable skills, and CLI and Web on one kernel.
 
 ## ✨ Why XKAgent
 
@@ -78,9 +83,14 @@ flowchart TB
     subgraph Sandbox["🛡️ Path Sandbox"]
         Pythonrt["⌨️ pythonrt · code kernel\n(call agent as sub-agent)"]
     end
+    subgraph Mail["📮 Mail Bus · mail.jsonl"]
+        Callagent["📨 callagent · async mail to peer sessions"]
+    end
     LLM --> Pythonrt
-    Status -.-> Future["🕒 Roadmap · Long-term Tasks + Memory"]
+    LLM --> Callagent
+    Callagent --> Peer["🗂 Peer sessions · same kernel"]
     Pythonrt --> User["👤 User (CLI / Web)"]
+    Status -.-> Future["🕒 Roadmap · Long-term Tasks + Memory"]
 ```
 
 Each interaction follows the path “user interaction → context injection → model planning → composed Python execution → response to the user,” rather than having the model click through tools one by one. The dashed `Roadmap` edge only indicates that Status can support long-running tasks and long-term Memory in the future; it does not mean either capability is already implemented. See the [Architecture Overview](.xkagent/docs/architecture-overview.md) for details.
@@ -230,20 +240,6 @@ What problems do pythonrt, Skills, and Status solve, and how do they work togeth
 ```
 
 This lets you learn about XKAgent through specific questions without reading all the documentation first. For implementation details, treat the current source code as authoritative.
-
----
-
-## 📝 What's New · 0.2.0
-
-This release focuses on multi-agent collaboration and a simpler storage layer:
-
-- **📮 Multi-Agent Communication**: a global `mail.jsonl` bus, the MailPostman carrier, and the `callagent` tool for asynchronous cross-session messaging — delayed/absolute delivery, priority, reply chains, broadcast, and per-recipient provider override.
-- **💾 Storage: SQLite → msgz**: sessions now live in a single zlib-compressed `.msgz` file (memory-first with atomic persistence); legacy `*.db` files stay readable and can be migrated with `codes/msgz_migrate.py`.
-- **🧭 Status Info board**: a session-level key-value store (`addinfo` / `listinfo` / `rminfo`) injected every turn and preserved across compaction.
-- **🧩 More built-in skills**: `paper_collect`, `paper_discuss`, `pdfreader`, `playwright_web`, `callagent_workflows`, and more.
-- **⚙️ Other improvements**: web session titles/pins and an online file preview page; auto-compaction and tool-output truncation for long contexts.
-
-See [0.2.0 Release Notes](docs/release_notes_0.2.0.md) for details.
 
 ---
 

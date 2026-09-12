@@ -16,6 +16,7 @@ requires:
   pip:
     - playwright
 author: system
+open_source: true
 ---
 
 # Playwright 网页自动化流程（v2：一次性任务 + CDP 常驻守护）
